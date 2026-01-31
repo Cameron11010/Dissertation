@@ -1,0 +1,4067 @@
+//
+//  CameraView.swift
+//  Baseball Tracker
+//
+
+import SwiftUI
+import AVFoundation
+import Vision
+import CoreML
+import Photos
+import Combine
+
+// MARK: - Settings Model
+class CameraSettings: ObservableObject {
+    @Published var ballDetectionEnabled: Bool = true
+    @Published var poseEstimationEnabled: Bool = true
+    @Published var showLabels: Bool = true
+    @Published var showSpeed: Bool = true
+    @Published var speedUnit: SpeedUnit = .mph
+    @Published var ballConfidenceThreshold: Float = 0.35
+    @Published var poseConfidenceThreshold: Float = 0.3
+    
+    // Calibration (using home plate width)
+    @Published var isCalibrated: Bool = false
+    @Published var plateLeftEdge: CGPoint = .zero // Normalized coordinates (0-1)
+    @Published var plateRightEdge: CGPoint = .zero // Normalized coordinates (0-1)
+    @Published var plateWidth: Double = 17.0 // inches (regulation baseball home plate)
+    @Published var useCentimeters: Bool = false // false = inches, true = centimeters
+    @Published var selectedLens: Double = 1.0 // Lens choice for speed calculation (1x, 2x, 4x, 8x)
+    
+    // Colors
+    @Published var ballColor: Color = .red
+    @Published var trajectoryColor: Color = .red
+    @Published var skeletonColor: Color = .cyan
+    @Published var jointColor: Color = .yellow
+    @Published var elbowAngleColor: Color = .green
+    @Published var kneeAngleColor: Color = .orange
+    @Published var shoulderAngleColor: Color = .purple
+    @Published var separationColor: Color = .cyan
+    
+    // Strike zone
+    @Published var showStrikeZone: Bool = true
+    @Published var strikeZoneColor: Color = .white
+    // Generic strike zone height in inches (MLB regulation ~22", adjustable for age groups)
+    @Published var strikeZoneHeight: Double = 22.0
+    // Distance in inches from home plate up to the bottom of the strike zone
+    // (~knee height; MLB regulation is roughly 18–20 inches above the plate)
+    @Published var strikeZoneBottomOffset: Double = 18.0
+    
+    // Export options
+    @Published var exportCleanVideo: Bool = false
+    
+    enum SpeedUnit: String, CaseIterable {
+        case mph = "mph"
+        case kmh = "km/h"
+        
+        func convert(fromMPH mph: Double) -> Double {
+            switch self {
+            case .mph:
+                return mph
+            case .kmh:
+                return mph * 1.60934
+            }
+        }
+    }
+    
+    // Calculate pixels per foot based on calibration
+    func pixelsPerFoot(viewSize: CGSize) -> Double {
+        guard isCalibrated else {
+            // Fallback: use estimated pixels per foot based on typical baseball field setup
+            // Assuming camera is ~30-50 feet from home plate, 1080p video
+            // This gives approximately 40-60 pixels per foot at that distance
+            let fallbackPixelsPerFoot = 50.0
+            print("[Calibration] Using fallback: \(fallbackPixelsPerFoot) pixels/ft (camera not calibrated)")
+            return fallbackPixelsPerFoot
+        }
+        
+        let left = CGPoint(x: plateLeftEdge.x * viewSize.width,
+                          y: plateLeftEdge.y * viewSize.height)
+        let right = CGPoint(x: plateRightEdge.x * viewSize.width,
+                           y: plateRightEdge.y * viewSize.height)
+        
+        let pixelDistance = sqrt(pow(right.x - left.x, 2) + pow(right.y - left.y, 2))
+        
+        // Sanity check: plate edges should be at least 10 pixels apart
+        guard pixelDistance > 10 else {
+            print("[Calibration] WARNING: Plate edges too close (\(pixelDistance)px), using fallback")
+            return 50.0
+        }
+        
+        // Convert plate width to feet
+        let plateWidthInFeet: Double
+        if useCentimeters {
+            plateWidthInFeet = plateWidth / 30.48 // Convert cm to feet
+        } else {
+            plateWidthInFeet = plateWidth / 12.0 // Convert inches to feet
+        }
+        
+        let result = pixelDistance / plateWidthInFeet
+        
+        // Sanity check: result should be reasonable (20-200 pixels per foot for typical video)
+        guard result >= 10 && result <= 500 else {
+            print("[Calibration] WARNING: Calculated pixels/ft out of range (\(result)), using fallback")
+            return 50.0
+        }
+        
+        print("[Calibration] Using calibrated value: \(String(format: "%.1f", result)) pixels/ft")
+        return result
+    }
+}
+
+struct CameraView: UIViewControllerRepresentable {
+    var onVideoSaved: ((String) -> Void)? = nil
+    var videoURL: URL? = nil
+    @Binding var isRecordingLive: Bool
+    @ObservedObject var settings: CameraSettings
+    @Environment(\.presentationMode) var presentationMode
+
+    func makeUIViewController(context: Context) -> CameraViewController {
+        let vc = CameraViewController()
+        vc.onVideoSaved = onVideoSaved
+        vc.videoURL = videoURL
+        vc.settings = settings
+        vc.onRecordingStateChanged = { value in
+            DispatchQueue.main.async { self.isRecordingLive = value }
+        }
+        return vc
+    }
+
+    func updateUIViewController(_ uiViewController: CameraViewController, context: Context) {
+        uiViewController.settings = settings
+    }
+}
+
+// MARK: - Parabolic Trajectory Smoother
+class TrajectoryKalmanSmoother {
+    
+    static func smoothTrajectory(_ points: [CGPoint]) -> [CGPoint] {
+        guard points.count >= 3 else { return points }
+        
+        let parabola = fitParabola(to: points)
+        
+        guard let (a, b, c) = parabola else {
+            return points
+        }
+        
+        let xValues = points.map { $0.x }
+        guard let minX = xValues.min(), let maxX = xValues.max() else { return points }
+        
+        let numPoints = max(points.count * 4, 50)
+        var smoothedPoints: [CGPoint] = []
+        
+        for i in 0..<numPoints {
+            let t = Double(i) / Double(numPoints - 1)
+            let x = Double(minX) + t * Double(maxX - minX)
+            let y = a * x * x + b * x + c
+            
+            smoothedPoints.append(CGPoint(x: x, y: y))
+        }
+        
+        return smoothedPoints
+    }
+    
+    // MARK: - Parabola Fitting using Least Squares
+
+    private static func fitParabola(to points: [CGPoint]) -> (a: Double, b: Double, c: Double)? {
+        guard points.count >= 3 else { return nil }
+        
+        let n = Double(points.count)
+        
+        var sumX = 0.0, sumX2 = 0.0, sumX3 = 0.0, sumX4 = 0.0
+        var sumY = 0.0, sumXY = 0.0, sumX2Y = 0.0
+        
+        for point in points {
+            let x = Double(point.x)
+            let y = Double(point.y)
+            let x2 = x * x
+            let x3 = x2 * x
+            let x4 = x2 * x2
+            
+            sumX += x
+            sumX2 += x2
+            sumX3 += x3
+            sumX4 += x4
+            sumY += y
+            sumXY += x * y
+            sumX2Y += x2 * y
+        }
+        
+        
+        let matrix: [[Double]] = [
+            [sumX4, sumX3, sumX2],
+            [sumX3, sumX2, sumX],
+            [sumX2, sumX, n]
+        ]
+        
+        let vector = [sumX2Y, sumXY, sumY]
+        
+        guard let solution = solveLinearSystem(matrix: matrix, vector: vector) else {
+            return nil
+        }
+        
+        return (a: solution[0], b: solution[1], c: solution[2])
+    }
+    
+    // MARK: - Linear System Solver (Gaussian Elimination)
+    
+    private static func solveLinearSystem(matrix: [[Double]], vector: [Double]) -> [Double]? {
+        guard matrix.count == 3, matrix[0].count == 3, vector.count == 3 else { return nil }
+        
+        var aug = matrix.map { $0 }
+        for i in 0..<3 {
+            aug[i].append(vector[i])
+        }
+        
+        for col in 0..<3 {
+            var maxRow = col
+            for row in (col + 1)..<3 {
+                if abs(aug[row][col]) > abs(aug[maxRow][col]) {
+                    maxRow = row
+                }
+            }
+            
+            if maxRow != col {
+                aug.swapAt(col, maxRow)
+            }
+            
+            if abs(aug[col][col]) < 1e-10 {
+                return nil
+            }
+            
+            for row in (col + 1)..<3 {
+                let factor = aug[row][col] / aug[col][col]
+                for j in col..<4 {
+                    aug[row][j] -= factor * aug[col][j]
+                }
+            }
+        }
+        
+        var solution = [Double](repeating: 0.0, count: 3)
+        for i in (0..<3).reversed() {
+            var sum = aug[i][3]
+            for j in (i + 1)..<3 {
+                sum -= aug[i][j] * solution[j]
+            }
+            solution[i] = sum / aug[i][i]
+        }
+        
+        return solution
+    }
+}
+
+class CameraViewController: UIViewController {
+    
+    // MARK: - Settings
+    var settings: CameraSettings = CameraSettings()
+    private var settingsCancellables = Set<AnyCancellable>()
+    
+    // MARK: - Camera
+    private let captureSession = AVCaptureSession()
+    private let sessionQueue = DispatchQueue(label: "camera.session.queue")
+    private let visionQueue = DispatchQueue(label: "camera.vision.queue", qos: .userInteractive)
+    
+    private var videoDeviceInput: AVCaptureDeviceInput!
+    private var videoOutput: AVCaptureVideoDataOutput!
+    private var previewLayer: CALayer!
+    private var player: AVPlayer?
+    
+    // MARK: - Recording
+    private var recordButton: UIButton!
+    private var isRecording = false
+    
+    var assetWriter: AVAssetWriter?
+    var assetWriterInput: AVAssetWriterInput?
+    var pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
+    var recordingStartTime: CMTime?
+    
+    private var lastFrameTime: CMTime?
+    private var frameCount: Int = 0
+    
+    private var activeFrameRate: Double = 30
+    private var activeDimensions: CMVideoDimensions = CMVideoDimensions(width: 1920, height: 1080)
+    
+    // MARK: - CoreML / Vision
+    private var visionModel: VNCoreMLModel!
+    private var requests = [VNRequest]()
+    private var lastObservations: [VNRecognizedObjectObservation] = []
+    private let allowedClasses = ["baseball"]
+    
+    // MARK: - Pose Estimation
+    private var poseRequest: VNDetectHumanBodyPoseRequest!
+    private var lastPoseObservation: VNHumanBodyPoseObservation?
+    private var poseHistory: [(timestamp: CMTime, observation: VNHumanBodyPoseObservation)] = []
+    
+    // MARK: - Frame Fusion Data
+    private var fusedFrameData: [(timestamp: CMTime, ballPosition: CGPoint?, poseObservation: VNHumanBodyPoseObservation?)] = []
+    
+    // MARK: - Overlay
+    private var overlayLayer = CALayer()
+    
+    private var detectionMarkers: [CGPoint] = []
+    
+    // MARK: - UI
+    private var processingOverlay: UIView?
+    private var processingLabel: UILabel?
+    private var processingSpinner: UIActivityIndicatorView?
+    
+    private var backButton: UIButton!
+    private var settingsButton: UIButton!
+    private var calibrateButton: UIButton!
+    private var speedDisplayLabel: UILabel!
+    private var zoomSlider: UISlider!
+    private var zoomStackView: UIStackView!
+    
+    // MARK: - Zoom
+    private var currentZoomFactor: CGFloat = 1.0
+    
+    // MARK: - Speed Tracking
+    private var ballPositionHistory: [(timestamp: CMTime, position: CGPoint)] = []
+    private var currentSpeed: Double = 0.0 // mph
+    private var peakSpeed: Double = 0.0 // mph (max speed detected during recording)
+    private var estimatedPixelsPerFoot: Double? = nil // Estimated from ball size
+    
+    var videoURL: URL? = nil
+    var onVideoSaved: ((String) -> Void)?
+    var onRecordingStateChanged: ((Bool) -> Void)?
+    
+    // URL of the most-recent raw (unannotated) recording, kept alive until
+    // the annotated export (and optional clean save) have both finished.
+    private var currentRawVideoURL: URL? = nil
+    
+    // MARK: - CIContext
+    private let ciContext = CIContext()
+    
+    // MARK: - Orientation Flags
+    private var mirrored = false
+    private var contentFlippedVertically = false
+    private var contentUpsideDown = false
+    /// The snapped rotation (0 / 90 / 180 / 270) derived from the selected
+    /// video's preferredTransform.  Zero for live-camera recordings (their
+    /// pixel buffers are already portrait).  Used to rotate the CGContext in
+    /// makeAnnotatedPixelBuffer so that corner-anchored overlays (speed pill)
+    /// end up in the correct position after the writer applies the transform.
+    private var videoRotationDegrees: Int = 0
+    
+    // MARK: - Lifecycle
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        print("🎥 CameraViewController viewDidLoad started")
+        view.backgroundColor = .black
+        onRecordingStateChanged?(false)
+        
+        setupOverlay()
+        setupModel()
+        setupBackButton()
+        setupSettingsButton()
+        setupCalibrateButton()
+        setupSpeedDisplay()
+        setupZoomControls()
+        setupRecordButton()
+        setupSettingsObservers()
+        
+        self.detectionMarkers.removeAll()
+        
+        if let url = videoURL {
+            print("🎥 Processing video file mode")
+            processVideoFile(url)
+        } else {
+            print("🎥 Live camera mode - setting up camera...")
+            sessionQueue.async { [weak self] in
+                self?.setupCamera()
+            }
+        }
+    }
+    
+    // MARK: - Settings Observers
+    private func setupSettingsObservers() {
+        // Clear overlay when ball detection is disabled
+        settings.$ballDetectionEnabled
+            .dropFirst() // Skip initial value
+            .sink { [weak self] enabled in
+                guard let self = self, !enabled else { return }
+                // If ball detection is disabled and pose is also disabled, clear overlay
+                if !self.settings.poseEstimationEnabled {
+                    DispatchQueue.main.async {
+                        self.overlayLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+                    }
+                }
+                // Hide speed display when ball detection is off
+                DispatchQueue.main.async {
+                    self.speedDisplayLabel?.isHidden = !self.settings.showSpeed || !enabled
+                }
+            }
+            .store(in: &settingsCancellables)
+        
+        // Clear overlay when pose estimation is disabled
+        settings.$poseEstimationEnabled
+            .dropFirst() // Skip initial value
+            .sink { [weak self] enabled in
+                guard let self = self, !enabled else { return }
+                // If pose estimation is disabled and ball detection is also disabled, clear overlay
+                if !self.settings.ballDetectionEnabled {
+                    DispatchQueue.main.async {
+                        self.overlayLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+                    }
+                }
+            }
+            .store(in: &settingsCancellables)
+        
+        // Update speed display visibility when showSpeed changes
+        settings.$showSpeed
+            .dropFirst()
+            .sink { [weak self] showSpeed in
+                guard let self = self else { return }
+                DispatchQueue.main.async {
+                    self.speedDisplayLabel?.isHidden = !showSpeed || !self.settings.ballDetectionEnabled
+                }
+            }
+            .store(in: &settingsCancellables)
+        
+        // Update speed display when unit changes
+        settings.$speedUnit
+            .dropFirst()
+            .sink { [weak self] _ in
+                guard let self = self else { return }
+                self.updateSpeedDisplay(self.currentSpeed)
+            }
+            .store(in: &settingsCancellables)
+    }
+    
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        previewLayer?.frame = view.bounds
+        overlayLayer.frame = view.bounds
+        overlayLayer.position = CGPoint(x: view.bounds.midX, y: view.bounds.midY)
+        processingOverlay?.frame = view.bounds
+        
+        // Ensure overlay is on top of preview but below UI controls
+        if let preview = previewLayer {
+            // Remove and re-add overlay to ensure correct z-order
+            overlayLayer.removeFromSuperlayer()
+            view.layer.insertSublayer(overlayLayer, above: preview)
+        }
+        
+        if let backButton = backButton {
+            let safeArea = view.safeAreaInsets
+            let buttonHeight: CGFloat = 44
+            let buttonWidth: CGFloat = 70
+            backButton.frame = CGRect(x: 16, y: safeArea.top + 8, width: buttonWidth, height: buttonHeight)
+            view.bringSubviewToFront(backButton)
+        }
+        
+        if let settingsButton = settingsButton {
+            let safeArea = view.safeAreaInsets
+            let buttonSize: CGFloat = 44
+            settingsButton.frame = CGRect(x: view.bounds.width - buttonSize - 16,
+                                         y: safeArea.top + 8,
+                                         width: buttonSize,
+                                         height: buttonSize)
+            view.bringSubviewToFront(settingsButton)
+        }
+        
+        if let calibrateButton = calibrateButton {
+            let safeArea = view.safeAreaInsets
+            let buttonSize: CGFloat = 44
+            calibrateButton.frame = CGRect(x: view.bounds.width - (buttonSize + 16) * 2,
+                                          y: safeArea.top + 8,
+                                          width: buttonSize,
+                                          height: buttonSize)
+            view.bringSubviewToFront(calibrateButton)
+        }
+        
+        if let recordButton = recordButton {
+            let safeArea = view.safeAreaInsets
+            let buttonSize: CGFloat = 70
+            recordButton.frame = CGRect(x: (view.bounds.width - buttonSize) / 2,
+                                        y: view.bounds.height - safeArea.bottom - buttonSize - 16,
+                                        width: buttonSize,
+                                        height: buttonSize)
+            view.bringSubviewToFront(recordButton)
+        }
+        
+        if let speedDisplayLabel = speedDisplayLabel {
+            let safeArea = view.safeAreaInsets
+            let labelWidth: CGFloat = 120
+            let labelHeight: CGFloat = 70
+            speedDisplayLabel.frame = CGRect(x: view.bounds.width - labelWidth - 16,
+                                             y: view.bounds.height - safeArea.bottom - labelHeight - 16,
+                                             width: labelWidth,
+                                             height: labelHeight)
+            view.bringSubviewToFront(speedDisplayLabel)
+        }
+        
+        // Layout zoom controls (left side, vertical center)
+        if let stackView = zoomStackView {
+            // Position stack vertically centered on left side
+            stackView.frame.origin = CGPoint(x: 16, y: (view.bounds.height - stackView.frame.height) / 2)
+            
+            view.bringSubviewToFront(stackView)
+        }
+    }
+    
+    // MARK: - Back Button Setup
+    private func setupBackButton() {
+        let button = UIButton(type: .system)
+        button.setTitle("Back", for: .normal)
+        button.setTitleColor(.white, for: .normal)
+        button.titleLabel?.font = UIFont.systemFont(ofSize: 18, weight: .medium)
+        button.backgroundColor = UIColor.black.withAlphaComponent(0.4)
+        button.layer.cornerRadius = 8
+        button.addTarget(self, action: #selector(backButtonTapped), for: .touchUpInside)
+        button.accessibilityLabel = "Back"
+        button.accessibilityHint = "Dismisses the camera view"
+        button.translatesAutoresizingMaskIntoConstraints = false
+        
+        view.addSubview(button)
+        self.backButton = button
+        
+        NSLayoutConstraint.activate([
+            button.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 16),
+            button.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8),
+            button.widthAnchor.constraint(equalToConstant: 70),
+            button.heightAnchor.constraint(equalToConstant: 44)
+        ])
+    }
+    
+    @objc private func backButtonTapped() {
+        if isRecording {
+            stopCustomRecording()
+        }
+        sessionQueue.async { [weak self] in
+            self?.captureSession.stopRunning()
+        }
+        self.dismiss(animated: true)
+    }
+    
+    // MARK: - Settings Button Setup
+    private func setupSettingsButton() {
+        let button = UIButton(type: .system)
+        let config = UIImage.SymbolConfiguration(pointSize: 24, weight: .medium)
+        let image = UIImage(systemName: "gearshape.fill", withConfiguration: config)
+        button.setImage(image, for: .normal)
+        button.tintColor = .white
+        button.backgroundColor = UIColor.black.withAlphaComponent(0.4)
+        button.layer.cornerRadius = 22
+        button.addTarget(self, action: #selector(settingsButtonTapped), for: .touchUpInside)
+        button.accessibilityLabel = "Settings"
+        button.accessibilityHint = "Opens camera settings"
+        button.translatesAutoresizingMaskIntoConstraints = false
+        
+        view.addSubview(button)
+        self.settingsButton = button
+    }
+    
+    @objc private func settingsButtonTapped() {
+        let hostingController = UIHostingController(rootView: CameraSettingsView(settings: settings))
+        hostingController.modalPresentationStyle = .pageSheet
+        
+        if let sheet = hostingController.sheetPresentationController {
+            sheet.detents = [.medium(), .large()]
+            sheet.prefersGrabberVisible = true
+        }
+        
+        present(hostingController, animated: true)
+    }
+    
+    // MARK: - Calibrate Button Setup
+    private func setupCalibrateButton() {
+        let button = UIButton(type: .system)
+        let config = UIImage.SymbolConfiguration(pointSize: 24, weight: .medium)
+        let image = UIImage(systemName: "ruler", withConfiguration: config)
+        button.setImage(image, for: .normal)
+        button.tintColor = .white
+        button.backgroundColor = settings.isCalibrated ? UIColor.green.withAlphaComponent(0.6) : UIColor.black.withAlphaComponent(0.4)
+        button.layer.cornerRadius = 22
+        button.addTarget(self, action: #selector(calibrateButtonTapped), for: .touchUpInside)
+        button.accessibilityLabel = "Calibrate"
+        button.accessibilityHint = "Opens calibration screen"
+        button.translatesAutoresizingMaskIntoConstraints = false
+        
+        view.addSubview(button)
+        self.calibrateButton = button
+    }
+    
+    @objc private func calibrateButtonTapped() {
+        // Store current zoom level to use as minimum zoom in calibration
+        let currentZoom = self.currentZoomFactor
+        
+        let hostingController = UIHostingController(rootView: CalibrationView(
+            settings: settings,
+            minimumZoom: currentZoom,
+            onDismiss: { [weak self] in
+                self?.updateCalibrateButtonAppearance()
+                
+                // Restore zoom level when returning from calibration
+                if let self = self {
+                    self.updateZoom(to: currentZoom)
+                }
+            }
+        ))
+        hostingController.modalPresentationStyle = .fullScreen
+        
+        present(hostingController, animated: true)
+    }
+    
+    private func updateCalibrateButtonAppearance() {
+        DispatchQueue.main.async {
+            self.calibrateButton.backgroundColor = self.settings.isCalibrated ? 
+                UIColor.green.withAlphaComponent(0.6) : UIColor.black.withAlphaComponent(0.4)
+        }
+    }
+    
+    // MARK: - Speed Display Setup
+    private func setupSpeedDisplay() {
+        let label = UILabel()
+        label.textAlignment = .center
+        label.numberOfLines = 0
+        label.font = UIFont.monospacedDigitSystemFont(ofSize: 32, weight: .bold)
+        label.textColor = .white
+        label.backgroundColor = UIColor.black.withAlphaComponent(0.6)
+        label.layer.cornerRadius = 12
+        label.layer.masksToBounds = true
+        label.text = "-- \(settings.speedUnit.rawValue)"
+        label.isHidden = !settings.showSpeed || !settings.ballDetectionEnabled
+        label.translatesAutoresizingMaskIntoConstraints = false
+        
+        view.addSubview(label)
+        self.speedDisplayLabel = label
+    }
+    
+    // MARK: - Zoom Controls Setup
+    private func setupZoomControls() {
+        // Only show zoom controls for live camera mode
+        guard videoURL == nil else { return }
+        
+        // Create a stack view for lens buttons
+        let stackView = UIStackView()
+        stackView.axis = .vertical
+        stackView.spacing = 8
+        stackView.alignment = .leading
+        stackView.translatesAutoresizingMaskIntoConstraints = false
+        
+        let lensOptions: [Double] = [1.0, 2.0, 4.0, 8.0]
+        
+        for lens in lensOptions {
+            let button = UIButton(type: .system)
+            button.setTitle(String(format: "%.0fx", lens), for: .normal)
+            button.titleLabel?.font = UIFont.monospacedDigitSystemFont(ofSize: 18, weight: .semibold)
+            button.tintColor = .white
+            button.backgroundColor = UIColor.black.withAlphaComponent(0.6)
+            button.layer.cornerRadius = 8
+            button.tag = Int(lens * 10) // Store lens as tag (10, 20, 40, 80)
+            button.addTarget(self, action: #selector(lensButtonTapped(_:)), for: .touchUpInside)
+            button.translatesAutoresizingMaskIntoConstraints = false
+            
+            NSLayoutConstraint.activate([
+                button.widthAnchor.constraint(equalToConstant: 60),
+                button.heightAnchor.constraint(equalToConstant: 44)
+            ])
+            
+            stackView.addArrangedSubview(button)
+        }
+        
+        view.addSubview(stackView)
+        self.zoomSlider = nil // We're using buttons instead
+        self.zoomStackView = stackView // Store the stack view
+        
+        // Update button appearance based on current selection
+        updateLensButtonAppearance()
+    }
+    
+    @objc private func lensButtonTapped(_ sender: UIButton) {
+        let lens = Double(sender.tag) / 10.0
+        currentZoomFactor = CGFloat(lens)
+        settings.selectedLens = lens
+        updateZoom(to: currentZoomFactor)
+        updateLensButtonAppearance()
+        
+        print("[Zoom] Selected \(String(format: "%.0f", lens))x lens")
+    }
+    
+    private func updateLensButtonAppearance() {
+        guard let stackView = zoomStackView else { return }
+        
+        for case let button as UIButton in stackView.arrangedSubviews {
+            let lens = Double(button.tag) / 10.0
+            if abs(lens - settings.selectedLens) < 0.1 {
+                button.backgroundColor = UIColor.systemBlue.withAlphaComponent(0.8)
+                button.transform = CGAffineTransform(scaleX: 1.1, y: 1.1)
+            } else {
+                button.backgroundColor = UIColor.black.withAlphaComponent(0.6)
+                button.transform = .identity
+            }
+        }
+    }
+    
+    @objc private func zoomSliderChanged(_ sender: UISlider) {
+        // Not used anymore, but keeping for compatibility
+    }
+    
+    private func updateZoom(to factor: CGFloat) {
+        guard let device = videoDeviceInput?.device else { return }
+        
+        do {
+            try device.lockForConfiguration()
+            
+            // Clamp zoom to device capabilities
+            let maxZoom = min(device.activeFormat.videoMaxZoomFactor, 10.0)
+            let clampedFactor = max(1.0, min(factor, maxZoom))
+            
+            device.videoZoomFactor = clampedFactor
+            device.unlockForConfiguration()
+            
+            print("[Zoom] Set zoom to \(String(format: "%.1f", clampedFactor))x")
+        } catch {
+            print("[Zoom] Error setting zoom: \(error)")
+        }
+    }
+    
+    private func updateSpeedDisplay(_ speed: Double) {
+        DispatchQueue.main.async {
+            let convertedSpeed = self.settings.speedUnit.convert(fromMPH: speed)
+            if speed > 0 {
+                self.speedDisplayLabel.text = String(format: "%.0f\n%@", convertedSpeed, self.settings.speedUnit.rawValue)
+            } else {
+                self.speedDisplayLabel.text = "-- \(self.settings.speedUnit.rawValue)"
+            }
+        }
+    }
+    
+    // MARK: - Record Button Setup
+    private func setupRecordButton() {
+        let button = UIButton(type: .custom)
+        button.backgroundColor = UIColor.red.withAlphaComponent(0.7)
+        button.layer.cornerRadius = 35
+        button.layer.borderColor = UIColor.white.cgColor
+        button.layer.borderWidth = 2
+        button.addTarget(self, action: #selector(recordButtonTapped), for: .touchUpInside)
+        button.accessibilityLabel = "Record"
+        button.accessibilityHint = "Start or stop video recording"
+        button.translatesAutoresizingMaskIntoConstraints = false
+        
+        view.addSubview(button)
+        self.recordButton = button
+        
+        updateRecordButton(isRecording: false)
+    }
+    
+    private func updateRecordButton(isRecording: Bool) {
+        DispatchQueue.main.async {
+            if isRecording {
+                self.recordButton.backgroundColor = UIColor.red.withAlphaComponent(1.0)
+                self.recordButton.layer.borderWidth = 0
+            } else {
+                self.recordButton.backgroundColor = UIColor.red.withAlphaComponent(0.7)
+                self.recordButton.layer.borderWidth = 2
+            }
+        }
+    }
+    
+    @objc private func recordButtonTapped() {
+        if isRecording {
+            stopCustomRecording()
+        } else {
+            startCustomRecording()
+        }
+    }
+    
+    private func startCustomRecording() {
+        guard !isRecording else { return }
+        
+        let orientation = UIDevice.current.orientation
+        let isPortrait = orientation == .portrait || orientation == .portraitUpsideDown
+        let baseWidth = Int(self.activeDimensions.width)
+        let baseHeight = Int(self.activeDimensions.height)
+        let videoWidth = isPortrait ? min(baseWidth, baseHeight) : max(baseWidth, baseHeight)
+        let videoHeight = isPortrait ? max(baseWidth, baseHeight) : min(baseWidth, baseHeight)
+        let videoTransform = CGAffineTransform.identity
+        
+        let outputFileName = UUID().uuidString
+        let outputFilePath = (NSTemporaryDirectory() as NSString).appendingPathComponent(outputFileName + ".mov")
+        let outputURL = URL(fileURLWithPath: outputFilePath)
+        
+        do {
+            assetWriter = try AVAssetWriter(outputURL: outputURL, fileType: .mov)
+        } catch {
+            print("Failed to create AVAssetWriter: \(error)")
+            return
+        }
+        
+        print("[Recording] Using ProRes for \(videoWidth)x\(videoHeight) @ \(self.activeFrameRate) fps")
+        
+        let videoSettings: [String: Any] = [
+            AVVideoCodecKey: AVVideoCodecType.proRes422Proxy,
+            AVVideoWidthKey: videoWidth,
+            AVVideoHeightKey: videoHeight
+        ]
+        
+        assetWriterInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+        assetWriterInput?.expectsMediaDataInRealTime = true
+        
+        let mediaTimeScale = CMTimeScale(max(600, Int32(self.activeFrameRate * 10)))
+        assetWriter?.movieTimeScale = mediaTimeScale
+        assetWriterInput?.mediaTimeScale = mediaTimeScale
+        
+        assetWriterInput?.performsMultiPassEncodingIfSupported = false
+        
+        assetWriterInput?.transform = videoTransform
+        
+        guard let assetWriter = assetWriter,
+              let assetWriterInput = assetWriterInput else {
+            print("Asset writer or input not available")
+            return
+        }
+        
+        if assetWriter.canAdd(assetWriterInput) {
+            assetWriter.add(assetWriterInput)
+        } else {
+            print("Cannot add asset writer input")
+            return
+        }
+        
+        let sourcePixelBufferAttributes: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+            kCVPixelBufferWidthKey as String: videoWidth,
+            kCVPixelBufferHeightKey as String: videoHeight,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+        ]
+        
+        pixelBufferAdaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: assetWriterInput,
+                                                                  sourcePixelBufferAttributes: sourcePixelBufferAttributes)
+        
+        recordingStartTime = nil
+        
+        self.detectionMarkers.removeAll()
+        self.poseHistory.removeAll()
+        self.fusedFrameData.removeAll()
+        self.lastPoseObservation = nil
+        self.ballPositionHistory.removeAll()
+        self.currentSpeed = 0.0
+        self.peakSpeed = 0.0
+        self.estimatedPixelsPerFoot = nil
+        self.videoRotationDegrees = 0  // Live recordings are already portrait
+        
+        // Reset frame timing debug
+        self.lastFrameTime = nil
+        self.frameCount = 0
+        
+        isRecording = true
+        updateRecordButton(isRecording: true)
+        onRecordingStateChanged?(true)
+        
+        print("[Recording] Started recording at \(self.activeFrameRate) fps using ProRes 422 Proxy")
+    }
+    
+    private func stopCustomRecording() {
+        guard isRecording, let assetWriter = assetWriter, let assetWriterInput = assetWriterInput else { return }
+        
+        isRecording = false
+        updateRecordButton(isRecording: false)
+        onRecordingStateChanged?(false)
+        
+        if let startTime = recordingStartTime, let endTime = lastFrameTime {
+            let duration = CMTimeGetSeconds(CMTimeSubtract(endTime, startTime))
+            let avgFPS = Double(frameCount) / duration
+            print("[Recording] Stopped. Recorded \(frameCount) frames in \(String(format: "%.2f", duration))s = \(String(format: "%.1f", avgFPS)) fps average")
+            
+            if peakSpeed > 0 {
+                print("[Recording] 🎯 PEAK SPEED RECORDED: \(String(format: "%.1f", peakSpeed)) mph")
+            }
+        }
+        
+        assetWriterInput.markAsFinished()
+        assetWriter.finishWriting { [weak self] in
+            guard let self = self else { return }
+            let rawVideoURL = assetWriter.outputURL
+            
+            print("[Recording] Raw video saved to: \(rawVideoURL.path)")
+            print("[Recording] Starting annotation post-processing...")
+            
+            // Export biomechanical analysis data
+            self.saveBiomechanicalDataToFile()
+            
+            DispatchQueue.main.async {
+                self.showProcessingOverlay(message: "Adding annotations to video...")
+            }
+            
+            Task {
+                await self.postProcessVideoWithAnnotations(rawVideoURL: rawVideoURL)
+            }
+            
+            self.assetWriter = nil
+            self.assetWriterInput = nil
+            self.pixelBufferAdaptor = nil
+            self.recordingStartTime = nil
+        }
+    }
+    
+    private func dismissToRootAndPresentAlert(_ alert: UIAlertController) {
+        DispatchQueue.main.async {
+            let presentAlert = {
+                if let root = self.view.window?.rootViewController {
+                    var top = root
+                    while let presented = top.presentedViewController { top = presented }
+                    top.present(alert, animated: true)
+                } else {
+                    self.topMostViewController().present(alert, animated: true)
+                }
+            }
+            if let nav = self.navigationController {
+                nav.popToRootViewController(animated: true)
+                nav.dismiss(animated: true) {
+                    presentAlert()
+                }
+            } else if let presenting = self.presentingViewController {
+                var rootPresenter = presenting
+                while let p = rootPresenter.presentingViewController { rootPresenter = p }
+                rootPresenter.presentedViewController?.dismiss(animated: true) {
+                    presentAlert()
+                }
+            } else {
+                self.view.window?.rootViewController?.dismiss(animated: true) {
+                    presentAlert()
+                }
+            }
+        }
+    }
+    
+    private func saveToPhotosThenAlert(outputURL: URL) {
+        Task { @MainActor in
+            await withCheckedContinuation { continuation in
+                self.ensurePhotoLibraryPermission { granted in
+                    Task { @MainActor in
+                        guard granted else {
+                            let alert = UIAlertController(title: "Photos Access Denied",
+                                                          message: "Annotated video exported to a temporary file, but app does not have permission to save to Photos. Please enable Photos access in Settings.",
+                                                          preferredStyle: .alert)
+                            alert.addAction(UIAlertAction(title: "OK", style: .default))
+                            self.dismissToRootAndPresentAlert(alert)
+                            continuation.resume()
+                            return
+                        }
+                        var localIdentifier: String?
+                        PHPhotoLibrary.shared().performChanges({
+                            if let placeholder = PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: outputURL)?.placeholderForCreatedAsset {
+                                localIdentifier = placeholder.localIdentifier
+                            }
+                        }) { success, error in
+                            Task { @MainActor in
+                                if success, let id = localIdentifier {
+                                    self.onVideoSaved?(id)
+                                    let alert = UIAlertController(title: "Success",
+                                                                  message: "Annotated video saved to Photos.",
+                                                                  preferredStyle: .alert)
+                                    alert.addAction(UIAlertAction(title: "OK", style: .default))
+                                    self.dismissToRootAndPresentAlert(alert)
+                                } else {
+                                    self.onVideoSaved?("")
+                                    let alert = UIAlertController(title: "Save Failed",
+                                                                  message: "Could not save video to Photos. Please check permissions or available space.",
+                                                                  preferredStyle: .alert)
+                                    alert.addAction(UIAlertAction(title: "OK", style: .default))
+                                    self.dismissToRootAndPresentAlert(alert)
+                                }
+                                continuation.resume()
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // MARK: - Processing Overlay
+    private func showProcessingOverlay(message: String) {
+        if processingOverlay == nil {
+            let overlay = UIView(frame: view.bounds)
+            overlay.backgroundColor = UIColor.black.withAlphaComponent(0.4)
+            
+            let spinner = UIActivityIndicatorView(style: .large)
+            spinner.translatesAutoresizingMaskIntoConstraints = false
+            spinner.startAnimating()
+            
+            let label = UILabel()
+            label.translatesAutoresizingMaskIntoConstraints = false
+            label.textColor = .white
+            label.font = UIFont.preferredFont(forTextStyle: .headline)
+            label.textAlignment = .center
+            label.numberOfLines = 0
+            
+            overlay.addSubview(spinner)
+            overlay.addSubview(label)
+            
+            NSLayoutConstraint.activate([
+                spinner.centerXAnchor.constraint(equalTo: overlay.centerXAnchor),
+                spinner.centerYAnchor.constraint(equalTo: overlay.centerYAnchor, constant: -12),
+                label.topAnchor.constraint(equalTo: spinner.bottomAnchor, constant: 12),
+                label.leadingAnchor.constraint(equalTo: overlay.leadingAnchor, constant: 24),
+                label.trailingAnchor.constraint(equalTo: overlay.trailingAnchor, constant: -24)
+            ])
+            
+            processingOverlay = overlay
+            processingLabel = label
+            processingSpinner = spinner
+            view.addSubview(overlay)
+        }
+        processingOverlay?.isHidden = false
+        updateProcessingMessage(message)
+    }
+    
+    private func hideProcessingOverlay() {
+        processingOverlay?.isHidden = true
+    }
+    
+    private func updateProcessingMessage(_ message: String) {
+        processingLabel?.text = message
+    }
+    
+    // MARK: - Camera Setup
+    private func setupCamera() {
+        print("🎥 setupCamera() called on thread: \(Thread.current)")
+        captureSession.beginConfiguration()
+
+        captureSession.sessionPreset = .inputPriority
+        
+        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else {
+            print("❌ ERROR: Could not get camera device")
+            return
+        }
+        
+        print("✅ Got camera device: \(device.localizedName)")
+        
+        let preferredDims: [(width: Int32, height: Int32)] = [
+            (1920, 1080), (1080, 1920),
+            (1280, 720), (720, 1280)
+        ]
+        
+        func maxFPS(for format: AVCaptureDevice.Format) -> Double {
+            return format.videoSupportedFrameRateRanges.map { $0.maxFrameRate }.max() ?? 0
+        }
+        
+        let globalMaxFPS = device.formats.map { maxFPS(for: $0) }.max() ?? 0
+        print("[Camera] Found \(device.formats.count) formats, max fps available: \(globalMaxFPS)")
+        
+        let highestFPSFormats = device.formats.filter { maxFPS(for: $0) == globalMaxFPS }
+        print("[Camera] \(highestFPSFormats.count) formats support \(globalMaxFPS) fps")
+        
+        let preferredHighSpeedFormat: AVCaptureDevice.Format? = {
+            for dim in preferredDims {
+                if let match = highestFPSFormats.first(where: { fmt in
+                    let d = CMVideoFormatDescriptionGetDimensions(fmt.formatDescription)
+                    return (d.width == dim.width && d.height == dim.height)
+                }) {
+                    return match
+                }
+            }
+            return nil
+        }()
+        
+        let chosenFormat: AVCaptureDevice.Format? = preferredHighSpeedFormat ?? device.formats.max(by: { f1, f2 in
+            let fps1 = maxFPS(for: f1)
+            let fps2 = maxFPS(for: f2)
+            if fps1 == fps2 {
+                let d1 = CMVideoFormatDescriptionGetDimensions(f1.formatDescription)
+                let d2 = CMVideoFormatDescriptionGetDimensions(f2.formatDescription)
+                let area1 = Int(d1.width) * Int(d1.height)
+                let area2 = Int(d2.width) * Int(d2.height)
+                return area1 < area2
+            }
+            return fps1 < fps2
+        })
+        
+        if let bestFormat = chosenFormat {
+            let maxFrameRate = maxFPS(for: bestFormat)
+            let dims = CMVideoFormatDescriptionGetDimensions(bestFormat.formatDescription)
+            print("[Camera] Chose format: \(dims.width)x\(dims.height) supporting max \(maxFrameRate) fps")
+            
+            do {
+                try device.lockForConfiguration()
+                device.activeFormat = bestFormat
+                let desc = CMVideoFormatDescriptionGetDimensions(bestFormat.formatDescription)
+                self.activeDimensions = desc
+                if let frameRateRange = bestFormat.videoSupportedFrameRateRanges.first(where: { $0.maxFrameRate == maxFrameRate }) {
+                    let duration = CMTimeMake(value: 1, timescale: Int32(frameRateRange.maxFrameRate.rounded()))
+                    device.activeVideoMinFrameDuration = duration
+                    device.activeVideoMaxFrameDuration = duration
+                    print("[Camera] Set frame duration to \(duration.value)/\(duration.timescale)")
+                }
+                device.unlockForConfiguration()
+                
+                let actualDuration = device.activeVideoMaxFrameDuration
+                if actualDuration.seconds > 0 {
+                    self.activeFrameRate = 1.0 / actualDuration.seconds
+                } else {
+                    self.activeFrameRate = Double(maxFrameRate)
+                }
+                
+                print("[Camera] Active configuration: \(self.activeDimensions.width)x\(self.activeDimensions.height) @ \(self.activeFrameRate) fps")
+                
+                // Confirm if we got 240fps
+                if self.activeFrameRate >= 240 {
+                    print("[Camera] ✅ SUCCESS: Running at 240fps or higher!")
+                } else if self.activeFrameRate >= 120 {
+                    print("[Camera] ⚠️ WARNING: Running at 120fps (not 240fps)")
+                } else {
+                    print("[Camera] ⚠️ WARNING: Running at \(self.activeFrameRate)fps (expected 240fps)")
+                }
+            } catch {
+                print("Failed to configure device for highest frame rate: \(error)")
+            }
+        } else {
+            print("[Camera] ERROR: No suitable format found!")
+        }
+        
+        do {
+            videoDeviceInput = try AVCaptureDeviceInput(device: device)
+        } catch {
+            print("Error creating device input: \(error)")
+            return
+        }
+        
+        guard videoDeviceInput != nil else { return }
+        captureSession.addInput(videoDeviceInput)
+        
+        videoOutput = AVCaptureVideoDataOutput()
+        videoOutput.videoSettings = [
+            kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+        ]
+        
+        let videoQueue = DispatchQueue(label: "videoQueue", qos: .userInteractive, attributes: [], autoreleaseFrequency: .workItem)
+        videoOutput.setSampleBufferDelegate(self, queue: videoQueue)
+        
+        if captureSession.canAddOutput(videoOutput) {
+            captureSession.addOutput(videoOutput)
+        }
+        
+        videoOutput.alwaysDiscardsLateVideoFrames = false
+        
+        if let connection = videoOutput.connection(with: .video) {
+            if #available(iOS 17.0, *) {
+                let desiredAngle: CGFloat = 90
+                if connection.isVideoRotationAngleSupported(desiredAngle) {
+                    connection.videoRotationAngle = desiredAngle
+                }
+            } else {
+                if connection.isVideoOrientationSupported {
+                    connection.videoOrientation = .portrait
+                }
+            }
+            
+            self.mirrored = (videoDeviceInput.device.position == .front)
+            self.contentFlippedVertically = false
+        }
+        
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            let bounds = self.view.bounds
+            let preview = AVCaptureVideoPreviewLayer(session: self.captureSession)
+            preview.videoGravity = .resizeAspectFill
+            preview.frame = bounds
+            self.previewLayer = preview
+            self.view.layer.insertSublayer(preview, at: 0)
+        }
+        
+        self.sessionQueue.async { [weak self] in
+            self?.captureSession.startRunning()
+        }
+        
+        captureSession.commitConfiguration()
+    }
+    
+    // MARK: - Overlay & CoreML
+    private func setupOverlay() {
+        overlayLayer.frame = view.bounds
+        overlayLayer.backgroundColor = UIColor.clear.cgColor
+        view.layer.addSublayer(overlayLayer)
+    }
+    
+    private func setupModel() {
+        // Load the CoreML model - replace 'YourModelName' with your actual .mlmodel file name
+        // For example, if your model is called 'best.mlmodel', use 'best'
+        // If it's 'baseball_detector.mlmodel', use 'baseball_detector'
+        guard let modelURL = Bundle.main.url(forResource: "best", withExtension: "mlmodelc"),
+              let mlmodel = try? MLModel(contentsOf: modelURL),
+              let visionModel = try? VNCoreMLModel(for: mlmodel) else { 
+            fatalError("Could not load CoreML model. Ensure 'best.mlmodel' is added to your project.") 
+        }
+        self.visionModel = visionModel
+        
+        let request = VNCoreMLRequest(model: visionModel) { [weak self] request, _ in
+            guard let self = self else { return }
+            let results = (request.results as? [VNRecognizedObjectObservation]) ?? []
+            self.lastObservations = results
+            
+            let baseballDetections = results.filter { obs in
+                guard let label = obs.labels.first else { return false }
+                return label.identifier == "baseball" && obs.confidence >= self.settings.ballConfidenceThreshold
+            }.sorted { $0.confidence > $1.confidence }
+            
+            DispatchQueue.main.async {
+                self.overlayLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+                
+                // Draw ball detection if enabled
+                if self.settings.ballDetectionEnabled, let bestDetection = baseballDetections.first {
+                    self.drawBoundingBox(bestDetection.boundingBox,
+                                         bufferSize: self.view.bounds.size,
+                                         confidence: bestDetection.confidence,
+                                         mirrored: self.mirrored,
+                                         contentFlippedVertically: self.contentFlippedVertically)
+                }
+                
+                // Always draw pose skeleton if pose estimation is enabled (regardless of ball detection)
+                if let poseObs = self.lastPoseObservation, self.settings.poseEstimationEnabled {
+                    self.drawPoseSkeleton(poseObs, bufferSize: self.view.bounds.size)
+                }
+                
+                // Draw calibration overlay if calibrated
+                if self.settings.isCalibrated {
+                    self.drawCalibrationOverlay(bufferSize: self.view.bounds.size)
+                }
+                
+                // Draw strike zone if enabled and calibrated
+                if self.settings.isCalibrated && self.settings.showStrikeZone {
+                    self.drawStrikeZone(bufferSize: self.view.bounds.size)
+                }
+            }
+        }
+        request.imageCropAndScaleOption = VNImageCropAndScaleOption.scaleFill
+        self.requests = [request]
+        
+        // Setup pose estimation request
+        setupPoseEstimation()
+    }
+    
+    private func setupPoseEstimation() {
+        poseRequest = VNDetectHumanBodyPoseRequest { [weak self] request, error in
+            guard let self = self else { return }
+            
+            if let error = error {
+                print("[Pose] Error: \(error.localizedDescription)")
+                return
+            }
+            
+            guard let observations = request.results as? [VNHumanBodyPoseObservation],
+                  let observation = observations.first else { return }
+            
+            self.lastPoseObservation = observation
+            
+            // Store pose history for analysis
+            if let lastFrameTime = self.lastFrameTime {
+                self.poseHistory.append((timestamp: lastFrameTime, observation: observation))
+                
+                // Keep only recent history (last 5 seconds)
+                let cutoffTime = CMTimeSubtract(lastFrameTime, CMTime(seconds: 5, preferredTimescale: 600))
+                self.poseHistory.removeAll { CMTimeCompare($0.timestamp, cutoffTime) < 0 }
+            }
+            
+            // If ball detection is disabled, we need to update the overlay here
+            // (normally the ball detection request handler does this)
+            if !self.settings.ballDetectionEnabled && self.settings.poseEstimationEnabled {
+                DispatchQueue.main.async {
+                    self.overlayLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+                    self.drawPoseSkeleton(observation, bufferSize: self.view.bounds.size)
+                }
+            }
+        }
+    }
+    
+    // MARK: - Coordinate Conversion
+    private func convertBoundingBox(_ rect: CGRect, bufferSize: CGSize, mirrored: Bool, contentFlippedVertically: Bool) -> CGRect {
+        var x = rect.origin.x * bufferSize.width
+        var y = rect.origin.y * bufferSize.height
+        let w = rect.width * bufferSize.width
+        let h = rect.height * bufferSize.height
+
+        if mirrored { x = bufferSize.width - x - w }
+        if !contentFlippedVertically {
+            y = bufferSize.height - y - h
+        }
+
+        return CGRect(x: x, y: y, width: w, height: h)
+    }
+
+    private func convertPoint(_ point: CGPoint, bufferSize: CGSize, mirrored: Bool, contentFlippedVertically: Bool) -> CGPoint {
+        var x = point.x * bufferSize.width
+        var y = point.y * bufferSize.height
+
+        if mirrored { x = bufferSize.width - x }
+        if !contentFlippedVertically {
+            y = bufferSize.height - y
+        }
+
+        return CGPoint(x: x, y: y)
+    }
+    
+    private func drawBoundingBox(_ rect: CGRect, bufferSize: CGSize,
+                                 confidence: VNConfidence, mirrored: Bool,
+                                 contentFlippedVertically: Bool) {
+        let boxRect = convertBoundingBox(rect, bufferSize: bufferSize,
+                                         mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+        
+        let centerX = boxRect.midX
+        let centerY = boxRect.midY
+        
+        let ballUIColor = settings.ballColor.toUIColor()
+        
+        let circleLayer = CAShapeLayer()
+        let circlePath = UIBezierPath(ovalIn: CGRect(x: boxRect.minX, 
+                                                      y: boxRect.minY,
+                                                      width: boxRect.width,
+                                                      height: boxRect.height))
+        circleLayer.path = circlePath.cgPath
+        circleLayer.strokeColor = ballUIColor.cgColor
+        circleLayer.fillColor = UIColor.clear.cgColor
+        circleLayer.lineWidth = 3
+        
+        overlayLayer.addSublayer(circleLayer)
+        
+        if settings.showLabels {
+            // Calculate speed (works with calibration OR auto-estimation)
+            if settings.showSpeed, let lastTime = lastFrameTime {
+                let normalizedCenter = CGPoint(x: centerX / bufferSize.width,
+                                              y: centerY / bufferSize.height)
+                let speed = calculateSpeed(newPosition: normalizedCenter, timestamp: lastTime, actualViewSize: bufferSize, ballBoundingBox: rect)
+                
+                let speedText = String(format: "%.0f mph", speed)
+                let confidenceText = String(format: "%.0f%%", confidence * 100)
+                let combinedText = "\(confidenceText)\n\(speedText)"
+                
+                let textLayer = CATextLayer()
+                textLayer.string = combinedText
+                textLayer.foregroundColor = ballUIColor.cgColor
+                textLayer.backgroundColor = UIColor.black.withAlphaComponent(0.6).cgColor
+                textLayer.fontSize = 24
+                textLayer.alignmentMode = .center
+                textLayer.contentsScale = view.traitCollection.displayScale
+                
+                let textWidth: CGFloat = 100
+                let textHeight: CGFloat = 60
+                textLayer.frame = CGRect(x: centerX - textWidth / 2,
+                                        y: centerY - textHeight / 2,
+                                        width: textWidth,
+                                        height: textHeight)
+                textLayer.cornerRadius = 4
+                
+                overlayLayer.addSublayer(textLayer)
+            } else {
+                // Show confidence only (speed disabled or no timestamp yet)
+                let textLayer = CATextLayer()
+                textLayer.string = String(format: "%.0f%%", confidence * 100)
+                textLayer.foregroundColor = ballUIColor.cgColor
+                textLayer.backgroundColor = UIColor.clear.cgColor
+                textLayer.fontSize = 28
+                textLayer.alignmentMode = .center
+                textLayer.contentsScale = view.traitCollection.displayScale
+                
+                let textWidth: CGFloat = 80
+                let textHeight: CGFloat = 35
+                textLayer.frame = CGRect(x: centerX - textWidth / 2,
+                                        y: centerY - textHeight / 2,
+                                        width: textWidth,
+                                        height: textHeight)
+                
+                overlayLayer.addSublayer(textLayer)
+            }
+        }
+    }
+    
+    // MARK: - Pose Skeleton Drawing
+    private func drawPoseSkeleton(_ observation: VNHumanBodyPoseObservation, bufferSize: CGSize) {
+        // Define skeleton connections (bones)
+        let connections: [(VNHumanBodyPoseObservation.JointName, VNHumanBodyPoseObservation.JointName)] = [
+            // Torso
+            (.neck, .rightShoulder),
+            (.neck, .leftShoulder),
+            (.rightShoulder, .rightHip),
+            (.leftShoulder, .leftHip),
+            (.rightHip, .leftHip),
+            
+            // Right arm
+            (.rightShoulder, .rightElbow),
+            (.rightElbow, .rightWrist),
+            
+            // Left arm
+            (.leftShoulder, .leftElbow),
+            (.leftElbow, .leftWrist),
+            
+            // Right leg
+            (.rightHip, .rightKnee),
+            (.rightKnee, .rightAnkle),
+            
+            // Left leg
+            (.leftHip, .leftKnee),
+            (.leftKnee, .leftAnkle)
+        ]
+        
+        // Get all recognized points
+        guard let recognizedPoints = try? observation.recognizedPoints(.all) else { return }
+        
+        let skeletonUIColor = settings.skeletonColor.toUIColor()
+        let jointUIColor = settings.jointColor.toUIColor()
+        
+        // Draw connections (bones)
+        for (startJoint, endJoint) in connections {
+            guard let startPoint = recognizedPoints[startJoint],
+                  let endPoint = recognizedPoints[endJoint],
+                  startPoint.confidence > settings.poseConfidenceThreshold,
+                  endPoint.confidence > settings.poseConfidenceThreshold else { continue }
+            
+            let start = convertPoint(startPoint.location, bufferSize: bufferSize,
+                                    mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let end = convertPoint(endPoint.location, bufferSize: bufferSize,
+                                  mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            
+            let bonePath = UIBezierPath()
+            bonePath.move(to: start)
+            bonePath.addLine(to: end)
+            
+            let boneLayer = CAShapeLayer()
+            boneLayer.path = bonePath.cgPath
+            boneLayer.strokeColor = skeletonUIColor.cgColor
+            boneLayer.lineWidth = 3
+            boneLayer.lineCap = .round
+            
+            overlayLayer.addSublayer(boneLayer)
+        }
+        
+        // Draw joints (keypoints)
+        for (_, point) in recognizedPoints {
+            guard point.confidence > settings.poseConfidenceThreshold else { continue }
+            
+            let location = convertPoint(point.location, bufferSize: bufferSize,
+                                       mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            
+            let jointSize: CGFloat = 8
+            let jointRect = CGRect(x: location.x - jointSize/2,
+                                  y: location.y - jointSize/2,
+                                  width: jointSize,
+                                  height: jointSize)
+            
+            let jointLayer = CAShapeLayer()
+            jointLayer.path = UIBezierPath(ovalIn: jointRect).cgPath
+            jointLayer.fillColor = jointUIColor.cgColor
+            jointLayer.strokeColor = UIColor.white.cgColor
+            jointLayer.lineWidth = 2
+            
+            overlayLayer.addSublayer(jointLayer)
+        }
+        
+        // Draw joint angles with labels
+        if settings.showLabels {
+            drawJointAngles(observation, bufferSize: bufferSize)
+        }
+    }
+    
+    // MARK: - Draw Joint Angles with Labels
+    private func drawJointAngles(_ observation: VNHumanBodyPoseObservation, bufferSize: CGSize) {
+        guard let recognizedPoints = try? observation.recognizedPoints(.all) else { return }
+        
+        let angleConfidenceThreshold = settings.poseConfidenceThreshold
+        
+        // Debug: Log detected joints every 60 frames
+        if frameCount % 60 == 0 {
+            var detectedJoints: [String] = []
+            for (jointName, point) in recognizedPoints where point.confidence > angleConfidenceThreshold {
+                detectedJoints.append("\(jointName.rawValue): \(String(format: "%.2f", point.confidence))")
+            }
+            print("[Pose Debug] Detected joints: \(detectedJoints.joined(separator: ", "))")
+        }
+        
+        let elbowColor = settings.elbowAngleColor.toUIColor()
+        let kneeColor = settings.kneeAngleColor.toUIColor()
+        let shoulderColor = settings.shoulderAngleColor.toUIColor()
+        
+        // Right Elbow Angle (Shoulder-Elbow-Wrist)
+        if let rightShoulder = recognizedPoints[.rightShoulder],
+           let rightElbow = recognizedPoints[.rightElbow],
+           let rightWrist = recognizedPoints[.rightWrist],
+           rightShoulder.confidence > angleConfidenceThreshold,
+           rightElbow.confidence > angleConfidenceThreshold,
+           rightWrist.confidence > angleConfidenceThreshold {
+            
+            let shoulderPt = convertPoint(rightShoulder.location, bufferSize: bufferSize,
+                                         mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let elbowPt = convertPoint(rightElbow.location, bufferSize: bufferSize,
+                                      mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let wristPt = convertPoint(rightWrist.location, bufferSize: bufferSize,
+                                      mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            
+            let angle = calculateJointAngle(proximal: shoulderPt, joint: elbowPt, distal: wristPt)
+            drawAngleArc(at: elbowPt, from: shoulderPt, to: wristPt, angle: angle, label: "R Elbow", color: elbowColor)
+        }
+        
+        // Left Elbow Angle (Shoulder-Elbow-Wrist)
+        if let leftShoulder = recognizedPoints[.leftShoulder],
+           let leftElbow = recognizedPoints[.leftElbow],
+           let leftWrist = recognizedPoints[.leftWrist],
+           leftShoulder.confidence > angleConfidenceThreshold,
+           leftElbow.confidence > angleConfidenceThreshold,
+           leftWrist.confidence > angleConfidenceThreshold {
+            
+            let shoulderPt = convertPoint(leftShoulder.location, bufferSize: bufferSize,
+                                         mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let elbowPt = convertPoint(leftElbow.location, bufferSize: bufferSize,
+                                      mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let wristPt = convertPoint(leftWrist.location, bufferSize: bufferSize,
+                                      mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            
+            let angle = calculateJointAngle(proximal: shoulderPt, joint: elbowPt, distal: wristPt)
+            drawAngleArc(at: elbowPt, from: shoulderPt, to: wristPt, angle: angle, label: "L Elbow", color: elbowColor)
+        }
+        
+        // Right Knee Angle (Hip-Knee-Ankle)
+        if let rightHip = recognizedPoints[.rightHip],
+           let rightKnee = recognizedPoints[.rightKnee],
+           let rightAnkle = recognizedPoints[.rightAnkle],
+           rightHip.confidence > angleConfidenceThreshold,
+           rightKnee.confidence > angleConfidenceThreshold,
+           rightAnkle.confidence > angleConfidenceThreshold {
+            
+            let hipPt = convertPoint(rightHip.location, bufferSize: bufferSize,
+                                    mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let kneePt = convertPoint(rightKnee.location, bufferSize: bufferSize,
+                                     mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let anklePt = convertPoint(rightAnkle.location, bufferSize: bufferSize,
+                                      mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            
+            let angle = calculateJointAngle(proximal: hipPt, joint: kneePt, distal: anklePt)
+            drawAngleArc(at: kneePt, from: hipPt, to: anklePt, angle: angle, label: "R Knee", color: kneeColor)
+        }
+        
+        // Left Knee Angle (Hip-Knee-Ankle)
+        if let leftHip = recognizedPoints[.leftHip],
+           let leftKnee = recognizedPoints[.leftKnee],
+           let leftAnkle = recognizedPoints[.leftAnkle],
+           leftHip.confidence > angleConfidenceThreshold,
+           leftKnee.confidence > angleConfidenceThreshold,
+           leftAnkle.confidence > angleConfidenceThreshold {
+            
+            let hipPt = convertPoint(leftHip.location, bufferSize: bufferSize,
+                                    mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let kneePt = convertPoint(leftKnee.location, bufferSize: bufferSize,
+                                     mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let anklePt = convertPoint(leftAnkle.location, bufferSize: bufferSize,
+                                      mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            
+            let angle = calculateJointAngle(proximal: hipPt, joint: kneePt, distal: anklePt)
+            drawAngleArc(at: kneePt, from: hipPt, to: anklePt, angle: angle, label: "L Knee", color: kneeColor)
+        }
+        
+        // Right Shoulder Angle (Hip-Shoulder-Elbow)
+        if let rightHip = recognizedPoints[.rightHip],
+           let rightShoulder = recognizedPoints[.rightShoulder],
+           let rightElbow = recognizedPoints[.rightElbow],
+           rightHip.confidence > angleConfidenceThreshold,
+           rightShoulder.confidence > angleConfidenceThreshold,
+           rightElbow.confidence > angleConfidenceThreshold {
+            
+            let hipPt = convertPoint(rightHip.location, bufferSize: bufferSize,
+                                    mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let shoulderPt = convertPoint(rightShoulder.location, bufferSize: bufferSize,
+                                         mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let elbowPt = convertPoint(rightElbow.location, bufferSize: bufferSize,
+                                      mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            
+            let angle = calculateJointAngle(proximal: hipPt, joint: shoulderPt, distal: elbowPt)
+            drawAngleArc(at: shoulderPt, from: hipPt, to: elbowPt, angle: angle, label: "R Shoulder", color: shoulderColor)
+        }
+        
+        // Left Shoulder Angle (Hip-Shoulder-Elbow)
+        if let leftHip = recognizedPoints[.leftHip],
+           let leftShoulder = recognizedPoints[.leftShoulder],
+           let leftElbow = recognizedPoints[.leftElbow],
+           leftHip.confidence > angleConfidenceThreshold,
+           leftShoulder.confidence > angleConfidenceThreshold,
+           leftElbow.confidence > angleConfidenceThreshold {
+            
+            let hipPt = convertPoint(leftHip.location, bufferSize: bufferSize,
+                                    mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let shoulderPt = convertPoint(leftShoulder.location, bufferSize: bufferSize,
+                                         mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let elbowPt = convertPoint(leftElbow.location, bufferSize: bufferSize,
+                                      mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            
+            let angle = calculateJointAngle(proximal: hipPt, joint: shoulderPt, distal: elbowPt)
+            drawAngleArc(at: shoulderPt, from: hipPt, to: elbowPt, angle: angle, label: "L Shoulder", color: shoulderColor)
+        }
+        
+        // Hip-Shoulder Separation (Torso Rotation Indicator)
+        if let leftShoulder = recognizedPoints[.leftShoulder],
+           let rightShoulder = recognizedPoints[.rightShoulder],
+           let leftHip = recognizedPoints[.leftHip],
+           let rightHip = recognizedPoints[.rightHip],
+           leftShoulder.confidence > angleConfidenceThreshold,
+           rightShoulder.confidence > angleConfidenceThreshold,
+           leftHip.confidence > angleConfidenceThreshold,
+           rightHip.confidence > angleConfidenceThreshold {
+            
+            let lShoulder = convertPoint(leftShoulder.location, bufferSize: bufferSize,
+                                        mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let rShoulder = convertPoint(rightShoulder.location, bufferSize: bufferSize,
+                                        mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let lHip = convertPoint(leftHip.location, bufferSize: bufferSize,
+                                   mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let rHip = convertPoint(rightHip.location, bufferSize: bufferSize,
+                                   mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            
+            // Calculate shoulder line angle
+            let shoulderAngle = atan2(rShoulder.y - lShoulder.y, rShoulder.x - lShoulder.x)
+            // Calculate hip line angle
+            let hipAngle = atan2(rHip.y - lHip.y, rHip.x - lHip.x)
+            // Separation is the difference
+            var separation = abs(shoulderAngle - hipAngle) * 180.0 / .pi
+            if separation > 180 { separation = 360 - separation }
+            
+            // Draw at torso center
+            let torsoCenter = CGPoint(x: (lShoulder.x + rShoulder.x + lHip.x + rHip.x) / 4,
+                                     y: (lShoulder.y + rShoulder.y + lHip.y + rHip.y) / 4)
+            
+            drawSeparationIndicator(at: torsoCenter, angle: separation, label: "Hip-Shoulder Sep")
+        }
+    }
+    
+    // MARK: - Draw Angle Arc with Label
+    private func drawAngleArc(at joint: CGPoint, from point1: CGPoint, to point2: CGPoint, 
+                             angle: Double, label: String, color: UIColor) {
+        let arcRadius: CGFloat = 30
+        
+        // Calculate angles for the arc
+        let angle1 = atan2(point1.y - joint.y, point1.x - joint.x)
+        let angle2 = atan2(point2.y - joint.y, point2.x - joint.x)
+        
+        // Determine start and end angles (always draw the smaller arc)
+        var startAngle = angle1
+        var endAngle = angle2
+        
+        // Normalize angle difference
+        var angleDiff = endAngle - startAngle
+        if angleDiff > .pi { angleDiff -= 2 * .pi }
+        if angleDiff < -.pi { angleDiff += 2 * .pi }
+        
+        if angleDiff < 0 {
+            swap(&startAngle, &endAngle)
+        }
+        
+        // Draw arc
+        let arcPath = UIBezierPath(arcCenter: joint, 
+                                   radius: arcRadius,
+                                   startAngle: startAngle,
+                                   endAngle: endAngle,
+                                   clockwise: true)
+        
+        let arcLayer = CAShapeLayer()
+        arcLayer.path = arcPath.cgPath
+        arcLayer.strokeColor = color.cgColor
+        arcLayer.fillColor = UIColor.clear.cgColor
+        arcLayer.lineWidth = 2
+        
+        overlayLayer.addSublayer(arcLayer)
+        
+        // Draw angle label
+        let midAngle = startAngle + (endAngle - startAngle) / 2
+        let labelDistance: CGFloat = arcRadius + 20
+        let labelX = joint.x + cos(midAngle) * labelDistance
+        let labelY = joint.y + sin(midAngle) * labelDistance
+        
+        let textLayer = CATextLayer()
+        textLayer.string = "\(label)\n\(Int(angle))°"
+        textLayer.foregroundColor = color.cgColor
+        textLayer.backgroundColor = UIColor.black.withAlphaComponent(0.6).cgColor
+        textLayer.fontSize = 14
+        textLayer.alignmentMode = .center
+        textLayer.contentsScale = view.traitCollection.displayScale
+        
+        let textWidth: CGFloat = 80
+        let textHeight: CGFloat = 36
+        textLayer.frame = CGRect(x: labelX - textWidth / 2,
+                                y: labelY - textHeight / 2,
+                                width: textWidth,
+                                height: textHeight)
+        textLayer.cornerRadius = 4
+        
+        overlayLayer.addSublayer(textLayer)
+    }
+    
+    // MARK: - Draw Separation Indicator
+    private func drawSeparationIndicator(at center: CGPoint, angle: Double, label: String) {
+        let separationUIColor = settings.separationColor.toUIColor()
+        
+        let textLayer = CATextLayer()
+        textLayer.string = "\(label)\n\(Int(angle))°"
+        textLayer.foregroundColor = separationUIColor.cgColor
+        textLayer.backgroundColor = UIColor.black.withAlphaComponent(0.7).cgColor
+        textLayer.fontSize = 16
+        textLayer.alignmentMode = .center
+        textLayer.contentsScale = view.traitCollection.displayScale
+        
+        let textWidth: CGFloat = 120
+        let textHeight: CGFloat = 40
+        textLayer.frame = CGRect(x: center.x - textWidth / 2,
+                                y: center.y - textHeight / 2,
+                                width: textWidth,
+                                height: textHeight)
+        textLayer.cornerRadius = 6
+        textLayer.borderColor = separationUIColor.cgColor
+        textLayer.borderWidth = 2
+        
+        overlayLayer.addSublayer(textLayer)
+    }
+    
+    // MARK: - Draw Calibration Overlay
+    private func drawCalibrationOverlay(bufferSize: CGSize) {
+        // Draw calibration markers and line
+        let leftPos = CGPoint(
+            x: settings.plateLeftEdge.x * bufferSize.width,
+            y: settings.plateLeftEdge.y * bufferSize.height
+        )
+        let rightPos = CGPoint(
+            x: settings.plateRightEdge.x * bufferSize.width,
+            y: settings.plateRightEdge.y * bufferSize.height
+        )
+        
+        // Draw line between markers
+        let linePath = UIBezierPath()
+        linePath.move(to: leftPos)
+        linePath.addLine(to: rightPos)
+        
+        let lineLayer = CAShapeLayer()
+        lineLayer.path = linePath.cgPath
+        lineLayer.strokeColor = UIColor.yellow.cgColor
+        lineLayer.lineWidth = 3
+        lineLayer.lineCap = .round
+        
+        overlayLayer.addSublayer(lineLayer)
+        
+        // Draw left marker
+        let leftMarkerSize: CGFloat = 12
+        let leftMarkerRect = CGRect(
+            x: leftPos.x - leftMarkerSize / 2,
+            y: leftPos.y - leftMarkerSize / 2,
+            width: leftMarkerSize,
+            height: leftMarkerSize
+        )
+        
+        let leftMarkerLayer = CAShapeLayer()
+        leftMarkerLayer.path = UIBezierPath(ovalIn: leftMarkerRect).cgPath
+        leftMarkerLayer.fillColor = UIColor.green.cgColor
+        leftMarkerLayer.strokeColor = UIColor.white.cgColor
+        leftMarkerLayer.lineWidth = 2
+        
+        overlayLayer.addSublayer(leftMarkerLayer)
+        
+        // Draw right marker
+        let rightMarkerSize: CGFloat = 12
+        let rightMarkerRect = CGRect(
+            x: rightPos.x - rightMarkerSize / 2,
+            y: rightPos.y - rightMarkerSize / 2,
+            width: rightMarkerSize,
+            height: rightMarkerSize
+        )
+        
+        let rightMarkerLayer = CAShapeLayer()
+        rightMarkerLayer.path = UIBezierPath(ovalIn: rightMarkerRect).cgPath
+        rightMarkerLayer.fillColor = UIColor.blue.cgColor
+        rightMarkerLayer.strokeColor = UIColor.white.cgColor
+        rightMarkerLayer.lineWidth = 2
+        
+        overlayLayer.addSublayer(rightMarkerLayer)
+        
+        // Draw label at midpoint
+        let midpoint = CGPoint(
+            x: (leftPos.x + rightPos.x) / 2,
+            y: (leftPos.y + rightPos.y) / 2
+        )
+        
+        let widthText = String(format: "%.1f%@", settings.plateWidth, settings.useCentimeters ? "cm" : "\"")
+        
+        let textLayer = CATextLayer()
+        textLayer.string = widthText
+        textLayer.foregroundColor = UIColor.white.cgColor
+        textLayer.backgroundColor = UIColor.yellow.withAlphaComponent(0.8).cgColor
+        textLayer.fontSize = 16
+        textLayer.alignmentMode = .center
+        textLayer.contentsScale = view.traitCollection.displayScale
+        
+        let textWidth: CGFloat = 80
+        let textHeight: CGFloat = 28
+        textLayer.frame = CGRect(
+            x: midpoint.x - textWidth / 2,
+            y: midpoint.y - textHeight / 2,
+            width: textWidth,
+            height: textHeight
+        )
+        textLayer.cornerRadius = 6
+        
+        overlayLayer.addSublayer(textLayer)
+    }
+    
+    // MARK: - Strike Zone Overlay
+    /// Computes the four corners of a generic strike zone and draws it as a
+    /// semi-transparent rectangle on the live overlay.
+    ///
+    /// Geometry:
+    ///   - The bottom edge of the strike zone is the calibrated home-plate line
+    ///     (plateLeftEdge → plateRightEdge).
+    ///   - "Up" is the unit vector perpendicular to that line, rotated so it
+    ///     points toward the top of the screen (negative-Y in UIKit coordinates).
+    ///   - The height of the zone is derived from the pixel-per-inch ratio that
+    ///     the calibrated plate width already gives us, multiplied by the
+    ///     configured strike-zone height in inches.
+    private func drawStrikeZone(bufferSize: CGSize) {
+        let left = CGPoint(
+            x: settings.plateLeftEdge.x * bufferSize.width,
+            y: settings.plateLeftEdge.y * bufferSize.height
+        )
+        let right = CGPoint(
+            x: settings.plateRightEdge.x * bufferSize.width,
+            y: settings.plateRightEdge.y * bufferSize.height
+        )
+
+        // --- derive pixel scale from the plate edge pair ---
+        let plateVec = CGPoint(x: right.x - left.x, y: right.y - left.y)
+        let platePixels = sqrt(plateVec.x * plateVec.x + plateVec.y * plateVec.y)
+        guard platePixels > 1 else { return }
+
+        let plateInches: Double
+        if settings.useCentimeters {
+            plateInches = settings.plateWidth / 2.54
+        } else {
+            plateInches = settings.plateWidth
+        }
+        let pixelsPerInch = platePixels / CGFloat(plateInches)
+
+        // --- "up" is always straight up the screen (negative Y) ---
+        // Gravity is vertical regardless of how the camera is angled, so the
+        // strike zone must rise vertically from the plate line, not
+        // perpendicular to it.
+        //
+        // The bottom of the strike zone is NOT at the plate — it is offset
+        // upward by strikeZoneBottomOffset inches (roughly knee height).
+        // The top is a further strikeZoneHeight inches above that.
+        let bottomOffsetPixels = pixelsPerInch * CGFloat(settings.strikeZoneBottomOffset)
+        let zoneHeightPixels   = pixelsPerInch * CGFloat(settings.strikeZoneHeight)
+
+        // Four corners: bottom edge is the plate line shifted up by the
+        // bottom offset; top edge is shifted up by offset + height.
+        let bl = CGPoint(x: left.x,  y: left.y  - bottomOffsetPixels)
+        let br = CGPoint(x: right.x, y: right.y - bottomOffsetPixels)
+        let tl = CGPoint(x: left.x,  y: left.y  - bottomOffsetPixels - zoneHeightPixels)
+        let tr = CGPoint(x: right.x, y: right.y - bottomOffsetPixels - zoneHeightPixels)
+
+        let szColor = settings.strikeZoneColor.toUIColor()
+
+        // --- filled background ---
+        let fillPath = UIBezierPath()
+        fillPath.move(to: bl)
+        fillPath.addLine(to: br)
+        fillPath.addLine(to: tr)
+        fillPath.addLine(to: tl)
+        fillPath.close()
+
+        let fillLayer = CAShapeLayer()
+        fillLayer.path = fillPath.cgPath
+        fillLayer.fillColor = szColor.withAlphaComponent(0.08).cgColor
+        fillLayer.strokeColor = nil
+        overlayLayer.addSublayer(fillLayer)
+
+        // --- outline ---
+        let outlineLayer = CAShapeLayer()
+        outlineLayer.path = fillPath.cgPath
+        outlineLayer.fillColor = nil
+        outlineLayer.strokeColor = szColor.withAlphaComponent(0.7).cgColor
+        outlineLayer.lineWidth = 2.5
+        outlineLayer.lineCap = .round
+        outlineLayer.lineJoin = .round
+        overlayLayer.addSublayer(outlineLayer)
+
+        // --- horizontal centre line (half-way up) ---
+        let midLeft  = CGPoint(x: (bl.x + tl.x) / 2, y: (bl.y + tl.y) / 2)
+        let midRight = CGPoint(x: (br.x + tr.x) / 2, y: (br.y + tr.y) / 2)
+
+        let midPath = UIBezierPath()
+        midPath.move(to: midLeft)
+        midPath.addLine(to: midRight)
+
+        let midLayer = CAShapeLayer()
+        midLayer.path = midPath.cgPath
+        midLayer.fillColor = nil
+        midLayer.strokeColor = szColor.withAlphaComponent(0.35).cgColor
+        midLayer.lineWidth = 1.0
+        midLayer.lineDashPattern = [6, 4]
+        overlayLayer.addSublayer(midLayer)
+    }
+    
+    // MARK: - Biomechanical Analysis
+    private func calculateJointAngle(proximal: CGPoint, joint: CGPoint, distal: CGPoint) -> Double {
+        let vector1 = CGPoint(x: proximal.x - joint.x, y: proximal.y - joint.y)
+        let vector2 = CGPoint(x: distal.x - joint.x, y: distal.y - joint.y)
+        
+        let dot = vector1.x * vector2.x + vector1.y * vector2.y
+        let mag1 = sqrt(vector1.x * vector1.x + vector1.y * vector1.y)
+        let mag2 = sqrt(vector2.x * vector2.x + vector2.y * vector2.y)
+        
+        guard mag1 > 0, mag2 > 0 else { return 0 }
+        
+        let cosAngle = max(-1, min(1, dot / (mag1 * mag2)))
+        return acos(cosAngle) * 180.0 / .pi
+    }
+    
+    // MARK: - Dynamic Calibration from Ball Size
+    private func estimatePixelsPerFootFromBall(boundingBox: CGRect, viewSize: CGSize) -> Double? {
+        // Baseball diameter is 2.9 inches = 0.242 feet
+        let baseballDiameterInFeet = 0.242
+        
+        // Get the average of width and height in pixels
+        let boxWidth = boundingBox.width * viewSize.width
+        let boxHeight = boundingBox.height * viewSize.height
+        let avgBallSizeInPixels = (boxWidth + boxHeight) / 2.0
+        
+        // Sanity check: ball should be between 10-200 pixels
+        guard avgBallSizeInPixels >= 10 && avgBallSizeInPixels <= 200 else {
+            print("[Calibration Debug] Ball size out of range (10-200px), rejecting")
+            return nil
+        }
+        
+        // Calculate raw pixels per foot
+        let rawPixelsPerFoot = avgBallSizeInPixels / baseballDiameterInFeet
+        
+        // The bounding box from Vision is already in the zoomed pixel space, so
+        // rawPixelsPerFoot is correct regardless of the selected lens.  No
+        // adjustment is needed here.
+        let pixelsPerFoot = rawPixelsPerFoot
+        print("[Calibration Debug] Ball box: \(String(format: "%.1f", boxWidth))px × \(String(format: "%.1f", boxHeight))px, avg: \(String(format: "%.1f", avgBallSizeInPixels))px, lens: \(String(format: "%.1f", settings.selectedLens))x")
+        print("[Calibration Debug] Calculated pixels/ft: \(String(format: "%.1f", pixelsPerFoot))")
+        
+        // Sanity check: should be between 10-500 pixels per foot
+        guard pixelsPerFoot >= 10 && pixelsPerFoot <= 500 else {
+            print("[Calibration Debug] Pixels/ft out of range (10-500), rejecting: \(String(format: "%.1f", pixelsPerFoot))")
+            return nil
+        }
+        
+        return pixelsPerFoot
+    }
+    
+    // MARK: - Speed Calculation
+    private func calculateSpeed(newPosition: CGPoint, timestamp: CMTime, actualViewSize: CGSize? = nil, ballBoundingBox: CGRect? = nil) -> Double {
+        // Add to history
+        ballPositionHistory.append((timestamp: timestamp, position: newPosition))
+        
+        // Keep only recent history (last 0.75 seconds for stable speed calculation)
+        let cutoffTime = CMTimeSubtract(timestamp, CMTime(seconds: 0.75, preferredTimescale: 600))
+        ballPositionHistory.removeAll { CMTimeCompare($0.timestamp, cutoffTime) < 0 }
+        
+        // Need at least 3 points for reliable speed calculation
+        guard ballPositionHistory.count >= 3 else { 
+            if ballPositionHistory.count % 10 == 0 {
+                print("[Speed] Not enough points: \(ballPositionHistory.count)")
+            }
+            return currentSpeed
+        }
+        
+        // Determine actual view size
+        let viewSize: CGSize
+        if let providedSize = actualViewSize {
+            viewSize = providedSize
+        } else if self.activeDimensions.width > 0 {
+            // Use actual video dimensions (accounting for portrait orientation)
+            let orientation = UIDevice.current.orientation
+            let isPortrait = orientation == .portrait || orientation == .portraitUpsideDown
+            if isPortrait {
+                viewSize = CGSize(width: CGFloat(self.activeDimensions.height), 
+                                height: CGFloat(self.activeDimensions.width))
+            } else {
+                viewSize = CGSize(width: CGFloat(self.activeDimensions.width), 
+                                height: CGFloat(self.activeDimensions.height))
+            }
+        } else {
+            viewSize = CGSize(width: 1920, height: 1080)
+        }
+        
+        // Update estimated calibration from ball size if available
+        if let bbox = ballBoundingBox, estimatedPixelsPerFoot == nil {
+            if let estimate = estimatePixelsPerFootFromBall(boundingBox: bbox, viewSize: viewSize) {
+                estimatedPixelsPerFoot = estimate
+                print("[Calibration] 📏 ESTIMATED from ball size: \(String(format: "%.1f", estimate)) pixels/ft")
+            }
+        }
+        
+        // Get pixels per foot (prioritize: calibration > estimate > fallback)
+        let pixelsPerFt: Double
+        if settings.isCalibrated {
+            pixelsPerFt = settings.pixelsPerFoot(viewSize: viewSize)
+        } else if let estimate = estimatedPixelsPerFoot {
+            pixelsPerFt = estimate
+            if ballPositionHistory.count % 30 == 0 {
+                print("[Calibration] Using estimated value: \(String(format: "%.1f", estimate)) pixels/ft")
+            }
+        } else {
+            pixelsPerFt = settings.pixelsPerFoot(viewSize: viewSize) // Will use fallback
+        }
+        
+        guard pixelsPerFt > 0 else { 
+            print("[Speed] Pixels per foot is 0 (calibration needed)")
+            return currentSpeed
+        }
+        
+        // Calculate average speed over multiple point pairs for stability
+        var speeds: [Double] = []
+        
+        // Use pairs of points spanning different time windows
+        let indices = [
+            (0, ballPositionHistory.count - 1),  // Longest span
+            (ballPositionHistory.count / 2, ballPositionHistory.count - 1),  // Half span
+        ]
+        
+        for (startIdx, endIdx) in indices where startIdx < endIdx && startIdx < ballPositionHistory.count && endIdx < ballPositionHistory.count {
+            let first = ballPositionHistory[startIdx]
+            let last = ballPositionHistory[endIdx]
+            
+            let timeDelta = CMTimeGetSeconds(CMTimeSubtract(last.timestamp, first.timestamp))
+            guard timeDelta > 0.001 else { continue }  // Avoid division by near-zero
+            
+            // Calculate pixel distance by converting each axis independently
+            let dx = last.position.x - first.position.x
+            let dy = last.position.y - first.position.y
+            let dxPixels = dx * viewSize.width
+            let dyPixels = dy * viewSize.height
+            let actualPixelDistance = sqrt(dxPixels * dxPixels + dyPixels * dyPixels)
+            
+            let feetDistance = actualPixelDistance / pixelsPerFt
+            
+            // Calculate speed in feet per second, then convert to mph
+            let feetPerSecond = feetDistance / timeDelta
+            let mph = feetPerSecond * 0.681818 // Convert ft/s to mph
+            
+            // Debug: Log all calculated speeds
+            if ballPositionHistory.count % 10 == 0 {
+                print("[Speed Debug] Calculated: \(String(format: "%.1f", mph)) mph (distance: \(String(format: "%.3f", feetDistance))ft, time: \(String(format: "%.3f", timeDelta))s, pixels/ft: \(String(format: "%.1f", pixelsPerFt)))")
+            }
+            
+            // Only accept reasonable speeds (5-120 mph for baseball)
+            if mph >= 5 && mph <= 120 {
+                speeds.append(mph)
+            }
+        }
+        
+        // Average the calculated speeds
+        guard !speeds.isEmpty else {
+            print("[Speed] No valid speeds calculated")
+            return currentSpeed
+        }
+        
+        let avgSpeed = speeds.reduce(0, +) / Double(speeds.count)
+        
+        // Track peak speed from the raw average BEFORE smoothing so we
+        // capture true peaks rather than the dampened smoothed value.
+        if avgSpeed > peakSpeed {
+            peakSpeed = avgSpeed
+            print("[Speed] 🔥 NEW PEAK SPEED: \(String(format: "%.1f", peakSpeed)) mph")
+        }
+        
+        // Smooth the speed reading (exponential moving average).
+        // Factor of 0.7 gives a responsive display while still filtering jitter.
+        let smoothingFactor: Double = currentSpeed > 0 ? 0.7 : 1.0  // No smoothing for first reading
+        currentSpeed = (smoothingFactor * avgSpeed) + ((1 - smoothingFactor) * currentSpeed)
+        
+        // Debug log periodically
+        if ballPositionHistory.count % 10 == 0 {
+            let first = ballPositionHistory[0]
+            let last = ballPositionHistory[ballPositionHistory.count - 1]
+            let totalTime = CMTimeGetSeconds(CMTimeSubtract(last.timestamp, first.timestamp))
+            print("[Speed] Points: \(ballPositionHistory.count), Span: \(String(format: "%.3f", totalTime))s, Speeds: \(speeds.map { String(format: "%.1f", $0) }), Avg: \(String(format: "%.1f", avgSpeed)) mph, Smoothed: \(String(format: "%.1f", currentSpeed)) mph, Peak: \(String(format: "%.1f", peakSpeed)) mph")
+        }
+        
+        // Update the speed display
+        updateSpeedDisplay(currentSpeed)
+        
+        return currentSpeed
+    }
+    
+    private func analyzeBiomechanics(ballPosition: CGPoint, poseObservation: VNHumanBodyPoseObservation, viewSize: CGSize? = nil) -> [String: Any] {
+        guard let recognizedPoints = try? poseObservation.recognizedPoints(.all) else {
+            return [:]
+        }
+        
+        // Determine the pixel dimensions to use for scaling normalised points.
+        // Falls back to the active capture dimensions (portrait-swapped if needed)
+        // so that the X and Y axes are mapped to their true pixel extents before
+        // any angle maths runs.
+        let pixelSize: CGSize
+        if let provided = viewSize {
+            pixelSize = provided
+        } else {
+            let orientation = UIDevice.current.orientation
+            let isPortrait = orientation == .portrait || orientation == .portraitUpsideDown
+            if isPortrait {
+                pixelSize = CGSize(width: CGFloat(activeDimensions.height),
+                                   height: CGFloat(activeDimensions.width))
+            } else {
+                pixelSize = CGSize(width: CGFloat(activeDimensions.width),
+                                   height: CGFloat(activeDimensions.height))
+            }
+        }
+        
+        // Helper: convert a normalised Vision point into pixel coordinates
+        func toPixels(_ pt: CGPoint) -> CGPoint {
+            return CGPoint(x: pt.x * pixelSize.width, y: pt.y * pixelSize.height)
+        }
+        
+        var analysis: [String: Any] = [:]
+        
+        // Calculate elbow angles
+        if let rightShoulder = recognizedPoints[.rightShoulder],
+           let rightElbow = recognizedPoints[.rightElbow],
+           let rightWrist = recognizedPoints[.rightWrist],
+           rightShoulder.confidence > 0.5,
+           rightElbow.confidence > 0.5,
+           rightWrist.confidence > 0.5 {
+            
+            let shoulderPt = toPixels(rightShoulder.location)
+            let elbowPt   = toPixels(rightElbow.location)
+            let wristPt   = toPixels(rightWrist.location)
+            
+            let angle = calculateJointAngle(proximal: shoulderPt, joint: elbowPt, distal: wristPt)
+            analysis["rightElbowAngle"] = angle
+        }
+        
+        if let leftShoulder = recognizedPoints[.leftShoulder],
+           let leftElbow = recognizedPoints[.leftElbow],
+           let leftWrist = recognizedPoints[.leftWrist],
+           leftShoulder.confidence > 0.5,
+           leftElbow.confidence > 0.5,
+           leftWrist.confidence > 0.5 {
+            
+            let shoulderPt = toPixels(leftShoulder.location)
+            let elbowPt   = toPixels(leftElbow.location)
+            let wristPt   = toPixels(leftWrist.location)
+            
+            let angle = calculateJointAngle(proximal: shoulderPt, joint: elbowPt, distal: wristPt)
+            analysis["leftElbowAngle"] = angle
+        }
+        
+        // Calculate knee angles
+        if let rightHip = recognizedPoints[.rightHip],
+           let rightKnee = recognizedPoints[.rightKnee],
+           let rightAnkle = recognizedPoints[.rightAnkle],
+           rightHip.confidence > 0.5,
+           rightKnee.confidence > 0.5,
+           rightAnkle.confidence > 0.5 {
+            
+            let hipPt   = toPixels(rightHip.location)
+            let kneePt  = toPixels(rightKnee.location)
+            let anklePt = toPixels(rightAnkle.location)
+            
+            let angle = calculateJointAngle(proximal: hipPt, joint: kneePt, distal: anklePt)
+            analysis["rightKneeAngle"] = angle
+        }
+        
+        if let leftHip = recognizedPoints[.leftHip],
+           let leftKnee = recognizedPoints[.leftKnee],
+           let leftAnkle = recognizedPoints[.leftAnkle],
+           leftHip.confidence > 0.5,
+           leftKnee.confidence > 0.5,
+           leftAnkle.confidence > 0.5 {
+            
+            let hipPt   = toPixels(leftHip.location)
+            let kneePt  = toPixels(leftKnee.location)
+            let anklePt = toPixels(leftAnkle.location)
+            
+            let angle = calculateJointAngle(proximal: hipPt, joint: kneePt, distal: anklePt)
+            analysis["leftKneeAngle"] = angle
+        }
+        
+        // Calculate shoulder angles (arm elevation)
+        if let rightShoulder = recognizedPoints[.rightShoulder],
+           let rightHip = recognizedPoints[.rightHip],
+           let rightElbow = recognizedPoints[.rightElbow],
+           rightShoulder.confidence > 0.5,
+           rightHip.confidence > 0.5,
+           rightElbow.confidence > 0.5 {
+            
+            let shoulderPt = toPixels(rightShoulder.location)
+            let hipPt      = toPixels(rightHip.location)
+            let elbowPt    = toPixels(rightElbow.location)
+            
+            let angle = calculateJointAngle(proximal: hipPt, joint: shoulderPt, distal: elbowPt)
+            analysis["rightShoulderAngle"] = angle
+        }
+        
+        if let leftShoulder = recognizedPoints[.leftShoulder],
+           let leftHip = recognizedPoints[.leftHip],
+           let leftElbow = recognizedPoints[.leftElbow],
+           leftShoulder.confidence > 0.5,
+           leftHip.confidence > 0.5,
+           leftElbow.confidence > 0.5 {
+            
+            let shoulderPt = toPixels(leftShoulder.location)
+            let hipPt      = toPixels(leftHip.location)
+            let elbowPt    = toPixels(leftElbow.location)
+            
+            let angle = calculateJointAngle(proximal: hipPt, joint: shoulderPt, distal: elbowPt)
+            analysis["leftShoulderAngle"] = angle
+        }
+        
+        // Calculate distance from ball to wrists (for contact detection)
+        if let rightWrist = recognizedPoints[.rightWrist], rightWrist.confidence > 0.5 {
+            let wristPt = rightWrist.location
+            let distance = sqrt(pow(ballPosition.x - wristPt.x, 2) + pow(ballPosition.y - wristPt.y, 2))
+            analysis["rightWristToBallDistance"] = distance
+        }
+        
+        if let leftWrist = recognizedPoints[.leftWrist], leftWrist.confidence > 0.5 {
+            let wristPt = leftWrist.location
+            let distance = sqrt(pow(ballPosition.x - wristPt.x, 2) + pow(ballPosition.y - wristPt.y, 2))
+            analysis["leftWristToBallDistance"] = distance
+        }
+        
+        analysis["ballPosition"] = ballPosition
+        
+        return analysis
+    }
+    
+    // MARK: - Post-Process Video with Annotations
+    private func postProcessVideoWithAnnotations(rawVideoURL: URL) async {
+        print("[PostProcess] Loading video asset from: \(rawVideoURL.path)")
+        
+        // Keep a reference so saveAndShowExportCompletion can also save the
+        // clean (unannotated) version if the user opted in.
+        self.currentRawVideoURL = rawVideoURL
+        
+        let asset = AVURLAsset(url: rawVideoURL)
+        
+        do {
+            let tracks = try await asset.loadTracks(withMediaType: .video)
+            guard let track = tracks.first else {
+                print("[PostProcess] ERROR: No video track found")
+                await MainActor.run { self.hideProcessingOverlay() }
+                return
+            }
+            
+            // Reset tracking data for video processing
+            self.detectionMarkers.removeAll()
+            self.ballPositionHistory.removeAll()
+            self.currentSpeed = 0.0
+            
+            await self.exportAnnotatedVideo(asset: asset, track: track)
+            
+        } catch {
+            print("[PostProcess] Error: \(error)")
+            await MainActor.run {
+                self.hideProcessingOverlay()
+                self.saveToPhotosThenAlert(outputURL: rawVideoURL)
+            }
+        }
+    }
+    
+    // MARK: - Export Annotated Video
+    private func exportAnnotatedVideo(asset: AVAsset, track: AVAssetTrack) async {
+        do {
+            let trimDuration = CMTime(seconds: 0.5, preferredTimescale: 600)
+            let duration = try await asset.load(.duration)
+            let startTime = trimDuration
+            let endTime = duration
+            let timeRange = CMTimeRange(start: startTime, end: endTime)
+            
+            let reader = try AVAssetReader(asset: asset)
+            reader.timeRange = timeRange
+            let outputSettings: [String: Any] = [kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA)]
+            let readerOutput = AVAssetReaderTrackOutput(track: track, outputSettings: outputSettings)
+
+            reader.add(readerOutput)
+            reader.startReading()
+
+            let naturalSize = try await track.load(.naturalSize)
+            let width = Int(abs(naturalSize.width))
+            let height = Int(abs(naturalSize.height))
+
+            let outputURL = FileManager.default.temporaryDirectory.appendingPathComponent("annotatedVideo_\(UUID().uuidString).mov")
+            try? FileManager.default.removeItem(at: outputURL)
+
+            guard let writer = try? AVAssetWriter(outputURL: outputURL, fileType: .mov) else { return }
+            let videoSettings: [String: Any] = [
+                AVVideoCodecKey: AVVideoCodecType.h264,
+                AVVideoWidthKey: width,
+                AVVideoHeightKey: height,
+                AVVideoCompressionPropertiesKey: [
+                    AVVideoExpectedSourceFrameRateKey: Int(self.activeFrameRate),
+                    AVVideoAverageBitRateKey: 20_000_000,
+                    AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel
+                ]
+            ]
+            let writerInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+            writerInput.expectsMediaDataInRealTime = false
+            
+            let mediaTimeScale = CMTimeScale(max(600, Int32(self.activeFrameRate * 10)))
+            writer.movieTimeScale = mediaTimeScale
+            writerInput.mediaTimeScale = mediaTimeScale
+
+            let preferredTransform = try await track.load(.preferredTransform)
+            writerInput.transform = preferredTransform
+
+            let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+                assetWriterInput: writerInput,
+                sourcePixelBufferAttributes: [
+                    kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
+                    kCVPixelBufferWidthKey as String: width,
+                    kCVPixelBufferHeightKey as String: height
+                ]
+            )
+
+            guard writer.canAdd(writerInput) else { return }
+            writer.add(writerInput)
+            writer.startWriting()
+            writer.startSession(atSourceTime: .zero)
+
+            var exportFrameCount = 0
+            while reader.status == .reading {
+                guard let sampleBuffer = readerOutput.copyNextSampleBuffer(),
+                      let px = CMSampleBufferGetImageBuffer(sampleBuffer) else { break }
+
+                autoreleasepool {
+                    exportFrameCount += 1
+                    
+                    // Get presentation timestamp and update lastFrameTime for speed calculation
+                    let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+                    self.lastFrameTime = pts
+                    
+                    // Run Vision on every frame for accurate overlay sync
+                    // (We skip frames during live preview for performance, but export needs accuracy)
+                    let req = VNCoreMLRequest(model: self.visionModel)
+                    let handler = VNImageRequestHandler(cvPixelBuffer: px, options: [:])
+                
+                    // Build request array based on settings
+                    var allRequests: [VNRequest] = []
+                    if self.settings.ballDetectionEnabled {
+                        allRequests.append(req)
+                    }
+                    if self.settings.poseEstimationEnabled, let poseReq = self.poseRequest {
+                        allRequests.append(poseReq)
+                    }
+                    
+                    var results: [VNRecognizedObjectObservation] = []
+                    
+                    if !allRequests.isEmpty {
+                        try? handler.perform(allRequests)
+                        results = (req.results as? [VNRecognizedObjectObservation]) ?? []
+                        
+                        // Only process ball detections if ball detection is enabled
+                        if self.settings.ballDetectionEnabled {
+                            let baseballDetections = results.filter { obs in
+                                guard let label = obs.labels.first else { return false }
+                                return label.identifier == "baseball" && obs.confidence >= self.settings.ballConfidenceThreshold
+                            }.sorted { $0.confidence > $1.confidence }
+                            for obs in baseballDetections {
+                                let c = CGPoint(x: obs.boundingBox.midX, y: obs.boundingBox.midY)
+                                self.detectionMarkers.append(c)
+                            }
+                            
+                            // Limit markers to prevent memory issues (keep last 1000)
+                            if self.detectionMarkers.count > 1000 {
+                                self.detectionMarkers.removeFirst(self.detectionMarkers.count - 1000)
+                            }
+                        }
+                    }
+
+                    while !writerInput.isReadyForMoreMediaData {
+                        Thread.sleep(forTimeInterval: 0.001)
+                    }
+                    if let annotated = self.makeAnnotatedPixelBuffer(from: px, observations: results, pool: adaptor.pixelBufferPool) {
+                        _ = adaptor.append(annotated, withPresentationTime: pts)
+                    } else {
+                        _ = adaptor.append(px, withPresentationTime: pts)
+                    }
+                }
+            }
+
+            writerInput.markAsFinished()
+            await writer.finishWriting()
+            await self.saveAndShowExportCompletion(outputURL: outputURL)
+
+        } catch { print("Error exporting annotated video: \(error)") }
+    }
+    
+    // MARK: - Permissions Helper
+    private func ensurePhotoLibraryPermission(completion: @escaping (Bool) -> Void) {
+        let status = PHPhotoLibrary.authorizationStatus(for: .addOnly)
+        switch status {
+        case .authorized, .limited:
+            completion(true)
+        case .notDetermined:
+            PHPhotoLibrary.requestAuthorization(for: .addOnly) { newStatus in
+                DispatchQueue.main.async {
+                    completion(newStatus == .authorized || newStatus == .limited)
+                }
+            }
+        default:
+            completion(false)
+        }
+    }
+
+    // MARK: - Save to Photos and Show Completion for Exported Video
+
+    @MainActor
+    private func saveAndShowExportCompletion(outputURL: URL) async {
+        await withCheckedContinuation { continuation in
+            self.ensurePhotoLibraryPermission { granted in
+                
+                Task { @MainActor in
+                    guard granted else {
+                        self.onVideoSaved?("")
+                        let alert = UIAlertController(title: "Photos Access Denied",
+                                                      message: "Annotated video exported to a temporary file, but app does not have permission to save to Photos. Please enable Photos access in Settings.",
+                                                      preferredStyle: .alert)
+                        alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in
+                            self.hideProcessingOverlay()
+                            self.dismiss(animated: true)
+                        })
+                        self.topMostViewController().present(alert, animated: true)
+                        continuation.resume()
+                        return
+                    }
+                    
+                    // --- helper: save a single URL to the photo library ---
+                    func saveToPhotos(_ url: URL) async -> String? {
+                        return await withCheckedContinuation { saveCont in
+                            var localId: String?
+                            PHPhotoLibrary.shared().performChanges({
+                                if let placeholder = PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)?.placeholderForCreatedAsset {
+                                    localId = placeholder.localIdentifier
+                                }
+                            }) { _, _ in
+                                saveCont.resume(returning: localId)
+                            }
+                        }
+                    }
+                    
+                    // 1. Save the clean (unannotated) recording first, if requested
+                    if self.settings.exportCleanVideo, let rawURL = self.currentRawVideoURL {
+                        self.updateProcessingMessage("Saving clean video…")
+                        let cleanId = await saveToPhotos(rawURL)
+                        if cleanId != nil {
+                            print("[Export] Clean video saved (id: \(cleanId!))")
+                        } else {
+                            print("[Export] WARNING: Clean video save returned nil identifier")
+                        }
+                    }
+                    
+                    // 2. Save the annotated video
+                    self.updateProcessingMessage("Saving annotated video…")
+                    let annotatedId = await saveToPhotos(outputURL)
+                    
+                    // Clean up the raw file reference — no longer needed
+                    self.currentRawVideoURL = nil
+                    
+                    if let id = annotatedId {
+                        self.onVideoSaved?(id)
+                        let message = self.settings.exportCleanVideo
+                            ? "Both the annotated and clean videos have been saved to Photos."
+                            : "Annotated video saved to Photos."
+                        let alert = UIAlertController(title: "Success",
+                                                      message: message,
+                                                      preferredStyle: .alert)
+                        alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in
+                            self.hideProcessingOverlay()
+                            self.dismiss(animated: true)
+                        })
+                        self.topMostViewController().present(alert, animated: true)
+                    } else {
+                        self.onVideoSaved?("")
+                        let alert = UIAlertController(title: "Save Failed",
+                                                      message: "Could not save video to Photos. Please check permissions or available space.",
+                                                      preferredStyle: .alert)
+                        alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in
+                            self.hideProcessingOverlay()
+                            self.dismiss(animated: true)
+                        })
+                        self.topMostViewController().present(alert, animated: true)
+                    }
+                    continuation.resume()
+                }
+            }
+        }
+    }
+
+    // MARK: - Annotation Renderer
+    private func makeAnnotatedPixelBuffer(from pixelBuffer: CVPixelBuffer,
+                                          observations: [VNRecognizedObjectObservation],
+                                          pool: CVPixelBufferPool?) -> CVPixelBuffer? {
+        guard let pool = pool else { return nil }
+
+        var outPixelBuffer: CVPixelBuffer?
+        let status = CVPixelBufferPoolCreatePixelBuffer(nil, pool, &outPixelBuffer)
+        guard status == kCVReturnSuccess, let output = outPixelBuffer else { return nil }
+
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        CVPixelBufferLockBaseAddress(output, [])
+        defer {
+            CVPixelBufferUnlockBaseAddress(output, [])
+            CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
+        }
+
+        let srcImage = CIImage(cvPixelBuffer: pixelBuffer)
+
+        let rect = CGRect(x: 0, y: 0,
+                          width: CVPixelBufferGetWidth(output),
+                          height: CVPixelBufferGetHeight(output))
+
+        UIGraphicsBeginImageContextWithOptions(rect.size, false, 1.0)
+        guard let ctx = UIGraphicsGetCurrentContext() else {
+            UIGraphicsEndImageContext()
+            return output
+        }
+
+        let uiImage = UIImage(ciImage: srcImage)
+        uiImage.draw(in: rect)
+
+        // --- Strike zone (drawn first so it sits behind all other overlays) ---
+        if self.settings.isCalibrated && self.settings.showStrikeZone {
+            drawStrikeZoneOnContext(ctx, rect: rect)
+        }
+
+        let baseballDetections = observations.filter { obs in
+            guard let label = obs.labels.first else { return false }
+            return label.identifier == "baseball" && obs.confidence >= self.settings.ballConfidenceThreshold
+        }.sorted { $0.confidence > $1.confidence }
+        
+        // Note: markers are already added in the export loop, don't duplicate here
+        
+        // Draw pose skeleton if available
+        if let poseObs = self.lastPoseObservation, self.settings.poseEstimationEnabled {
+            drawPoseOnContext(ctx, poseObs: poseObs, rect: rect)
+        }
+        
+        // Draw ball detection and calculate speed for video processing
+        if self.settings.ballDetectionEnabled, let obs = baseballDetections.first {
+            let bbox = obs.boundingBox
+            var x = bbox.origin.x * rect.width
+            var y = bbox.origin.y * rect.height
+            let w = bbox.width * rect.width
+            let h = bbox.height * rect.height
+            if !contentFlippedVertically {
+                y = rect.height - y - h
+            }
+            
+            if mirrored { x = rect.width - x - w }
+            let drawRect = CGRect(x: x, y: y, width: w, height: h)
+
+            let ballUIColor = settings.ballColor.toUIColor()
+            ctx.setStrokeColor(ballUIColor.cgColor)
+            ctx.setLineWidth(3)
+            ctx.addEllipse(in: drawRect)
+            ctx.strokePath()
+            
+            if settings.showLabels {
+                let centerX = drawRect.midX
+                let centerY = drawRect.midY
+                
+                // Calculate speed using the normalized center position
+                let normalizedCenter = CGPoint(x: bbox.midX, y: bbox.midY)
+                
+                // Use lastFrameTime for speed calculation during video export
+                if let timestamp = self.lastFrameTime, self.settings.showSpeed {
+                    _ = calculateSpeed(newPosition: normalizedCenter, timestamp: timestamp, actualViewSize: rect.size, ballBoundingBox: bbox)
+                }
+                
+                // Just show confidence on the ball
+                let confidenceText = String(format: "%.0f%%", obs.confidence * 100)
+                
+                let fontSize: CGFloat = 28
+                let attributes: [NSAttributedString.Key: Any] = [
+                    .font: UIFont.boldSystemFont(ofSize: fontSize),
+                    .foregroundColor: ballUIColor
+                ]
+                
+                ctx.saveGState()
+                ctx.translateBy(x: centerX, y: centerY)
+                ctx.rotate(by: -.pi / 2)
+                
+                let textSize = confidenceText.size(withAttributes: attributes)
+                confidenceText.draw(at: CGPoint(x: -textSize.width / 2, y: -textSize.height / 2),
+                                   withAttributes: attributes)
+                
+                ctx.restoreGState()
+            }
+        }
+        
+        if self.detectionMarkers.count >= 3 {
+            let smoothedPoints = TrajectoryKalmanSmoother.smoothTrajectory(self.detectionMarkers)
+            
+            let trajectoryUIColor = settings.trajectoryColor.toUIColor()
+            ctx.setStrokeColor(trajectoryUIColor.withAlphaComponent(0.9).cgColor)
+            ctx.setLineWidth(25)
+            ctx.setLineCap(.round)
+            ctx.setLineJoin(.round)
+            
+            var sfx = smoothedPoints[0].x * rect.width
+            var sfy = smoothedPoints[0].y * rect.height
+            if !contentFlippedVertically { sfy = rect.height - sfy }
+            if mirrored { sfx = rect.width - sfx }
+            ctx.move(to: CGPoint(x: sfx, y: sfy))
+            
+            for i in 1..<smoothedPoints.count {
+                var sx = smoothedPoints[i].x * rect.width
+                var sy = smoothedPoints[i].y * rect.height
+                if !contentFlippedVertically { sy = rect.height - sy }
+                if mirrored { sx = rect.width - sx }
+                ctx.addLine(to: CGPoint(x: sx, y: sy))
+            }
+            ctx.strokePath()
+        }
+        
+        if !self.detectionMarkers.isEmpty {
+            for normCenter in self.detectionMarkers {
+                var cx = normCenter.x * rect.width
+                var cy = normCenter.y * rect.height
+                if !contentFlippedVertically { cy = rect.height - cy }
+                if mirrored { cx = rect.width - cx }
+                let markerSize: CGFloat = 12
+                let markerRect = CGRect(x: cx - markerSize/2,
+                                        y: cy - markerSize/2,
+                                        width: markerSize,
+                                        height: markerSize)
+                let ballUIColor = settings.ballColor.toUIColor()
+                ctx.setFillColor(ballUIColor.cgColor)
+                ctx.fillEllipse(in: markerRect)
+                ctx.setStrokeColor(UIColor.white.withAlphaComponent(0.8).cgColor)
+                ctx.setLineWidth(2)
+                ctx.strokeEllipse(in: markerRect)
+            }
+        }
+        
+        // Draw peak speed display in bottom-right corner (upright, no rotation).
+        //
+        // For live recordings the pixel buffer is already portrait so drawing
+        // into rect directly works.  For a selected video the raw pixel buffer
+        // may be in a different orientation; the writer's preferredTransform
+        // will rotate the final file, so we need to pre-rotate the context here
+        // to match that final orientation before drawing the pill.
+        if self.settings.showSpeed && self.peakSpeed > 0 {
+            let convertedPeak = self.settings.speedUnit.convert(fromMPH: self.peakSpeed)
+            let peakNumber = String(format: "%.0f", convertedPeak)
+            let unitLabel  = self.settings.speedUnit.rawValue
+
+            let numberAttributes: [NSAttributedString.Key: Any] = [
+                .font: UIFont.monospacedDigitSystemFont(ofSize: 72, weight: .bold),
+                .foregroundColor: UIColor.white
+            ]
+            let unitAttributes: [NSAttributedString.Key: Any] = [
+                .font: UIFont.systemFont(ofSize: 28, weight: .semibold),
+                .foregroundColor: UIColor(white: 0.85, alpha: 1.0)
+            ]
+
+            let numberSize = peakNumber.size(withAttributes: numberAttributes)
+            let unitSize   = unitLabel.size(withAttributes: unitAttributes)
+
+            let padding:  CGFloat = 16
+            let gap:      CGFloat = 6   // vertical gap between number and unit
+            let innerW = max(numberSize.width, unitSize.width)
+            let innerH = numberSize.height + gap + unitSize.height
+            let bgW    = innerW + padding * 2
+            let bgH    = innerH + padding * 2
+
+            // Determine the dimensions of the *final* (post-transform) frame.
+            // For 90° or 270° rotations width and height swap.
+            let finalW: CGFloat
+            let finalH: CGFloat
+            if videoRotationDegrees == 90 || videoRotationDegrees == 270 {
+                finalW = rect.height
+                finalH = rect.width
+            } else {
+                finalW = rect.width
+                finalH = rect.height
+            }
+
+            // Anchor to bottom-right of the *final* frame
+            let bgRect = CGRect(x: finalW  - bgW  - 24,
+                                y: finalH  - bgH  - 24,
+                                width: bgW, height: bgH)
+
+            // Pre-rotate the context so that coordinates match the final
+            // playback orientation.  The transform sequence is:
+            //   1. Translate origin to the corner that becomes (0,0) after rotation.
+            //   2. Rotate by the same angle the writer will apply.
+            // This way drawing at bgRect lands in the correct spot in the raw buffer.
+            ctx.saveGState()
+            switch videoRotationDegrees {
+            case 90:
+                // Writer rotates 90° CCW (i.e. the raw buffer's +X becomes final +Y).
+                // To draw in final-frame coords we rotate our context 90° CW and
+                // shift the origin.
+                ctx.translateBy(x: rect.width, y: 0)
+                ctx.rotate(by: .pi / 2)
+            case 180:
+                ctx.translateBy(x: rect.width, y: rect.height)
+                ctx.rotate(by: .pi)
+            case 270:
+                ctx.translateBy(x: 0, y: rect.height)
+                ctx.rotate(by: -.pi / 2)
+            default:
+                break // 0° — no transform needed
+            }
+
+            // Background pill
+            ctx.setFillColor(UIColor.black.withAlphaComponent(0.65).cgColor)
+            let roundedPath = UIBezierPath(roundedRect: bgRect, cornerRadius: 14)
+            ctx.addPath(roundedPath.cgPath)
+            ctx.fillPath()
+
+            // Number (centred horizontally in the pill)
+            let numberX = bgRect.minX + padding + (innerW - numberSize.width)  / 2
+            let numberY = bgRect.minY + padding
+            peakNumber.draw(at: CGPoint(x: numberX, y: numberY), withAttributes: numberAttributes)
+
+            // Unit label (centred horizontally, below number)
+            let unitX = bgRect.minX + padding + (innerW - unitSize.width) / 2
+            let unitY = numberY + numberSize.height + gap
+            unitLabel.draw(at: CGPoint(x: unitX, y: unitY), withAttributes: unitAttributes)
+
+            ctx.restoreGState()
+        }
+
+        let composed = UIGraphicsGetImageFromCurrentImageContext()
+        UIGraphicsEndImageContext()
+
+        if let composed = composed, let cgImage = composed.cgImage {
+            let ci = CIImage(cgImage: cgImage)
+            ciContext.render(ci, to: output)
+        }
+
+        return output
+    }
+    
+    // MARK: - Draw Pose on CGContext
+    private func drawPoseOnContext(_ ctx: CGContext, poseObs: VNHumanBodyPoseObservation, rect: CGRect) {
+        guard let recognizedPoints = try? poseObs.recognizedPoints(.all) else { return }
+        
+        // Define skeleton connections
+        let connections: [(VNHumanBodyPoseObservation.JointName, VNHumanBodyPoseObservation.JointName)] = [
+            (.neck, .rightShoulder), (.neck, .leftShoulder),
+            (.rightShoulder, .rightHip), (.leftShoulder, .leftHip),
+            (.rightHip, .leftHip),
+            (.rightShoulder, .rightElbow), (.rightElbow, .rightWrist),
+            (.leftShoulder, .leftElbow), (.leftElbow, .leftWrist),
+            (.rightHip, .rightKnee), (.rightKnee, .rightAnkle),
+            (.leftHip, .leftKnee), (.leftKnee, .leftAnkle)
+        ]
+        
+        // Helper to convert point with orientation
+        func convertPt(_ normPt: CGPoint) -> CGPoint {
+            var x = normPt.x * rect.width
+            var y = normPt.y * rect.height
+            if !contentFlippedVertically { y = rect.height - y }
+            if mirrored { x = rect.width - x }
+            return CGPoint(x: x, y: y)
+        }
+        
+        // Draw bones
+        let skeletonUIColor = settings.skeletonColor.toUIColor()
+        ctx.setStrokeColor(skeletonUIColor.cgColor)
+        ctx.setLineWidth(3)
+        ctx.setLineCap(.round)
+        
+        for (startJoint, endJoint) in connections {
+            guard let startPoint = recognizedPoints[startJoint],
+                  let endPoint = recognizedPoints[endJoint],
+                  startPoint.confidence > settings.poseConfidenceThreshold,
+                  endPoint.confidence > settings.poseConfidenceThreshold else { continue }
+            
+            let start = convertPt(startPoint.location)
+            let end = convertPt(endPoint.location)
+            
+            ctx.move(to: start)
+            ctx.addLine(to: end)
+        }
+        ctx.strokePath()
+        
+        // Draw joints
+        let jointUIColor = settings.jointColor.toUIColor()
+        for (_, point) in recognizedPoints {
+            guard point.confidence > settings.poseConfidenceThreshold else { continue }
+            
+            let pt = convertPt(point.location)
+            let jointSize: CGFloat = 8
+            let jointRect = CGRect(x: pt.x - jointSize/2, y: pt.y - jointSize/2,
+                                  width: jointSize, height: jointSize)
+            
+            ctx.setFillColor(jointUIColor.cgColor)
+            ctx.fillEllipse(in: jointRect)
+            ctx.setStrokeColor(UIColor.white.cgColor)
+            ctx.setLineWidth(2)
+            ctx.strokeEllipse(in: jointRect)
+        }
+        
+        // Draw joint angles
+        if settings.showLabels {
+            drawJointAnglesOnContext(ctx, poseObs: poseObs, rect: rect, recognizedPoints: recognizedPoints, convertPt: convertPt)
+        }
+    }
+    
+    // MARK: - Draw Joint Angles on CGContext
+    private func drawJointAnglesOnContext(_ ctx: CGContext, poseObs: VNHumanBodyPoseObservation, 
+                                          rect: CGRect, recognizedPoints: [VNHumanBodyPoseObservation.JointName: VNRecognizedPoint],
+                                          convertPt: (CGPoint) -> CGPoint) {
+        
+        let angleConfidenceThreshold = settings.poseConfidenceThreshold
+        
+        let elbowColor = settings.elbowAngleColor.toUIColor()
+        let kneeColor = settings.kneeAngleColor.toUIColor()
+        let shoulderColor = settings.shoulderAngleColor.toUIColor()
+        
+        // Right Elbow
+        if let rShoulder = recognizedPoints[.rightShoulder],
+           let rElbow = recognizedPoints[.rightElbow],
+           let rWrist = recognizedPoints[.rightWrist],
+           rShoulder.confidence > angleConfidenceThreshold, 
+           rElbow.confidence > angleConfidenceThreshold, 
+           rWrist.confidence > angleConfidenceThreshold {
+            let s = convertPt(rShoulder.location)
+            let e = convertPt(rElbow.location)
+            let w = convertPt(rWrist.location)
+            let angle = calculateJointAngle(proximal: s, joint: e, distal: w)
+            drawAngleOnContext(ctx, at: e, from: s, to: w, angle: angle, label: "R Elbow", color: elbowColor)
+        }
+        
+        // Left Elbow
+        if let lShoulder = recognizedPoints[.leftShoulder],
+           let lElbow = recognizedPoints[.leftElbow],
+           let lWrist = recognizedPoints[.leftWrist],
+           lShoulder.confidence > angleConfidenceThreshold, 
+           lElbow.confidence > angleConfidenceThreshold, 
+           lWrist.confidence > angleConfidenceThreshold {
+            let s = convertPt(lShoulder.location)
+            let e = convertPt(lElbow.location)
+            let w = convertPt(lWrist.location)
+            let angle = calculateJointAngle(proximal: s, joint: e, distal: w)
+            drawAngleOnContext(ctx, at: e, from: s, to: w, angle: angle, label: "L Elbow", color: elbowColor)
+        }
+        
+        // Right Knee
+        if let rHip = recognizedPoints[.rightHip],
+           let rKnee = recognizedPoints[.rightKnee],
+           let rAnkle = recognizedPoints[.rightAnkle],
+           rHip.confidence > angleConfidenceThreshold, 
+           rKnee.confidence > angleConfidenceThreshold, 
+           rAnkle.confidence > angleConfidenceThreshold {
+            let h = convertPt(rHip.location)
+            let k = convertPt(rKnee.location)
+            let a = convertPt(rAnkle.location)
+            let angle = calculateJointAngle(proximal: h, joint: k, distal: a)
+            drawAngleOnContext(ctx, at: k, from: h, to: a, angle: angle, label: "R Knee", color: kneeColor)
+        }
+        
+        // Left Knee
+        if let lHip = recognizedPoints[.leftHip],
+           let lKnee = recognizedPoints[.leftKnee],
+           let lAnkle = recognizedPoints[.leftAnkle],
+           lHip.confidence > angleConfidenceThreshold, 
+           lKnee.confidence > angleConfidenceThreshold, 
+           lAnkle.confidence > angleConfidenceThreshold {
+            let h = convertPt(lHip.location)
+            let k = convertPt(lKnee.location)
+            let a = convertPt(lAnkle.location)
+            let angle = calculateJointAngle(proximal: h, joint: k, distal: a)
+            drawAngleOnContext(ctx, at: k, from: h, to: a, angle: angle, label: "L Knee", color: kneeColor)
+        }
+        
+        // Right Shoulder
+        if let rHip = recognizedPoints[.rightHip],
+           let rShoulder = recognizedPoints[.rightShoulder],
+           let rElbow = recognizedPoints[.rightElbow],
+           rHip.confidence > angleConfidenceThreshold, 
+           rShoulder.confidence > angleConfidenceThreshold, 
+           rElbow.confidence > angleConfidenceThreshold {
+            let h = convertPt(rHip.location)
+            let s = convertPt(rShoulder.location)
+            let e = convertPt(rElbow.location)
+            let angle = calculateJointAngle(proximal: h, joint: s, distal: e)
+            drawAngleOnContext(ctx, at: s, from: h, to: e, angle: angle, label: "R Shoulder", color: shoulderColor)
+        }
+        
+        // Left Shoulder
+        if let lHip = recognizedPoints[.leftHip],
+           let lShoulder = recognizedPoints[.leftShoulder],
+           let lElbow = recognizedPoints[.leftElbow],
+           lHip.confidence > angleConfidenceThreshold, 
+           lShoulder.confidence > angleConfidenceThreshold, 
+           lElbow.confidence > angleConfidenceThreshold {
+            let h = convertPt(lHip.location)
+            let s = convertPt(lShoulder.location)
+            let e = convertPt(lElbow.location)
+            let angle = calculateJointAngle(proximal: h, joint: s, distal: e)
+            drawAngleOnContext(ctx, at: s, from: h, to: e, angle: angle, label: "L Shoulder", color: shoulderColor)
+        }
+        
+        // Hip-Shoulder Separation
+        if let lShoulder = recognizedPoints[.leftShoulder],
+           let rShoulder = recognizedPoints[.rightShoulder],
+           let lHip = recognizedPoints[.leftHip],
+           let rHip = recognizedPoints[.rightHip],
+           lShoulder.confidence > angleConfidenceThreshold, 
+           rShoulder.confidence > angleConfidenceThreshold,
+           lHip.confidence > angleConfidenceThreshold, 
+           rHip.confidence > angleConfidenceThreshold {
+            let ls = convertPt(lShoulder.location)
+            let rs = convertPt(rShoulder.location)
+            let lh = convertPt(lHip.location)
+            let rh = convertPt(rHip.location)
+            
+            let shoulderAngle = atan2(rs.y - ls.y, rs.x - ls.x)
+            let hipAngle = atan2(rh.y - lh.y, rh.x - lh.x)
+            var separation = abs(shoulderAngle - hipAngle) * 180.0 / .pi
+            if separation > 180 { separation = 360 - separation }
+            
+            let center = CGPoint(x: (ls.x + rs.x + lh.x + rh.x) / 4,
+                               y: (ls.y + rs.y + lh.y + rh.y) / 4)
+            
+            drawSeparationOnContext(ctx, at: center, angle: separation, label: "Hip-Shoulder Sep")
+        }
+    }
+    
+    // MARK: - Draw Angle on CGContext
+    private func drawAngleOnContext(_ ctx: CGContext, at joint: CGPoint, from p1: CGPoint, to p2: CGPoint,
+                                   angle: Double, label: String, color: UIColor) {
+        let arcRadius: CGFloat = 30
+        
+        let angle1 = atan2(p1.y - joint.y, p1.x - joint.x)
+        let angle2 = atan2(p2.y - joint.y, p2.x - joint.x)
+        
+        var startAngle = angle1
+        var endAngle = angle2
+        var angleDiff = endAngle - startAngle
+        if angleDiff > .pi { angleDiff -= 2 * .pi }
+        if angleDiff < -.pi { angleDiff += 2 * .pi }
+        if angleDiff < 0 { swap(&startAngle, &endAngle) }
+        
+        // Draw arc
+        ctx.setStrokeColor(color.cgColor)
+        ctx.setLineWidth(2)
+        ctx.addArc(center: joint, radius: arcRadius, startAngle: startAngle, endAngle: endAngle, clockwise: false)
+        ctx.strokePath()
+        
+        // Draw label
+        let midAngle = startAngle + (endAngle - startAngle) / 2
+        let labelDistance: CGFloat = arcRadius + 20
+        let labelCenter = CGPoint(x: joint.x + cos(midAngle) * labelDistance,
+                                 y: joint.y + sin(midAngle) * labelDistance)
+        
+        let text = "\(label) \(Int(angle))°"
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: UIFont.boldSystemFont(ofSize: 14),
+            .foregroundColor: color
+        ]
+        
+        let textSize = text.size(withAttributes: attributes)
+        let padding: CGFloat = 4
+        let bgRect = CGRect(x: labelCenter.x - textSize.width/2 - padding,
+                           y: labelCenter.y - textSize.height/2 - padding,
+                           width: textSize.width + padding * 2,
+                           height: textSize.height + padding * 2)
+        
+        ctx.setFillColor(UIColor.black.withAlphaComponent(0.6).cgColor)
+        ctx.fill(bgRect)
+        
+        text.draw(at: CGPoint(x: labelCenter.x - textSize.width/2,
+                            y: labelCenter.y - textSize.height/2),
+                 withAttributes: attributes)
+    }
+    
+    // MARK: - Draw Separation on CGContext
+    private func drawSeparationOnContext(_ ctx: CGContext, at center: CGPoint, angle: Double, label: String) {
+        let separationUIColor = settings.separationColor.toUIColor()
+        let text = "\(label) \(Int(angle))°"
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: UIFont.boldSystemFont(ofSize: 16),
+            .foregroundColor: separationUIColor
+        ]
+        
+        let textSize = text.size(withAttributes: attributes)
+        let padding: CGFloat = 6
+        let bgRect = CGRect(x: center.x - textSize.width/2 - padding,
+                           y: center.y - textSize.height/2 - padding,
+                           width: textSize.width + padding * 2,
+                           height: textSize.height + padding * 2)
+        
+        ctx.setFillColor(UIColor.black.withAlphaComponent(0.7).cgColor)
+        ctx.fill(bgRect)
+        ctx.setStrokeColor(separationUIColor.cgColor)
+        ctx.setLineWidth(2)
+        ctx.stroke(bgRect)
+        
+        text.draw(at: CGPoint(x: center.x - textSize.width/2,
+                            y: center.y - textSize.height/2),
+                 withAttributes: attributes)
+    }
+
+    // MARK: - Draw Strike Zone on CGContext
+    /// CGContext equivalent of `drawStrikeZone(bufferSize:)` for baking the
+    /// strike zone into exported video frames.
+    ///
+    /// The camera connection already rotates pixel buffers to portrait before
+    /// they are written (videoRotationAngle = 90), and the raw .mov is saved
+    /// with an identity transform.  So the pixel buffers read back during
+    /// export are already in portrait orientation — exactly the same space the
+    /// calibration points were recorded in.  Calibration points live in UIKit
+    /// screen coordinates (Y = 0 at the top), which matches the pixel-buffer
+    /// origin, so no Y-flip is applied here.  (The Y-flip used elsewhere is
+    /// only for Vision results, which use a bottom-left origin.)
+    private func drawStrikeZoneOnContext(_ ctx: CGContext, rect: CGRect) {
+        // Calibration points were recorded in screen (UIKit) coordinates and
+        // normalised to 0–1.  The pixel buffers written during recording already
+        // have portrait layout baked in (videoRotationAngle = 90), so when we
+        // read them back the coordinate origin is top-left — identical to UIKit.
+        // We must NOT apply the Vision Y-flip here; just scale directly.
+        // Mirror is still needed if the source was a front camera.
+        func calibrationPtToContext(_ normPt: CGPoint) -> CGPoint {
+            var x = normPt.x * rect.width
+            let y = normPt.y * rect.height
+            if mirrored { x = rect.width - x }
+            return CGPoint(x: x, y: y)
+        }
+
+        let left  = calibrationPtToContext(settings.plateLeftEdge)
+        let right = calibrationPtToContext(settings.plateRightEdge)
+
+        let plateVec = CGPoint(x: right.x - left.x, y: right.y - left.y)
+        let platePixels = sqrt(plateVec.x * plateVec.x + plateVec.y * plateVec.y)
+        guard platePixels > 1 else { return }
+
+        let plateInches: Double = settings.useCentimeters
+            ? settings.plateWidth / 2.54
+            : settings.plateWidth
+        let pixelsPerInch = platePixels / CGFloat(plateInches)
+
+        // Derive "up" by transforming a point that is 1 % higher in
+        // normalised screen space (smaller Y = higher on screen) and
+        // computing the resulting pixel-space vector.
+        let aboveLeft = calibrationPtToContext(
+            CGPoint(x: settings.plateLeftEdge.x,
+                    y: settings.plateLeftEdge.y - 0.01)
+        )
+        let upVec = CGPoint(x: aboveLeft.x - left.x, y: aboveLeft.y - left.y)
+        let upLen = sqrt(upVec.x * upVec.x + upVec.y * upVec.y)
+        guard upLen > 0 else { return }
+        let upUnit = CGPoint(x: upVec.x / upLen, y: upVec.y / upLen)
+
+        let bottomOffsetPixels = pixelsPerInch * CGFloat(settings.strikeZoneBottomOffset)
+        let zoneHeightPixels   = pixelsPerInch * CGFloat(settings.strikeZoneHeight)
+
+        // Offset the four corners along the derived "up" direction.
+        let bl = CGPoint(x: left.x  + upUnit.x * bottomOffsetPixels,
+                         y: left.y  + upUnit.y * bottomOffsetPixels)
+        let br = CGPoint(x: right.x + upUnit.x * bottomOffsetPixels,
+                         y: right.y + upUnit.y * bottomOffsetPixels)
+        let tl = CGPoint(x: left.x  + upUnit.x * (bottomOffsetPixels + zoneHeightPixels),
+                         y: left.y  + upUnit.y * (bottomOffsetPixels + zoneHeightPixels))
+        let tr = CGPoint(x: right.x + upUnit.x * (bottomOffsetPixels + zoneHeightPixels),
+                         y: right.y + upUnit.y * (bottomOffsetPixels + zoneHeightPixels))
+
+        let szColor = settings.strikeZoneColor.toUIColor()
+
+        // --- filled background ---
+        ctx.saveGState()
+        ctx.setFillColor(szColor.withAlphaComponent(0.08).cgColor)
+        ctx.beginPath()
+        ctx.move(to: bl)
+        ctx.addLine(to: br)
+        ctx.addLine(to: tr)
+        ctx.addLine(to: tl)
+        ctx.closePath()
+        ctx.fillPath()
+        ctx.restoreGState()
+
+        // --- outline ---
+        ctx.saveGState()
+        ctx.setStrokeColor(szColor.withAlphaComponent(0.7).cgColor)
+        ctx.setLineWidth(2.5)
+        ctx.setLineCap(.round)
+        ctx.setLineJoin(.round)
+        ctx.beginPath()
+        ctx.move(to: bl)
+        ctx.addLine(to: br)
+        ctx.addLine(to: tr)
+        ctx.addLine(to: tl)
+        ctx.closePath()
+        ctx.strokePath()
+        ctx.restoreGState()
+
+        // --- dashed centre line ---
+        ctx.saveGState()
+        ctx.setStrokeColor(szColor.withAlphaComponent(0.35).cgColor)
+        ctx.setLineWidth(1.0)
+        ctx.setLineDash(phase: 0, lengths: [6, 4])
+        let midLeft  = CGPoint(x: (bl.x + tl.x) / 2, y: (bl.y + tl.y) / 2)
+        let midRight = CGPoint(x: (br.x + tr.x) / 2, y: (br.y + tr.y) / 2)
+        ctx.beginPath()
+        ctx.move(to: midLeft)
+        ctx.addLine(to: midRight)
+        ctx.strokePath()
+        ctx.restoreGState()
+    }
+
+    // MARK: - Export Completion / Redirect
+    private func showExportCompletion(url: URL) {
+        DispatchQueue.main.async {
+            self.onVideoSaved?(url.path)
+
+            let alert = UIAlertController(title: "Success",
+                                          message: "Recorded video saved to Photos.",
+                                          preferredStyle: .alert)
+            alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in
+                self.dismiss(animated: true)
+            })
+            self.present(alert, animated: true)
+        }
+    }
+    
+    // MARK: - Export Biomechanical Analysis
+    private func exportBiomechanicalData() -> String {
+        var csv = "Timestamp,BallX,BallY,RightElbowAngle,LeftElbowAngle,RightKneeAngle,LeftKneeAngle,RightShoulderAngle,LeftShoulderAngle,RightWristDistance,LeftWristDistance\n"
+        
+        for frameData in fusedFrameData {
+            let timestamp = CMTimeGetSeconds(frameData.timestamp)
+            let ballPos = frameData.ballPosition
+            
+            if let poseObs = frameData.poseObservation, let ballPosition = ballPos {
+                let analysis = analyzeBiomechanics(ballPosition: ballPosition, poseObservation: poseObs)
+                
+                let rightElbow = analysis["rightElbowAngle"] as? Double ?? 0
+                let leftElbow = analysis["leftElbowAngle"] as? Double ?? 0
+                let rightKnee = analysis["rightKneeAngle"] as? Double ?? 0
+                let leftKnee = analysis["leftKneeAngle"] as? Double ?? 0
+                let rightShoulder = analysis["rightShoulderAngle"] as? Double ?? 0
+                let leftShoulder = analysis["leftShoulderAngle"] as? Double ?? 0
+                let rightWristDist = analysis["rightWristToBallDistance"] as? Double ?? 0
+                let leftWristDist = analysis["leftWristToBallDistance"] as? Double ?? 0
+                
+                csv += "\(timestamp),\(ballPosition.x),\(ballPosition.y),\(rightElbow),\(leftElbow),\(rightKnee),\(leftKnee),\(rightShoulder),\(leftShoulder),\(rightWristDist),\(leftWristDist)\n"
+            } else if let ballPosition = ballPos {
+                csv += "\(timestamp),\(ballPosition.x),\(ballPosition.y),0,0,0,0,0,0,0,0\n"
+            }
+        }
+        
+        return csv
+    }
+    
+    private func saveBiomechanicalDataToFile() {
+        let csv = exportBiomechanicalData()
+        let fileName = "biomechanics_\(UUID().uuidString).csv"
+        let fileURL = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
+        
+        do {
+            try csv.write(to: fileURL, atomically: true, encoding: .utf8)
+            print("[Biomechanics] Exported data to: \(fileURL.path)")
+            print("[Biomechanics] Total frames analyzed: \(fusedFrameData.count)")
+        } catch {
+            print("[Biomechanics] Error saving CSV: \(error)")
+        }
+    }
+
+    // MARK: - Video File Processing
+    private func processVideoFile(_ url: URL) {
+        let asset = AVURLAsset(url: url)
+        showProcessingOverlay(message: "Processing…")
+        
+        // Reset tracking data for video processing
+        self.detectionMarkers.removeAll()
+        self.ballPositionHistory.removeAll()
+        self.currentSpeed = 0.0
+        self.peakSpeed = 0.0
+        self.estimatedPixelsPerFoot = nil
+        self.poseHistory.removeAll()
+        self.fusedFrameData.removeAll()
+        self.lastPoseObservation = nil
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.player = AVPlayer(url: url)
+            let playerLayer = AVPlayerLayer(player: self.player)
+            playerLayer.frame = self.view.bounds
+            playerLayer.videoGravity = .resizeAspectFill
+            self.previewLayer = playerLayer
+            self.view.layer.insertSublayer(self.previewLayer, at: 0)
+            self.player?.play()
+        }
+
+        Task {
+            do {
+                let tracks = try await asset.loadTracks(withMediaType: .video)
+                guard let track = tracks.first else { await MainActor.run { self.hideProcessingOverlay() }; return }
+
+                let t = try await track.load(.preferredTransform)
+                
+                let angle = atan2(Double(t.b), Double(t.a))
+                var degrees = Int(round(angle * 180.0 / .pi))
+                degrees = (degrees % 360 + 360) % 360
+                let snapped: Int = {
+                    let options = [0, 90, 180, 270]
+                    let diffs = options.map { abs($0 - degrees) }
+                    if let idx = diffs.enumerated().min(by: { $0.element < $1.element })?.offset {
+                        return options[idx]
+                    }
+                    return 0
+                }()
+
+                var mirrored = false
+                switch snapped {
+                case 0, 180:
+                    mirrored = (t.a < 0)
+                case 90, 270:
+                    mirrored = (t.d < 0)
+                default:
+                    mirrored = false
+                }
+                self.mirrored = mirrored
+
+                self.contentUpsideDown = (snapped == 180)
+                self.videoRotationDegrees = snapped
+
+                self.contentFlippedVertically = false
+
+                await MainActor.run { self.updateProcessingMessage("Analysing & Exporting…") }
+                // All processing now happens in a single pass during export
+                await self.exportAnnotatedVideo(asset: asset, track: track)
+            } catch {
+                await MainActor.run { self.hideProcessingOverlay() }
+            }
+        }
+    }
+}
+
+// MARK: - Live Capture Delegate
+extension CameraViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
+    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        guard videoURL == nil else { return }
+
+        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        
+        if isRecording {
+            guard let assetWriter = assetWriter,
+                  let assetWriterInput = assetWriterInput,
+                  let pixelBufferAdaptor = pixelBufferAdaptor,
+                  let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+            
+            if recordingStartTime == nil {
+                assetWriter.startWriting()
+                assetWriter.startSession(atSourceTime: pts)
+                recordingStartTime = pts
+                print("[Recording] Writer started. Status: \(assetWriter.status.rawValue)")
+            }
+            
+            if assetWriter.status == .failed {
+                print("[Recording] ERROR: Writer failed with error: \(assetWriter.error?.localizedDescription ?? "unknown")")
+                return
+            }
+            
+            frameCount += 1
+            if let lastTime = lastFrameTime {
+                let deltaTime = CMTimeGetSeconds(CMTimeSubtract(pts, lastTime))
+                let instantFPS = 1.0 / deltaTime
+                
+                if frameCount % 60 == 0 {
+                    let avgTime = CMTimeGetSeconds(CMTimeSubtract(pts, recordingStartTime ?? pts))
+                    let avgFPS = avgTime > 0 ? Double(frameCount) / avgTime : 0
+                    print("[Recording] Frame \(frameCount): instant=\(String(format: "%.1f", instantFPS)) fps, avg=\(String(format: "%.1f", avgFPS)) fps, ready=\(assetWriterInput.isReadyForMoreMediaData)")
+                }
+            }
+            lastFrameTime = pts
+            
+            if assetWriterInput.isReadyForMoreMediaData {
+                let success = pixelBufferAdaptor.append(pixelBuffer, withPresentationTime: pts)
+                if !success {
+                    print("[Recording] WARNING: Failed to append frame \(frameCount)")
+                }
+            } else {
+                print("[Recording] WARNING: Writer not ready, dropping frame \(frameCount)")
+            }
+            
+            if frameCount % 4 == 0 {
+                visionQueue.async { [weak self, sampleBuffer] in
+                    guard let self = self,
+                          let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+                    
+                    let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
+                    
+                    // Build request array based on settings
+                    var allRequests: [VNRequest] = []
+                    if self.settings.ballDetectionEnabled {
+                        allRequests.append(contentsOf: self.requests)
+                    }
+                    if self.settings.poseEstimationEnabled, let poseRequest = self.poseRequest {
+                        allRequests.append(poseRequest)
+                    }
+                    
+                    guard !allRequests.isEmpty else { return }
+                    
+                    try? handler.perform(allRequests)
+                    
+                    // Fuse the data for biomechanical analysis
+                    if let poseObs = self.lastPoseObservation,
+                       let ballObs = self.lastObservations.first(where: { obs in
+                           guard let label = obs.labels.first else { return false }
+                           return label.identifier == "baseball" && obs.confidence >= self.settings.ballConfidenceThreshold
+                       }) {
+                        
+                        let ballPosition = CGPoint(x: ballObs.boundingBox.midX, y: ballObs.boundingBox.midY)
+                        let analysis = self.analyzeBiomechanics(ballPosition: ballPosition, poseObservation: poseObs)
+                        
+                        // Store fused frame data (keep only last 5 seconds to avoid memory issues)
+                        if let timestamp = self.lastFrameTime {
+                            self.fusedFrameData.append((timestamp: timestamp, ballPosition: ballPosition, poseObservation: poseObs))
+                            
+                            // Trim old data to prevent memory bloat
+                            let cutoffTime = CMTimeSubtract(timestamp, CMTime(seconds: 5, preferredTimescale: 600))
+                            self.fusedFrameData.removeAll { CMTimeCompare($0.timestamp, cutoffTime) < 0 }
+                            
+                            // Log biomechanical data periodically
+                            if self.frameCount % 120 == 0 {
+                                print("[Biomechanics] \(analysis)")
+                            }
+                        }
+                    }
+                }
+            }
+            
+            return
+        }
+        
+        // For live preview (not recording), process synchronously with minimal throttling
+        // This reduces overlay lag while maintaining good performance
+        frameCount += 1
+        lastFrameTime = pts  // Record timestamp so speed calculation has a valid reference
+        guard frameCount % 2 == 0 else { return }  // Process every other frame
+        
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        
+        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
+        
+        // Build request array based on settings
+        var allRequests: [VNRequest] = []
+        if self.settings.ballDetectionEnabled {
+            allRequests.append(contentsOf: self.requests)
+        }
+        if self.settings.poseEstimationEnabled, let poseRequest = self.poseRequest {
+            allRequests.append(poseRequest)
+        }
+        
+        guard !allRequests.isEmpty else {
+            print("[LivePreview] No Vision requests enabled")
+            return
+        }
+        
+        // Process synchronously for minimal latency during live preview
+        try? handler.perform(allRequests)
+        
+        // Debug: Check if overlay is being updated
+        if frameCount % 60 == 0 {
+            print("[LivePreview] Processed frame \(frameCount), overlay sublayers: \(overlayLayer.sublayers?.count ?? 0)")
+        }
+    }
+}
+
+// MARK: - UIViewController extension for safe alert presentation
+private extension UIViewController {
+    func topMostViewController() -> UIViewController {
+        var top = self
+        while let presented = top.presentedViewController {
+            top = presented
+        }
+        return top
+    }
+}
+
+// MARK: - Color Conversion Extension
+extension Color {
+    func toUIColor() -> UIColor {
+        // Convert SwiftUI Color to UIColor
+        if #available(iOS 15.0, *) {
+            return UIColor(self)
+        } else {
+            // Fallback: try to get components from cgColor
+            if let components = self.cgColor?.components {
+                let red = components.count > 0 ? components[0] : 0
+                let green = components.count > 1 ? components[1] : 0
+                let blue = components.count > 2 ? components[2] : 0
+                let alpha = components.count > 3 ? components[3] : 1
+                return UIColor(red: red, green: green, blue: blue, alpha: alpha)
+            }
+            // Default fallback
+            return .black
+        }
+    }
+}
+
+// MARK: - Camera Settings View
+struct CameraSettingsView: View {
+    @ObservedObject var settings: CameraSettings
+    @Environment(\.dismiss) var dismiss
+    
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Detection") {
+                    Toggle("Ball Detection", isOn: $settings.ballDetectionEnabled)
+                    
+                    if settings.ballDetectionEnabled {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Ball Confidence: \(String(format: "%.0f%%", settings.ballConfidenceThreshold * 100))")
+                                .font(.subheadline)
+                            Slider(value: $settings.ballConfidenceThreshold, in: 0.1...0.9, step: 0.05)
+                        }
+                        
+                        Toggle("Show Speed", isOn: $settings.showSpeed)
+                        
+                        if settings.showSpeed {
+                            Picker("Speed Unit", selection: $settings.speedUnit) {
+                                ForEach(CameraSettings.SpeedUnit.allCases, id: \.self) { unit in
+                                    Text(unit.rawValue).tag(unit)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+                            
+                            if !settings.isCalibrated {
+                                HStack {
+                                    Image(systemName: "exclamationmark.triangle.fill")
+                                        .foregroundColor(.orange)
+                                    Text("Using fallback calibration. Calibrate for accuracy")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                        }
+                        
+                        ColorPicker("Ball Colour", selection: $settings.ballColor)
+                        ColorPicker("Trajectory Colour", selection: $settings.trajectoryColor)
+                    }
+                }
+                
+                Section("Calibration") {
+                    Toggle("Use Centimeters", isOn: $settings.useCentimeters)
+                    
+                    if settings.isCalibrated {
+                        HStack {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundColor(.green)
+                            Text("Camera is calibrated")
+                        }
+                        
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Plate Width: \(String(format: "%.1f", settings.plateWidth)) \(settings.useCentimeters ? "cm" : "inches")")
+                                .font(.subheadline)
+                            Text("Use the ruler button to recalibrate")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    } else {
+                        HStack {
+                            Image(systemName: "exclamationmark.circle.fill")
+                                .foregroundColor(.orange)
+                            Text("Camera not calibrated")
+                        }
+                        Text("Tap the ruler button and mark the two front edges of home plate for accurate speed measurements")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                
+                Section("Strike Zone") {
+                    Toggle("Show Strike Zone", isOn: $settings.showStrikeZone)
+                    
+                    if settings.showStrikeZone {
+                        if settings.isCalibrated {
+                            ColorPicker("Strike Zone Colour", selection: $settings.strikeZoneColor)
+                            
+                            VStack(alignment: .leading, spacing: 8) {
+                                let heightLabel: String = settings.useCentimeters
+                                    ? String(format: "Strike Zone Height: %.1f cm", settings.strikeZoneHeight * 2.54)
+                                    : String(format: "Strike Zone Height: %.1f\"", settings.strikeZoneHeight)
+                                Text(heightLabel)
+                                    .font(.subheadline)
+                                // Slider range: 18"–26" covers youth through MLB
+                                Slider(value: $settings.strikeZoneHeight, in: 18...26, step: 0.5)
+                            }
+                            
+                            VStack(alignment: .leading, spacing: 8) {
+                                let offsetLabel: String = settings.useCentimeters
+                                    ? String(format: "Bottom Offset (above plate): %.1f cm", settings.strikeZoneBottomOffset * 2.54)
+                                    : String(format: "Bottom Offset (above plate): %.1f\"", settings.strikeZoneBottomOffset)
+                                Text(offsetLabel)
+                                    .font(.subheadline)
+                                // Slider range: 14"–24" covers knee height for youth through MLB
+                                Slider(value: $settings.strikeZoneBottomOffset, in: 14...24, step: 0.5)
+                            }
+                            
+                            Text("Generic height based on MLB regulation (~22\"). Bottom offset is the distance from the plate up to the batter's knees (~18\"). Adjust both for age group or batter height.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        } else {
+                            HStack {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .foregroundColor(.orange)
+                                Text("Calibrate first to display the strike zone")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                    }
+                }
+                
+                Section("Pose Estimation") {
+                    Toggle("Pose Estimation", isOn: $settings.poseEstimationEnabled)
+                    
+                    if settings.poseEstimationEnabled {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Pose Confidence: \(String(format: "%.0f%%", settings.poseConfidenceThreshold * 100))")
+                                .font(.subheadline)
+                            Slider(value: $settings.poseConfidenceThreshold, in: 0.1...0.9, step: 0.05)
+                        }
+                        
+                        ColorPicker("Skeleton Colour", selection: $settings.skeletonColor)
+                        ColorPicker("Joint Colour", selection: $settings.jointColor)
+                        ColorPicker("Elbow Angle Colour", selection: $settings.elbowAngleColor)
+                        ColorPicker("Knee Angle Colour", selection: $settings.kneeAngleColor)
+                        ColorPicker("Shoulder Angle Colour", selection: $settings.shoulderAngleColor)
+                        ColorPicker("Separation Colour", selection: $settings.separationColor)
+                    }
+                }
+                
+                Section("Display") {
+                    Toggle("Show Labels", isOn: $settings.showLabels)
+                }
+                
+                Section("Export") {
+                    Toggle("Also Export Clean Video", isOn: $settings.exportCleanVideo)
+                    Text("When enabled, the original recording without any overlays is saved to Photos alongside the annotated version.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+            .navigationTitle("Camera Settings")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") {
+                        dismiss()
+                    }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Calibration View
+struct CalibrationView: View {
+    @ObservedObject var settings: CameraSettings
+    @Environment(\.dismiss) var dismiss
+    var minimumZoom: CGFloat = 1.0 // Minimum zoom (from live camera)
+    var onDismiss: (() -> Void)?
+    
+    @State private var leftEdgePosition: CGPoint = .zero // View coordinates
+    @State private var rightEdgePosition: CGPoint = .zero // View coordinates
+    @State private var calibrationZoom: CGFloat = 1.0 // Zoom level when markers were placed
+    @State private var leftEdgeZoom: CGFloat = 1.0   // Zoom at which the left marker was tapped
+    @State private var rightEdgeZoom: CGFloat = 1.0  // Zoom at which the right marker was tapped
+    @State private var plateWidthText: String = "17"
+    @State private var hasSetLeftEdge = false
+    @State private var hasSetRightEdge = false
+    @State private var screenSize: CGSize = .zero
+    @State private var useCentimeters: Bool = false
+    @State private var zoomFactor: CGFloat = 1.0 // Current zoom for preview
+    
+    var body: some View {
+        GeometryReader { geometry in
+            calibrationContent
+                .onAppear {
+                    screenSize = geometry.size
+                    loadExistingCalibration()
+                }
+        }
+    }
+    
+    private var calibrationContent: some View {
+        ZStack {
+            // Live Camera Preview
+            CalibrationCameraPreview(zoomFactor: $zoomFactor, minimumZoom: minimumZoom)
+                .ignoresSafeArea()
+            
+            // Calibration UI
+            VStack {
+                // Header
+                VStack(spacing: 8) {
+                    Text("Calibrate Home Plate")
+                        .font(.largeTitle)
+                        .fontWeight(.bold)
+                        .foregroundColor(.white)
+                    
+                    Text(instructionText)
+                        .font(.headline)
+                        .foregroundColor(.white)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal)
+                }
+                .padding()
+                .background(Color.black.opacity(0.6))
+                
+                Spacer()
+                
+                // Zoom indicator (top left)
+                HStack {
+                    Text(String(format: "%.1fx", zoomFactor))
+                        .font(.subheadline)
+                        .fontWeight(.semibold)
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(Color.black.opacity(0.6))
+                        .cornerRadius(8)
+                    
+                    Spacer()
+                }
+                .padding(.leading, 16)
+                
+                Spacer()
+                
+                // Plate width input
+                VStack(spacing: 12) {
+                    Text("Home Plate Width")
+                        .font(.headline)
+                        .foregroundColor(.white)
+                    
+                    HStack(spacing: 16) {
+                        if useCentimeters {
+                            Button {
+                                plateWidthText = "43.2"
+                            } label: {
+                                Text("Baseball (43.2cm)")
+                                    .font(.subheadline)
+                                    .foregroundColor(.white)
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 8)
+                                    .background(plateWidthText == "43.2" ? Color.blue : Color.gray.opacity(0.5))
+                                    .cornerRadius(8)
+                            }
+                            
+                            Button {
+                                plateWidthText = "30.5"
+                            } label: {
+                                Text("Softball (30.5cm)")
+                                    .font(.subheadline)
+                                    .foregroundColor(.white)
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 8)
+                                    .background(plateWidthText == "30.5" ? Color.blue : Color.gray.opacity(0.5))
+                                    .cornerRadius(8)
+                            }
+                        } else {
+                            Button {
+                                plateWidthText = "17"
+                            } label: {
+                                Text("Baseball (17\")")
+                                    .font(.subheadline)
+                                    .foregroundColor(.white)
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 8)
+                                    .background(plateWidthText == "17" ? Color.blue : Color.gray.opacity(0.5))
+                                    .cornerRadius(8)
+                            }
+                            
+                            Button {
+                                plateWidthText = "12"
+                            } label: {
+                                Text("Softball (12\")")
+                                    .font(.subheadline)
+                                    .foregroundColor(.white)
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 8)
+                                    .background(plateWidthText == "12" ? Color.blue : Color.gray.opacity(0.5))
+                                    .cornerRadius(8)
+                            }
+                        }
+                    }
+                    
+                    HStack {
+                        TextField("Width", text: $plateWidthText)
+                            .textFieldStyle(.roundedBorder)
+                            .keyboardType(.decimalPad)
+                            .frame(width: 100)
+                        
+                        Text(useCentimeters ? "cm" : "inches")
+                            .foregroundColor(.white)
+                    }
+                }
+                .padding()
+                .background(Color.black.opacity(0.6))
+                .cornerRadius(12)
+                .padding()
+                
+                // Action buttons
+                VStack(spacing: 12) {
+                    // Cancel and Clear on same row
+                    HStack(spacing: 12) {
+                        Button {
+                            dismiss()
+                        } label: {
+                            Text("Cancel")
+                                .font(.headline)
+                                .foregroundColor(.white)
+                                .frame(maxWidth: .infinity)
+                                .padding()
+                                .background(Color.red.opacity(0.7))
+                                .cornerRadius(12)
+                        }
+                        
+                        Button {
+                            clearCalibration()
+                        } label: {
+                            Text("Clear")
+                                .font(.headline)
+                                .foregroundColor(.white)
+                                .frame(maxWidth: .infinity)
+                                .padding()
+                                .background(Color.orange.opacity(0.7))
+                                .cornerRadius(12)
+                        }
+                    }
+                    
+                    // Save on its own row
+                    Button {
+                        saveCalibration()
+                    } label: {
+                        Text("Save")
+                            .font(.headline)
+                            .foregroundColor(.white)
+                            .frame(maxWidth: .infinity)
+                            .padding()
+                            .background(canSave ? Color.green : Color.gray.opacity(0.5))
+                            .cornerRadius(12)
+                    }
+                    .disabled(!canSave)
+                }
+                .padding()
+            }
+            
+            // Edge Markers (scale with zoom)
+            if hasSetLeftEdge {
+                CalibrationMarker(label: "Left Edge", color: .green)
+                    .position(scaledPosition(leftEdgePosition, recordedAt: leftEdgeZoom))
+            }
+            
+            if hasSetRightEdge {
+                CalibrationMarker(label: "Right Edge", color: .blue)
+                    .position(scaledPosition(rightEdgePosition, recordedAt: rightEdgeZoom))
+            }
+            
+            // Plate width line (scale with zoom)
+            if hasSetLeftEdge && hasSetRightEdge {
+                let scaledLeft = scaledPosition(leftEdgePosition, recordedAt: leftEdgeZoom)
+                let scaledRight = scaledPosition(rightEdgePosition, recordedAt: rightEdgeZoom)
+                
+                Path { path in
+                    path.move(to: scaledLeft)
+                    path.addLine(to: scaledRight)
+                }
+                .stroke(Color.yellow, lineWidth: 4)
+                
+                // Midpoint label showing distance
+                let midpoint = CGPoint(
+                    x: (scaledLeft.x + scaledRight.x) / 2,
+                    y: (scaledLeft.y + scaledRight.y) / 2
+                )
+                
+                Text("\(plateWidthText)\(useCentimeters ? "cm" : "\"")")
+                    .font(.headline)
+                    .fontWeight(.bold)
+                    .foregroundColor(.white)
+                    .padding(8)
+                    .background(Color.yellow.opacity(0.8))
+                    .cornerRadius(6)
+                    .position(midpoint)
+            }
+        }
+        .contentShape(Rectangle())
+        .gesture(
+            DragGesture(minimumDistance: 0)
+                .onEnded { value in
+                    handleTap(at: value.location)
+                }
+        )
+        .simultaneousGesture(
+            MagnificationGesture()
+                .onChanged { scale in
+                    let newZoom = calibrationZoom * scale
+                    // Clamp zoom between minimumZoom and 10.0
+                    zoomFactor = min(max(newZoom, minimumZoom), 10.0)
+                }
+                .onEnded { scale in
+                    // Ensure final zoom respects minimum
+                    calibrationZoom = max(zoomFactor, minimumZoom)
+                }
+        )
+    }
+    
+    // Scale position from the zoom at which it was recorded to the current zoom
+    private func scaledPosition(_ position: CGPoint, recordedAt markerZoom: CGFloat) -> CGPoint {
+        let center = CGPoint(x: screenSize.width / 2, y: screenSize.height / 2)
+        let scale = zoomFactor / markerZoom
+        
+        return CGPoint(
+            x: center.x + (position.x - center.x) * scale,
+            y: center.y + (position.y - center.y) * scale
+        )
+    }
+    
+    private func loadExistingCalibration() {
+        // Load existing calibration if available
+        useCentimeters = settings.useCentimeters
+        if settings.isCalibrated {
+            hasSetLeftEdge = true
+            hasSetRightEdge = true
+            calibrationZoom = minimumZoom // Start at the live camera zoom
+            leftEdgeZoom  = minimumZoom   // Existing markers are stored at minimumZoom scale
+            rightEdgeZoom = minimumZoom
+            zoomFactor = minimumZoom
+            leftEdgePosition = CGPoint(
+                x: settings.plateLeftEdge.x * screenSize.width,
+                y: settings.plateLeftEdge.y * screenSize.height
+            )
+            rightEdgePosition = CGPoint(
+                x: settings.plateRightEdge.x * screenSize.width,
+                y: settings.plateRightEdge.y * screenSize.height
+            )
+            plateWidthText = String(format: "%.1f", settings.plateWidth)
+        } else {
+            // Set defaults based on unit preference
+            calibrationZoom = minimumZoom // Start at the live camera zoom
+            leftEdgeZoom  = minimumZoom
+            rightEdgeZoom = minimumZoom
+            zoomFactor = minimumZoom
+            if useCentimeters {
+                plateWidthText = "43.2" // 17 inches in cm
+            } else {
+                plateWidthText = "17"
+            }
+        }
+    }
+    
+    private var instructionText: String {
+        if !hasSetLeftEdge {
+            return "Pinch to zoom in for precision, then tap the LEFT edge of home plate"
+        } else if !hasSetRightEdge {
+            return "Now tap the RIGHT edge of home plate"
+        } else {
+            return "Markers will stay locked to your points. Adjust width if needed, then tap Save"
+        }
+    }
+    
+    private var canSave: Bool {
+        hasSetLeftEdge && hasSetRightEdge && Double(plateWidthText) != nil && Double(plateWidthText)! > 0
+    }
+    
+    private func handleTap(at position: CGPoint) {
+        if !hasSetLeftEdge {
+            leftEdgePosition = position
+            leftEdgeZoom = zoomFactor
+            hasSetLeftEdge = true
+        } else if !hasSetRightEdge {
+            rightEdgePosition = position
+            rightEdgeZoom = zoomFactor
+            hasSetRightEdge = true
+        } else {
+            // Reset and start over
+            hasSetLeftEdge = false
+            hasSetRightEdge = false
+            calibrationZoom = minimumZoom
+            zoomFactor = minimumZoom
+        }
+    }
+    
+    private func clearCalibration() {
+        hasSetLeftEdge = false
+        hasSetRightEdge = false
+        leftEdgePosition = .zero
+        rightEdgePosition = .zero
+        calibrationZoom = minimumZoom
+        leftEdgeZoom  = minimumZoom
+        rightEdgeZoom = minimumZoom
+        zoomFactor = minimumZoom
+        settings.isCalibrated = false
+        settings.plateLeftEdge = .zero
+        settings.plateRightEdge = .zero
+        
+        // Reset to default value
+        if useCentimeters {
+            plateWidthText = "43.2"
+        } else {
+            plateWidthText = "17"
+        }
+        
+        onDismiss?()
+    }
+    
+    private func saveCalibration() {
+        guard let width = Double(plateWidthText), width > 0 else { return }
+        
+        // Each marker was tapped at a potentially different zoom level.  Convert
+        // each one back to minimumZoom (the live-camera zoom) coordinates
+        // independently before normalising to 0–1.
+        let center = CGPoint(x: screenSize.width / 2, y: screenSize.height / 2)
+        let leftAtMinZoom = CGPoint(
+            x: center.x + (leftEdgePosition.x - center.x) / leftEdgeZoom * minimumZoom,
+            y: center.y + (leftEdgePosition.y - center.y) / leftEdgeZoom * minimumZoom
+        )
+        let rightAtMinZoom = CGPoint(
+            x: center.x + (rightEdgePosition.x - center.x) / rightEdgeZoom * minimumZoom,
+            y: center.y + (rightEdgePosition.y - center.y) / rightEdgeZoom * minimumZoom
+        )
+        
+        settings.plateLeftEdge = CGPoint(
+            x: leftAtMinZoom.x / screenSize.width,
+            y: leftAtMinZoom.y / screenSize.height
+        )
+        settings.plateRightEdge = CGPoint(
+            x: rightAtMinZoom.x / screenSize.width,
+            y: rightAtMinZoom.y / screenSize.height
+        )
+        settings.plateWidth = width
+        settings.useCentimeters = useCentimeters
+        settings.isCalibrated = true
+        
+        onDismiss?()
+        dismiss()
+    }
+}
+
+// MARK: - Calibration Marker
+struct CalibrationMarker: View {
+    let label: String
+    let color: Color
+    
+    var body: some View {
+        VStack(spacing: 4) {
+            Circle()
+                .fill(color)
+                .frame(width: 20, height: 20)
+                .overlay(
+                    Circle()
+                        .stroke(Color.white, lineWidth: 2)
+                )
+            
+            Text(label)
+                .font(.caption)
+                .fontWeight(.bold)
+                .foregroundColor(.white)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(color.opacity(0.8))
+                .cornerRadius(6)
+        }
+    }
+}
+
+// MARK: - Calibration Camera Preview
+struct CalibrationCameraPreview: UIViewControllerRepresentable {
+    @Binding var zoomFactor: CGFloat
+    var minimumZoom: CGFloat = 1.0
+    
+    func makeUIViewController(context: Context) -> CalibrationCameraViewController {
+        let vc = CalibrationCameraViewController()
+        vc.zoomFactor = zoomFactor
+        vc.minimumZoom = minimumZoom
+        return vc
+    }
+    
+    func updateUIViewController(_ uiViewController: CalibrationCameraViewController, context: Context) {
+        uiViewController.updateZoom(to: zoomFactor)
+    }
+}
+
+class CalibrationCameraViewController: UIViewController {
+    private let captureSession = AVCaptureSession()
+    private let sessionQueue = DispatchQueue(label: "calibration.camera.queue")
+    private var previewLayer: AVCaptureVideoPreviewLayer!
+    private var videoDeviceInput: AVCaptureDeviceInput?
+    
+    var zoomFactor: CGFloat = 1.0
+    var minimumZoom: CGFloat = 1.0
+    
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .black
+        setupCamera()
+    }
+    
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        previewLayer?.frame = view.bounds
+    }
+    
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        sessionQueue.async { [weak self] in
+            self?.captureSession.startRunning()
+        }
+    }
+    
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        sessionQueue.async { [weak self] in
+            self?.captureSession.stopRunning()
+        }
+    }
+    
+    private func setupCamera() {
+        sessionQueue.async { [weak self] in
+            guard let self = self else { return }
+            
+            self.captureSession.beginConfiguration()
+            self.captureSession.sessionPreset = .high
+            
+            guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
+                  let input = try? AVCaptureDeviceInput(device: device) else {
+                self.captureSession.commitConfiguration()
+                return
+            }
+            
+            self.videoDeviceInput = input
+            
+            if self.captureSession.canAddInput(input) {
+                self.captureSession.addInput(input)
+            }
+            
+            self.captureSession.commitConfiguration()
+            
+            DispatchQueue.main.async {
+                let preview = AVCaptureVideoPreviewLayer(session: self.captureSession)
+                preview.videoGravity = .resizeAspectFill
+                preview.frame = self.view.bounds
+                self.view.layer.insertSublayer(preview, at: 0)
+                self.previewLayer = preview
+            }
+            
+            // Set initial zoom to minimum zoom
+            self.updateZoom(to: self.minimumZoom)
+        }
+    }
+    
+    func updateZoom(to factor: CGFloat) {
+        guard let device = videoDeviceInput?.device else { return }
+        
+        sessionQueue.async {
+            do {
+                try device.lockForConfiguration()
+                
+                // Clamp zoom to device capabilities, respecting minimum zoom
+                let maxZoom = min(device.activeFormat.videoMaxZoomFactor, 10.0)
+                let clampedFactor = max(self.minimumZoom, min(factor, maxZoom))
+                
+                device.videoZoomFactor = clampedFactor
+                device.unlockForConfiguration()
+                
+                print("[Calibration Zoom] Set zoom to \(String(format: "%.1f", clampedFactor))x (min: \(String(format: "%.1f", self.minimumZoom))x)")
+            } catch {
+                print("[Calibration Zoom] Error setting zoom: \(error)")
+            }
+        }
+    }
+}
+
