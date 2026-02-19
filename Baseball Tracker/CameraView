@@ -47,6 +47,10 @@ class CameraSettings: ObservableObject {
     
     // Export options
     @Published var exportCleanVideo: Bool = false
+    
+    // Debug options
+    @Published var showROI: Bool = false
+    @Published var enableROI: Bool = true // Toggle to enable/disable ROI tracking
 }
 
 struct CameraView: UIViewControllerRepresentable {
@@ -226,6 +230,32 @@ class CameraViewController: UIViewController {
     private var requests = [VNRequest]()
     private var lastObservations: [VNRecognizedObjectObservation] = []
     private let allowedClasses = ["baseball"]
+    
+    // MARK: - ROI Tracking
+    // Region of Interest (ROI) tracking focuses the vision model on a smaller area
+    // where the ball is likely to be, improving performance and reducing false positives.
+    // 
+    // How it works:
+    // 1. When a ball is detected, create an ROI 3x the ball size (minimum 15% of frame)
+    // 2. On subsequent frames, only search within this ROI
+    // 3. If ball is still detected, update ROI to follow it
+    // 4. If ball is not detected, gradually expand ROI by 8% per frame
+    // 5. After 60 frames (~0.25 seconds at 240fps) or when ROI exceeds 70% of frame, reset to full frame
+    // 6. Detections far outside the current ROI are rejected as false positives
+    //
+    // The confidence threshold is kept CONSTANT in ROI mode - do not lower it.
+    // The whole point of ROI is to reduce false positives by constraining the search area.
+    //
+    // At 240fps, the ball barely moves between frames, so tight tracking is appropriate.
+    //
+    // ROI can be toggled on/off via settings.enableROI
+    private var currentROI: CGRect? = nil
+    private var framesWithoutDetection: Int = 0
+    private let maxFramesWithoutDetection = 60 // ~0.25 second at 240fps
+    private let initialROIScale: CGFloat = 3.0 // Initial ROI is 3x the ball size (perfect for 240fps)
+    private let minROISize: CGFloat = 0.15 // Minimum ROI size (15% of frame)
+    private let maxROISize: CGFloat = 0.7 // Maximum ROI size before resetting to full frame
+    private let roiExpansionRate: CGFloat = 1.08 // Expand by 8% per frame without detection (gentle for 240fps)
     
     // MARK: - Pose Estimation
     private var poseRequest: VNDetectHumanBodyPoseRequest!
@@ -706,6 +736,10 @@ class CameraViewController: UIViewController {
         self.lastPoseObservation = nil
         self.videoRotationDegrees = 0  // Live recordings are already portrait
         
+        // Reset ROI tracking
+        self.currentROI = nil
+        self.framesWithoutDetection = 0
+        
         // Reset frame timing debug
         self.lastFrameTime = nil
         self.frameCount = 0
@@ -1040,10 +1074,10 @@ class CameraViewController: UIViewController {
         // Load the CoreML model - replace 'YourModelName' with your actual .mlmodel file name
         // For example, if your model is called 'best.mlmodel', use 'best'
         // If it's 'baseball_detector.mlmodel', use 'baseball_detector'
-        guard let modelURL = Bundle.main.url(forResource: "best", withExtension: "mlmodelc"),
+        guard let modelURL = Bundle.main.url(forResource: "best_v2", withExtension: "mlmodelc"),
               let mlmodel = try? MLModel(contentsOf: modelURL),
               let visionModel = try? VNCoreMLModel(for: mlmodel) else {
-            fatalError("Could not load CoreML model. Ensure 'best.mlmodel' is added to your project.")
+            fatalError("Could not load CoreML model. Ensure 'best_v2.mlmodel' is added to your project.")
         }
         self.visionModel = visionModel
         
@@ -1052,10 +1086,56 @@ class CameraViewController: UIViewController {
             let results = (request.results as? [VNRecognizedObjectObservation]) ?? []
             self.lastObservations = results
             
+            // Debug: Log what ROI Vision is actually using
+            if self.settings.showROI && self.settings.enableROI && self.frameCount % 30 == 0 {
+                if let coreMLRequest = request as? VNCoreMLRequest {
+                    let roi = coreMLRequest.regionOfInterest
+                    print("[ROI Debug] Vision request ROI: x=\(String(format: "%.3f", roi.origin.x)) y=\(String(format: "%.3f", roi.origin.y)) w=\(String(format: "%.3f", roi.width)) h=\(String(format: "%.3f", roi.height))")
+                    print("[ROI Debug] Got \(results.count) total results from Vision")
+                }
+            }
+            
+            // Use the user's confidence threshold consistently - do NOT lower it in ROI mode
+            // The ROI itself is the constraint that reduces false positives
+            let effectiveThreshold = self.settings.ballConfidenceThreshold
+            
             let baseballDetections = results.filter { obs in
                 guard let label = obs.labels.first else { return false }
-                return label.identifier == "baseball" && obs.confidence >= self.settings.ballConfidenceThreshold
+                
+                // Validate bounding box is reasonable
+                let bbox = obs.boundingBox
+                let isValidBox = bbox.minX >= -0.1 && bbox.maxX <= 1.1 &&
+                                bbox.minY >= -0.1 && bbox.maxY <= 1.1 &&
+                                bbox.width > 0.005 && bbox.width <= 0.5 &&  // Ball should be between 0.5% and 50% of frame
+                                bbox.height > 0.005 && bbox.height <= 0.5
+                
+                if !isValidBox && self.settings.showROI {
+                    print("[ROI] ⚠️ Rejecting invalid detection: bbox=\(bbox), conf=\(String(format: "%.2f", obs.confidence))")
+                }
+                
+                let passed = label.identifier == "baseball" && 
+                       obs.confidence >= effectiveThreshold &&
+                       isValidBox
+                
+                // Debug: Log all detections when ROI is enabled
+                if self.settings.showROI && self.settings.enableROI && self.frameCount % 30 == 0 {
+                    if label.identifier == "baseball" {
+                        let currentROIString = self.currentROI != nil ? String(format: "ROI(%.2f,%.2f %.2fx%.2f)", self.currentROI!.origin.x, self.currentROI!.origin.y, self.currentROI!.width, self.currentROI!.height) : "NO ROI"
+                        print("[ROI Debug] Detection: conf=\(String(format: "%.2f", obs.confidence)) bbox=(\(String(format: "%.3f,%.3f %.3fx%.3f", bbox.origin.x, bbox.origin.y, bbox.width, bbox.height))) passed=\(passed) \(currentROIString)")
+                    }
+                }
+                
+                return passed
             }.sorted { $0.confidence > $1.confidence }
+            
+            // Update ROI based on detection (only if ROI is enabled)
+            if self.settings.enableROI {
+                if let bestDetection = baseballDetections.first {
+                    self.updateROI(from: bestDetection.boundingBox)
+                } else {
+                    self.expandROI()
+                }
+            }
             
             DispatchQueue.main.async {
                 self.overlayLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
@@ -1082,6 +1162,11 @@ class CameraViewController: UIViewController {
                 // Draw strike zone if enabled and calibrated
                 if self.settings.isCalibrated && self.settings.showStrikeZone {
                     self.drawStrikeZone(bufferSize: self.view.bounds.size)
+                }
+                
+                // Draw ROI if enabled in settings
+                if self.settings.showROI, let roi = self.currentROI, self.settings.enableROI {
+                    self.drawROI(roi, bufferSize: self.view.bounds.size)
                 }
             }
         }
@@ -1124,6 +1209,179 @@ class CameraViewController: UIViewController {
                 }
             }
         }
+    }
+    
+    // MARK: - ROI Management
+    
+    /// Updates the ROI based on a successful ball detection
+    private func updateROI(from boundingBox: CGRect) {
+        // Validate bounding box is within valid range [0, 1]
+        guard boundingBox.minX >= -0.1 && boundingBox.maxX <= 1.1 &&
+              boundingBox.minY >= -0.1 && boundingBox.maxY <= 1.1 &&
+              boundingBox.width > 0 && boundingBox.height > 0 &&
+              boundingBox.width <= 1.0 && boundingBox.height <= 1.0 else {
+            print("[ROI] ⚠️ Invalid bounding box detected: \(boundingBox) - ignoring")
+            expandROI()
+            return
+        }
+        
+        // If we have an existing ROI and this detection is far outside it, it might be a false positive
+        // At 240fps, ball movement between frames is minimal, so be more strict
+        // Only apply this check if we've had perfect tracking (0 frames missed)
+        if let existingROI = currentROI, framesWithoutDetection == 0 {
+            let center = CGPoint(x: boundingBox.midX, y: boundingBox.midY)
+            // Check if the new detection is within 1.5x the current ROI (tight for 240fps)
+            let expandedROI = existingROI.insetBy(dx: -existingROI.width * 0.5, dy: -existingROI.height * 0.5)
+            if !expandedROI.contains(center) {
+                print("[ROI] ⚠️ Detection too far from current ROI at 240fps, likely false positive - expanding instead")
+                expandROI()
+                return
+            }
+        }
+        
+        // Reset frames without detection counter
+        framesWithoutDetection = 0
+        
+        // Calculate center of detection (clamped to valid range)
+        let centerX = max(0, min(1, boundingBox.midX))
+        let centerY = max(0, min(1, boundingBox.midY))
+        
+        // Calculate ROI size (scale up from ball size, with minimum size)
+        let baseROIWidth = max(boundingBox.width * initialROIScale, minROISize)
+        let baseROIHeight = max(boundingBox.height * initialROIScale, minROISize)
+        let roiWidth = min(baseROIWidth, 1.0)
+        let roiHeight = min(baseROIHeight, 1.0)
+        
+        // Create ROI centered on detection
+        var roi = CGRect(
+            x: centerX - roiWidth / 2,
+            y: centerY - roiHeight / 2,
+            width: roiWidth,
+            height: roiHeight
+        )
+        
+        // Clamp ROI to valid bounds [0, 1]
+        roi = roi.intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
+        
+        // Ensure ROI is not empty
+        guard !roi.isEmpty else {
+            print("[ROI] ⚠️ Empty ROI after clamping - resetting to full frame")
+            currentROI = nil
+            if let request = requests.first as? VNCoreMLRequest {
+                request.regionOfInterest = CGRect(x: 0, y: 0, width: 1, height: 1)
+            }
+            return
+        }
+        
+        currentROI = roi
+        
+        // Apply ROI to the next vision request
+        if let request = requests.first as? VNCoreMLRequest {
+            request.regionOfInterest = roi
+            
+            // Debug: Verify ROI is being applied
+            if settings.showROI && frameCount % 60 == 0 {
+                print("[ROI] ✅ Applied ROI to request: \(String(format: "x:%.3f y:%.3f w:%.3f h:%.3f", roi.origin.x, roi.origin.y, roi.width, roi.height))")
+            }
+        }
+        
+        // Debug logging when showROI is enabled
+        if settings.showROI && frameCount % 30 == 0 {
+            print("[ROI] ✅ Ball detected at 240fps: center(\(String(format: "%.3f,%.3f", centerX, centerY))) ball size(\(String(format: "%.3fx%.3f", boundingBox.width, boundingBox.height))) → ROI(\(String(format: "%.3fx%.3f", roi.width, roi.height)))")
+        }
+    }
+    
+    /// Expands the ROI when no ball is detected, or resets it after too many frames
+    private func expandROI() {
+        framesWithoutDetection += 1
+        
+        // If we've gone too long without detection, reset ROI to full frame
+        if framesWithoutDetection >= maxFramesWithoutDetection {
+            currentROI = nil
+            if let request = requests.first as? VNCoreMLRequest {
+                request.regionOfInterest = CGRect(x: 0, y: 0, width: 1, height: 1)
+            }
+            
+            #if DEBUG
+            if framesWithoutDetection == maxFramesWithoutDetection {
+                print("[ROI] Reset to full frame after \(maxFramesWithoutDetection) frames")
+            }
+            #endif
+            return
+        }
+        
+        // Gradually expand the ROI
+        guard var roi = currentROI else { return }
+        
+        let newWidth = min(roi.width * roiExpansionRate, 1.0)
+        let newHeight = min(roi.height * roiExpansionRate, 1.0)
+        
+        // Check if ROI has expanded beyond maxROISize - if so, reset to full frame
+        let averageSize = (newWidth + newHeight) / 2.0
+        if averageSize >= maxROISize {
+            print("[ROI] ROI expanded beyond max size (\(String(format: "%.2f", averageSize))), resetting to full frame")
+            currentROI = nil
+            framesWithoutDetection = maxFramesWithoutDetection // Force reset
+            if let request = requests.first as? VNCoreMLRequest {
+                request.regionOfInterest = CGRect(x: 0, y: 0, width: 1, height: 1)
+            }
+            return
+        }
+        
+        // Keep ROI centered on previous position
+        let centerX = roi.midX
+        let centerY = roi.midY
+        
+        roi = CGRect(
+            x: max(0, centerX - newWidth / 2),
+            y: max(0, centerY - newHeight / 2),
+            width: min(newWidth, 1.0),
+            height: min(newHeight, 1.0)
+        )
+        
+        // Clamp to [0, 1] bounds
+        roi = roi.intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
+        
+        currentROI = roi
+        
+        // Apply expanded ROI to the next vision request
+        if let request = requests.first as? VNCoreMLRequest {
+            request.regionOfInterest = roi
+        }
+        
+        #if DEBUG
+        if framesWithoutDetection % 10 == 0 {
+            print("[ROI] Expanded (\(framesWithoutDetection) frames): \(String(format: "%.3fx%.3f", roi.width, roi.height))")
+        }
+        #endif
+    }
+    
+    /// Draws the current ROI on the overlay (for debugging)
+    private func drawROI(_ roi: CGRect, bufferSize: CGSize) {
+        // Convert from Vision coordinates (bottom-left origin) to UIKit coordinates (top-left origin)
+        let roiRect = convertBoundingBox(roi, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+        
+        let roiPath = UIBezierPath(rect: roiRect)
+        let roiLayer = CAShapeLayer()
+        roiLayer.path = roiPath.cgPath
+        roiLayer.strokeColor = UIColor.yellow.withAlphaComponent(0.8).cgColor
+        roiLayer.fillColor = UIColor.yellow.withAlphaComponent(0.1).cgColor
+        roiLayer.lineWidth = 3
+        roiLayer.lineDashPattern = [10, 5]
+        
+        overlayLayer.addSublayer(roiLayer)
+        
+        // Add label
+        let label = CATextLayer()
+        label.string = "ROI (missed: \(framesWithoutDetection))"
+        label.foregroundColor = UIColor.white.cgColor
+        label.backgroundColor = UIColor.yellow.withAlphaComponent(0.8).cgColor
+        label.fontSize = 14
+        label.contentsScale = view.traitCollection.displayScale
+        label.alignmentMode = .center
+        label.frame = CGRect(x: roiRect.minX, y: roiRect.minY - 22, width: 140, height: 20)
+        
+        overlayLayer.addSublayer(label)
     }
     
     // MARK: - Coordinate Conversion
@@ -1958,6 +2216,17 @@ class CameraViewController: UIViewController {
             let endTime = duration
             let timeRange = CMTimeRange(start: startTime, end: endTime)
             
+            // Detect actual frame rate
+            let nominalFrameRate = try await track.load(.nominalFrameRate)
+            let minFrameDuration = try await track.load(.minFrameDuration)
+            let actualFPS = minFrameDuration.seconds > 0 ? 1.0 / minFrameDuration.seconds : Double(nominalFrameRate)
+            
+            print("[Export] Video Info:")
+            print("[Export]   - Nominal frame rate: \(nominalFrameRate) fps")
+            print("[Export]   - Min frame duration: \(minFrameDuration.value)/\(minFrameDuration.timescale) = \(String(format: "%.4f", minFrameDuration.seconds))s")
+            print("[Export]   - Calculated actual FPS: \(String(format: "%.1f", actualFPS))")
+            print("[Export]   - Duration: \(String(format: "%.2f", CMTimeGetSeconds(duration)))s")
+            
             let reader = try AVAssetReader(asset: asset)
             reader.timeRange = timeRange
             let outputSettings: [String: Any] = [kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA)]
@@ -2009,6 +2278,17 @@ class CameraViewController: UIViewController {
             writer.startSession(atSourceTime: .zero)
 
             var exportFrameCount = 0
+            var detectionCount = 0
+            var missedFrameCount = 0
+            var lastPTS: CMTime?
+            
+            print("========================================")
+            print("🎬 STARTING VIDEO EXPORT WITH DETECTION LOGGING")
+            print("Video FPS: \(String(format: "%.1f", actualFPS))")
+            print("ROI Enabled: \(self.settings.enableROI) (NOTE: ROI is DISABLED during export due to 30fps vs 240fps live capture)")
+            print("Ball Confidence Threshold: \(self.settings.ballConfidenceThreshold)")
+            print("========================================")
+            
             while reader.status == .reading {
                 guard let sampleBuffer = readerOutput.copyNextSampleBuffer(),
                       let px = CMSampleBufferGetImageBuffer(sampleBuffer) else { break }
@@ -2020,9 +2300,25 @@ class CameraViewController: UIViewController {
                     let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
                     self.lastFrameTime = pts
                     
+                    // Calculate actual frame delta
+                    var frameDeltaInfo = ""
+                    if let last = lastPTS {
+                        let delta = CMTimeGetSeconds(CMTimeSubtract(pts, last))
+                        let instantFPS = delta > 0 ? 1.0 / delta : 0
+                        frameDeltaInfo = String(format: " [Δ=%.4fs, %.1ffps]", delta, instantFPS)
+                    }
+                    lastPTS = pts
+                    
                     // Run Vision on every frame for accurate overlay sync
                     // (We skip frames during live preview for performance, but export needs accuracy)
                     let req = VNCoreMLRequest(model: self.visionModel)
+                    
+                    // NOTE: ROI is DISABLED during export because video export runs at ~30fps,
+                    // while ROI was designed for 240fps live capture. At 30fps, the ball moves
+                    // too far between frames for ROI tracking to be effective.
+                    // ROI is ONLY used during live capture/recording.
+                    let roiUsed: CGRect? = nil
+                    
                     let handler = VNImageRequestHandler(cvPixelBuffer: px, options: [:])
                 
                     // Build request array based on settings
@@ -2042,14 +2338,67 @@ class CameraViewController: UIViewController {
                         
                         // Only process ball detections if ball detection is enabled
                         if self.settings.ballDetectionEnabled {
+                            // Use consistent threshold - ROI itself is the constraint
+                            let effectiveThreshold = self.settings.ballConfidenceThreshold
+                            
+                            // Log ALL raw results before filtering
+                            let rawBaseballResults = results.filter { obs in
+                                guard let label = obs.labels.first else { return false }
+                                return label.identifier == "baseball"
+                            }.sorted { $0.confidence > $1.confidence }
+                            
                             let baseballDetections = results.filter { obs in
                                 guard let label = obs.labels.first else { return false }
-                                return label.identifier == "baseball" && obs.confidence >= self.settings.ballConfidenceThreshold
+                                
+                                // Validate bounding box is reasonable
+                                let bbox = obs.boundingBox
+                                let isValidBox = bbox.minX >= -0.1 && bbox.maxX <= 1.1 &&
+                                                bbox.minY >= -0.1 && bbox.maxY <= 1.1 &&
+                                                bbox.width > 0.005 && bbox.width <= 0.5 &&
+                                                bbox.height > 0.005 && bbox.height <= 0.5
+                                
+                                return label.identifier == "baseball" && 
+                                       obs.confidence >= effectiveThreshold &&
+                                       isValidBox
                             }.sorted { $0.confidence > $1.confidence }
-                            for obs in baseballDetections {
-                                let c = CGPoint(x: obs.boundingBox.midX, y: obs.boundingBox.midY)
+                            
+                            // Detailed logging every frame
+                            let timestamp = CMTimeGetSeconds(pts)
+                            if let detection = baseballDetections.first {
+                                detectionCount += 1
+                                let bbox = detection.boundingBox
+                                let roiInfo = "ROI=disabled_for_export"
+                                print("[Export Frame \(exportFrameCount) @ \(String(format: "%.3f", timestamp))s\(frameDeltaInfo)] ✅ DETECTED: conf=\(String(format: "%.3f", detection.confidence)) bbox=(\(String(format: "%.3f,%.3f %.3fx%.3f", bbox.origin.x, bbox.origin.y, bbox.width, bbox.height))) \(roiInfo)")
+                                
+                                // Record detection marker for trajectory
+                                let c = CGPoint(x: detection.boundingBox.midX, y: detection.boundingBox.midY)
                                 self.detectionMarkers.append(c)
+                            } else {
+                                missedFrameCount += 1
+                                let roiInfo = "ROI=disabled_for_export"
+                                
+                                // Show why we missed
+                                var reason = "no results"
+                                if !rawBaseballResults.isEmpty {
+                                    let best = rawBaseballResults.first!
+                                    let bbox = best.boundingBox
+                                    let isValidBox = bbox.minX >= -0.1 && bbox.maxX <= 1.1 &&
+                                                    bbox.minY >= -0.1 && bbox.maxY <= 1.1 &&
+                                                    bbox.width > 0.005 && bbox.width <= 0.5 &&
+                                                    bbox.height > 0.005 && bbox.height <= 0.5
+                                    if best.confidence < effectiveThreshold {
+                                        reason = String(format: "conf=%.3f < threshold=%.3f", best.confidence, effectiveThreshold)
+                                    } else if !isValidBox {
+                                        reason = String(format: "invalid bbox=(\(String(format: "%.3f,%.3f %.3fx%.3f", bbox.origin.x, bbox.origin.y, bbox.width, bbox.height)))")
+                                    } else {
+                                        reason = "filtered out (unknown)"
+                                    }
+                                    reason += String(format: " best=(\(String(format: "%.3f,%.3f %.3fx%.3f", bbox.origin.x, bbox.origin.y, bbox.width, bbox.height)) conf=%.3f)", bbox.origin.x, bbox.origin.y, bbox.width, bbox.height, best.confidence)
+                                }
+                                print("[Export Frame \(exportFrameCount) @ \(String(format: "%.3f", timestamp))s\(frameDeltaInfo)] ❌ MISSED: \(reason) \(roiInfo)")
                             }
+                            
+                            // NOTE: ROI tracking is NOT used during export (see comment above)
                             
                             // Limit markers to prevent memory issues (keep last 1000)
                             if self.detectionMarkers.count > 1000 {
@@ -2068,6 +2417,20 @@ class CameraViewController: UIViewController {
                     }
                 }
             }
+
+            print("========================================")
+            print("🎬 EXPORT COMPLETE")
+            print("Video FPS: \(String(format: "%.1f", actualFPS))")
+            print("Total Frames: \(exportFrameCount)")
+            print("Detections: \(detectionCount)")
+            print("Missed Frames: \(missedFrameCount)")
+            print("Detection Rate: \(String(format: "%.1f", Double(detectionCount) / Double(exportFrameCount) * 100))%")
+            if actualFPS >= 200 {
+                print("NOTE: High-speed video detected! ROI would work well at this frame rate during live recording.")
+            } else {
+                print("NOTE: ROI tracking is disabled during export (designed for 240fps live, not \(String(format: "%.0f", actualFPS))fps export)")
+            }
+            print("========================================")
 
             writerInput.markAsFinished()
             await writer.finishWriting()
@@ -2315,6 +2678,57 @@ class CameraViewController: UIViewController {
                 ctx.setLineWidth(2)
                 ctx.strokeEllipse(in: markerRect)
             }
+        }
+        
+        // Draw ROI box if enabled
+        if self.settings.showROI, let roi = self.currentROI, self.settings.enableROI {
+            // Convert ROI from Vision coordinates to render coordinates
+            var roiX = roi.origin.x * rect.width
+            var roiY = roi.origin.y * rect.height
+            let roiW = roi.width * rect.width
+            let roiH = roi.height * rect.height
+            
+            if !contentFlippedVertically {
+                roiY = rect.height - roiY - roiH
+            }
+            if mirrored {
+                roiX = rect.width - roiX - roiW
+            }
+            
+            let roiRect = CGRect(x: roiX, y: roiY, width: roiW, height: roiH)
+            
+            // Draw filled background
+            ctx.setFillColor(UIColor.yellow.withAlphaComponent(0.1).cgColor)
+            ctx.fill(roiRect)
+            
+            // Draw dashed border
+            ctx.setStrokeColor(UIColor.yellow.withAlphaComponent(0.8).cgColor)
+            ctx.setLineWidth(3)
+            ctx.setLineDash(phase: 0, lengths: [10, 5])
+            ctx.stroke(roiRect)
+            ctx.setLineDash(phase: 0, lengths: [])
+            
+            // Draw ROI label
+            let roiLabel = "ROI (missed: \(self.framesWithoutDetection))"
+            let labelAttributes: [NSAttributedString.Key: Any] = [
+                .font: UIFont.boldSystemFont(ofSize: 14),
+                .foregroundColor: UIColor.white
+            ]
+            let labelSize = roiLabel.size(withAttributes: labelAttributes)
+            let labelPadding: CGFloat = 4
+            let labelBgRect = CGRect(
+                x: roiRect.minX,
+                y: roiRect.minY - labelSize.height - labelPadding * 2 - 2,
+                width: labelSize.width + labelPadding * 2,
+                height: labelSize.height + labelPadding * 2
+            )
+            
+            ctx.setFillColor(UIColor.yellow.withAlphaComponent(0.8).cgColor)
+            ctx.fill(labelBgRect)
+            
+            roiLabel.draw(at: CGPoint(x: labelBgRect.minX + labelPadding,
+                                     y: labelBgRect.minY + labelPadding),
+                         withAttributes: labelAttributes)
         }
         
         let composed = UIGraphicsGetImageFromCurrentImageContext()
@@ -2765,6 +3179,10 @@ class CameraViewController: UIViewController {
         self.poseHistory.removeAll()
         self.fusedFrameData.removeAll()
         self.lastPoseObservation = nil
+        
+        // Reset ROI tracking
+        self.currentROI = nil
+        self.framesWithoutDetection = 0
 
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
@@ -3100,6 +3518,26 @@ struct CameraSettingsView: View {
                 
                 Section("Display") {
                     Toggle("Show Labels", isOn: $settings.showLabels)
+                    
+                    Toggle("Enable ROI Tracking", isOn: $settings.enableROI)
+                    
+                    if settings.enableROI {
+                        Toggle("Show ROI Box (Debug)", isOn: $settings.showROI)
+                        
+                        if settings.showROI {
+                            Text("Shows a yellow box indicating the active detection region. ROI automatically focuses on the ball to improve tracking performance at 240fps.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        
+                        Text("⚠️ ROI is designed for 240fps live recording. It's automatically disabled during video export (30fps) to ensure consistent detection.")
+                            .font(.caption)
+                            .foregroundColor(.orange)
+                    } else {
+                        Text("⚠️ ROI tracking is disabled. Detection will search the entire frame.")
+                            .font(.caption)
+                            .foregroundColor(.orange)
+                    }
                 }
                 
                 Section("Export") {
