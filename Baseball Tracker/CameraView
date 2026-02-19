@@ -15,8 +15,6 @@ class CameraSettings: ObservableObject {
     @Published var ballDetectionEnabled: Bool = true
     @Published var poseEstimationEnabled: Bool = true
     @Published var showLabels: Bool = true
-    @Published var showSpeed: Bool = true
-    @Published var speedUnit: SpeedUnit = .mph
     @Published var ballConfidenceThreshold: Float = 0.35
     @Published var poseConfidenceThreshold: Float = 0.3
     
@@ -26,7 +24,7 @@ class CameraSettings: ObservableObject {
     @Published var plateRightEdge: CGPoint = .zero // Normalized coordinates (0-1)
     @Published var plateWidth: Double = 17.0 // inches (regulation baseball home plate)
     @Published var useCentimeters: Bool = false // false = inches, true = centimeters
-    @Published var selectedLens: Double = 1.0 // Lens choice for speed calculation (1x, 2x, 4x, 8x)
+    @Published var selectedLens: Double = 1.0 // Lens choice (1x, 2x, 4x, 8x)
     
     // Colors
     @Published var ballColor: Color = .red
@@ -49,64 +47,6 @@ class CameraSettings: ObservableObject {
     
     // Export options
     @Published var exportCleanVideo: Bool = false
-    
-    enum SpeedUnit: String, CaseIterable {
-        case mph = "mph"
-        case kmh = "km/h"
-        
-        func convert(fromMPH mph: Double) -> Double {
-            switch self {
-            case .mph:
-                return mph
-            case .kmh:
-                return mph * 1.60934
-            }
-        }
-    }
-    
-    // Calculate pixels per foot based on calibration
-    func pixelsPerFoot(viewSize: CGSize) -> Double {
-        guard isCalibrated else {
-            // Fallback: use estimated pixels per foot based on typical baseball field setup
-            // Assuming camera is ~30-50 feet from home plate, 1080p video
-            // This gives approximately 40-60 pixels per foot at that distance
-            let fallbackPixelsPerFoot = 50.0
-            print("[Calibration] Using fallback: \(fallbackPixelsPerFoot) pixels/ft (camera not calibrated)")
-            return fallbackPixelsPerFoot
-        }
-        
-        let left = CGPoint(x: plateLeftEdge.x * viewSize.width,
-                          y: plateLeftEdge.y * viewSize.height)
-        let right = CGPoint(x: plateRightEdge.x * viewSize.width,
-                           y: plateRightEdge.y * viewSize.height)
-        
-        let pixelDistance = sqrt(pow(right.x - left.x, 2) + pow(right.y - left.y, 2))
-        
-        // Sanity check: plate edges should be at least 10 pixels apart
-        guard pixelDistance > 10 else {
-            print("[Calibration] WARNING: Plate edges too close (\(pixelDistance)px), using fallback")
-            return 50.0
-        }
-        
-        // Convert plate width to feet
-        let plateWidthInFeet: Double
-        if useCentimeters {
-            plateWidthInFeet = plateWidth / 30.48 // Convert cm to feet
-        } else {
-            plateWidthInFeet = plateWidth / 12.0 // Convert inches to feet
-        }
-        
-        let result = pixelDistance / plateWidthInFeet
-        
-        // Sanity check: result should be reasonable (20-200 pixels per foot for typical video)
-        guard result >= 10 && result <= 500 else {
-            print("[Calibration] WARNING: Calculated pixels/ft out of range (\(result)), using fallback")
-            return 50.0
-        }
-        
-        print("[Calibration] Using calibrated value: \(String(format: "%.1f", result)) pixels/ft")
-        return result
-    }
 }
 
 struct CameraView: UIViewControllerRepresentable {
@@ -308,18 +248,11 @@ class CameraViewController: UIViewController {
     private var backButton: UIButton!
     private var settingsButton: UIButton!
     private var calibrateButton: UIButton!
-    private var speedDisplayLabel: UILabel!
     private var zoomSlider: UISlider!
     private var zoomStackView: UIStackView!
     
     // MARK: - Zoom
     private var currentZoomFactor: CGFloat = 1.0
-    
-    // MARK: - Speed Tracking
-    private var ballPositionHistory: [(timestamp: CMTime, position: CGPoint)] = []
-    private var currentSpeed: Double = 0.0 // mph
-    private var peakSpeed: Double = 0.0 // mph (max speed detected during recording)
-    private var estimatedPixelsPerFoot: Double? = nil // Estimated from ball size
     
     var videoURL: URL? = nil
     var onVideoSaved: ((String) -> Void)?
@@ -339,8 +272,8 @@ class CameraViewController: UIViewController {
     /// The snapped rotation (0 / 90 / 180 / 270) derived from the selected
     /// video's preferredTransform.  Zero for live-camera recordings (their
     /// pixel buffers are already portrait).  Used to rotate the CGContext in
-    /// makeAnnotatedPixelBuffer so that corner-anchored overlays (speed pill)
-    /// end up in the correct position after the writer applies the transform.
+    /// makeAnnotatedPixelBuffer for proper overlay positioning after the writer
+    /// applies the transform.
     private var videoRotationDegrees: Int = 0
     
     // MARK: - Lifecycle
@@ -355,7 +288,6 @@ class CameraViewController: UIViewController {
         setupBackButton()
         setupSettingsButton()
         setupCalibrateButton()
-        setupSpeedDisplay()
         setupZoomControls()
         setupRecordButton()
         setupSettingsObservers()
@@ -386,10 +318,6 @@ class CameraViewController: UIViewController {
                         self.overlayLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
                     }
                 }
-                // Hide speed display when ball detection is off
-                DispatchQueue.main.async {
-                    self.speedDisplayLabel?.isHidden = !self.settings.showSpeed || !enabled
-                }
             }
             .store(in: &settingsCancellables)
         
@@ -404,26 +332,6 @@ class CameraViewController: UIViewController {
                         self.overlayLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
                     }
                 }
-            }
-            .store(in: &settingsCancellables)
-        
-        // Update speed display visibility when showSpeed changes
-        settings.$showSpeed
-            .dropFirst()
-            .sink { [weak self] showSpeed in
-                guard let self = self else { return }
-                DispatchQueue.main.async {
-                    self.speedDisplayLabel?.isHidden = !showSpeed || !self.settings.ballDetectionEnabled
-                }
-            }
-            .store(in: &settingsCancellables)
-        
-        // Update speed display when unit changes
-        settings.$speedUnit
-            .dropFirst()
-            .sink { [weak self] _ in
-                guard let self = self else { return }
-                self.updateSpeedDisplay(self.currentSpeed)
             }
             .store(in: &settingsCancellables)
     }
@@ -478,17 +386,6 @@ class CameraViewController: UIViewController {
                                         width: buttonSize,
                                         height: buttonSize)
             view.bringSubviewToFront(recordButton)
-        }
-        
-        if let speedDisplayLabel = speedDisplayLabel {
-            let safeArea = view.safeAreaInsets
-            let labelWidth: CGFloat = 120
-            let labelHeight: CGFloat = 70
-            speedDisplayLabel.frame = CGRect(x: view.bounds.width - labelWidth - 16,
-                                             y: view.bounds.height - safeArea.bottom - labelHeight - 16,
-                                             width: labelWidth,
-                                             height: labelHeight)
-            view.bringSubviewToFront(speedDisplayLabel)
         }
         
         // Layout zoom controls (left side, vertical center)
@@ -605,27 +502,9 @@ class CameraViewController: UIViewController {
     
     private func updateCalibrateButtonAppearance() {
         DispatchQueue.main.async {
-            self.calibrateButton.backgroundColor = self.settings.isCalibrated ? 
+            self.calibrateButton.backgroundColor = self.settings.isCalibrated ?
                 UIColor.green.withAlphaComponent(0.6) : UIColor.black.withAlphaComponent(0.4)
         }
-    }
-    
-    // MARK: - Speed Display Setup
-    private func setupSpeedDisplay() {
-        let label = UILabel()
-        label.textAlignment = .center
-        label.numberOfLines = 0
-        label.font = UIFont.monospacedDigitSystemFont(ofSize: 32, weight: .bold)
-        label.textColor = .white
-        label.backgroundColor = UIColor.black.withAlphaComponent(0.6)
-        label.layer.cornerRadius = 12
-        label.layer.masksToBounds = true
-        label.text = "-- \(settings.speedUnit.rawValue)"
-        label.isHidden = !settings.showSpeed || !settings.ballDetectionEnabled
-        label.translatesAutoresizingMaskIntoConstraints = false
-        
-        view.addSubview(label)
-        self.speedDisplayLabel = label
     }
     
     // MARK: - Zoom Controls Setup
@@ -714,17 +593,6 @@ class CameraViewController: UIViewController {
             print("[Zoom] Set zoom to \(String(format: "%.1f", clampedFactor))x")
         } catch {
             print("[Zoom] Error setting zoom: \(error)")
-        }
-    }
-    
-    private func updateSpeedDisplay(_ speed: Double) {
-        DispatchQueue.main.async {
-            let convertedSpeed = self.settings.speedUnit.convert(fromMPH: speed)
-            if speed > 0 {
-                self.speedDisplayLabel.text = String(format: "%.0f\n%@", convertedSpeed, self.settings.speedUnit.rawValue)
-            } else {
-                self.speedDisplayLabel.text = "-- \(self.settings.speedUnit.rawValue)"
-            }
         }
     }
     
@@ -836,10 +704,6 @@ class CameraViewController: UIViewController {
         self.poseHistory.removeAll()
         self.fusedFrameData.removeAll()
         self.lastPoseObservation = nil
-        self.ballPositionHistory.removeAll()
-        self.currentSpeed = 0.0
-        self.peakSpeed = 0.0
-        self.estimatedPixelsPerFoot = nil
         self.videoRotationDegrees = 0  // Live recordings are already portrait
         
         // Reset frame timing debug
@@ -864,10 +728,6 @@ class CameraViewController: UIViewController {
             let duration = CMTimeGetSeconds(CMTimeSubtract(endTime, startTime))
             let avgFPS = Double(frameCount) / duration
             print("[Recording] Stopped. Recorded \(frameCount) frames in \(String(format: "%.2f", duration))s = \(String(format: "%.1f", avgFPS)) fps average")
-            
-            if peakSpeed > 0 {
-                print("[Recording] 🎯 PEAK SPEED RECORDED: \(String(format: "%.1f", peakSpeed)) mph")
-            }
         }
         
         assetWriterInput.markAsFinished()
@@ -1182,8 +1042,8 @@ class CameraViewController: UIViewController {
         // If it's 'baseball_detector.mlmodel', use 'baseball_detector'
         guard let modelURL = Bundle.main.url(forResource: "best", withExtension: "mlmodelc"),
               let mlmodel = try? MLModel(contentsOf: modelURL),
-              let visionModel = try? VNCoreMLModel(for: mlmodel) else { 
-            fatalError("Could not load CoreML model. Ensure 'best.mlmodel' is added to your project.") 
+              let visionModel = try? VNCoreMLModel(for: mlmodel) else {
+            fatalError("Could not load CoreML model. Ensure 'best.mlmodel' is added to your project.")
         }
         self.visionModel = visionModel
         
@@ -1305,7 +1165,7 @@ class CameraViewController: UIViewController {
         let ballUIColor = settings.ballColor.toUIColor()
         
         let circleLayer = CAShapeLayer()
-        let circlePath = UIBezierPath(ovalIn: CGRect(x: boxRect.minX, 
+        let circlePath = UIBezierPath(ovalIn: CGRect(x: boxRect.minX,
                                                       y: boxRect.minY,
                                                       width: boxRect.width,
                                                       height: boxRect.height))
@@ -1317,52 +1177,23 @@ class CameraViewController: UIViewController {
         overlayLayer.addSublayer(circleLayer)
         
         if settings.showLabels {
-            // Calculate speed (works with calibration OR auto-estimation)
-            if settings.showSpeed, let lastTime = lastFrameTime {
-                let normalizedCenter = CGPoint(x: centerX / bufferSize.width,
-                                              y: centerY / bufferSize.height)
-                let speed = calculateSpeed(newPosition: normalizedCenter, timestamp: lastTime, actualViewSize: bufferSize, ballBoundingBox: rect)
-                
-                let speedText = String(format: "%.0f mph", speed)
-                let confidenceText = String(format: "%.0f%%", confidence * 100)
-                let combinedText = "\(confidenceText)\n\(speedText)"
-                
-                let textLayer = CATextLayer()
-                textLayer.string = combinedText
-                textLayer.foregroundColor = ballUIColor.cgColor
-                textLayer.backgroundColor = UIColor.black.withAlphaComponent(0.6).cgColor
-                textLayer.fontSize = 24
-                textLayer.alignmentMode = .center
-                textLayer.contentsScale = view.traitCollection.displayScale
-                
-                let textWidth: CGFloat = 100
-                let textHeight: CGFloat = 60
-                textLayer.frame = CGRect(x: centerX - textWidth / 2,
-                                        y: centerY - textHeight / 2,
-                                        width: textWidth,
-                                        height: textHeight)
-                textLayer.cornerRadius = 4
-                
-                overlayLayer.addSublayer(textLayer)
-            } else {
-                // Show confidence only (speed disabled or no timestamp yet)
-                let textLayer = CATextLayer()
-                textLayer.string = String(format: "%.0f%%", confidence * 100)
-                textLayer.foregroundColor = ballUIColor.cgColor
-                textLayer.backgroundColor = UIColor.clear.cgColor
-                textLayer.fontSize = 28
-                textLayer.alignmentMode = .center
-                textLayer.contentsScale = view.traitCollection.displayScale
-                
-                let textWidth: CGFloat = 80
-                let textHeight: CGFloat = 35
-                textLayer.frame = CGRect(x: centerX - textWidth / 2,
-                                        y: centerY - textHeight / 2,
-                                        width: textWidth,
-                                        height: textHeight)
-                
-                overlayLayer.addSublayer(textLayer)
-            }
+            // Show confidence only
+            let textLayer = CATextLayer()
+            textLayer.string = String(format: "%.0f%%", confidence * 100)
+            textLayer.foregroundColor = ballUIColor.cgColor
+            textLayer.backgroundColor = UIColor.clear.cgColor
+            textLayer.fontSize = 28
+            textLayer.alignmentMode = .center
+            textLayer.contentsScale = view.traitCollection.displayScale
+            
+            let textWidth: CGFloat = 80
+            let textHeight: CGFloat = 35
+            textLayer.frame = CGRect(x: centerX - textWidth / 2,
+                                    y: centerY - textHeight / 2,
+                                    width: textWidth,
+                                    height: textHeight)
+            
+            overlayLayer.addSublayer(textLayer)
         }
     }
     
@@ -1622,7 +1453,7 @@ class CameraViewController: UIViewController {
     }
     
     // MARK: - Draw Angle Arc with Label
-    private func drawAngleArc(at joint: CGPoint, from point1: CGPoint, to point2: CGPoint, 
+    private func drawAngleArc(at joint: CGPoint, from point1: CGPoint, to point2: CGPoint,
                              angle: Double, label: String, color: UIColor) {
         let arcRadius: CGFloat = 30
         
@@ -1644,7 +1475,7 @@ class CameraViewController: UIViewController {
         }
         
         // Draw arc
-        let arcPath = UIBezierPath(arcCenter: joint, 
+        let arcPath = UIBezierPath(arcCenter: joint,
                                    radius: arcRadius,
                                    startAngle: startAngle,
                                    endAngle: endAngle,
@@ -1942,141 +1773,7 @@ class CameraViewController: UIViewController {
         return pixelsPerFoot
     }
     
-    // MARK: - Speed Calculation
-    private func calculateSpeed(newPosition: CGPoint, timestamp: CMTime, actualViewSize: CGSize? = nil, ballBoundingBox: CGRect? = nil) -> Double {
-        // Add to history
-        ballPositionHistory.append((timestamp: timestamp, position: newPosition))
-        
-        // Keep only recent history (last 0.75 seconds for stable speed calculation)
-        let cutoffTime = CMTimeSubtract(timestamp, CMTime(seconds: 0.75, preferredTimescale: 600))
-        ballPositionHistory.removeAll { CMTimeCompare($0.timestamp, cutoffTime) < 0 }
-        
-        // Need at least 3 points for reliable speed calculation
-        guard ballPositionHistory.count >= 3 else { 
-            if ballPositionHistory.count % 10 == 0 {
-                print("[Speed] Not enough points: \(ballPositionHistory.count)")
-            }
-            return currentSpeed
-        }
-        
-        // Determine actual view size
-        let viewSize: CGSize
-        if let providedSize = actualViewSize {
-            viewSize = providedSize
-        } else if self.activeDimensions.width > 0 {
-            // Use actual video dimensions (accounting for portrait orientation)
-            let orientation = UIDevice.current.orientation
-            let isPortrait = orientation == .portrait || orientation == .portraitUpsideDown
-            if isPortrait {
-                viewSize = CGSize(width: CGFloat(self.activeDimensions.height), 
-                                height: CGFloat(self.activeDimensions.width))
-            } else {
-                viewSize = CGSize(width: CGFloat(self.activeDimensions.width), 
-                                height: CGFloat(self.activeDimensions.height))
-            }
-        } else {
-            viewSize = CGSize(width: 1920, height: 1080)
-        }
-        
-        // Update estimated calibration from ball size if available
-        if let bbox = ballBoundingBox, estimatedPixelsPerFoot == nil {
-            if let estimate = estimatePixelsPerFootFromBall(boundingBox: bbox, viewSize: viewSize) {
-                estimatedPixelsPerFoot = estimate
-                print("[Calibration] 📏 ESTIMATED from ball size: \(String(format: "%.1f", estimate)) pixels/ft")
-            }
-        }
-        
-        // Get pixels per foot (prioritize: calibration > estimate > fallback)
-        let pixelsPerFt: Double
-        if settings.isCalibrated {
-            pixelsPerFt = settings.pixelsPerFoot(viewSize: viewSize)
-        } else if let estimate = estimatedPixelsPerFoot {
-            pixelsPerFt = estimate
-            if ballPositionHistory.count % 30 == 0 {
-                print("[Calibration] Using estimated value: \(String(format: "%.1f", estimate)) pixels/ft")
-            }
-        } else {
-            pixelsPerFt = settings.pixelsPerFoot(viewSize: viewSize) // Will use fallback
-        }
-        
-        guard pixelsPerFt > 0 else { 
-            print("[Speed] Pixels per foot is 0 (calibration needed)")
-            return currentSpeed
-        }
-        
-        // Calculate average speed over multiple point pairs for stability
-        var speeds: [Double] = []
-        
-        // Use pairs of points spanning different time windows
-        let indices = [
-            (0, ballPositionHistory.count - 1),  // Longest span
-            (ballPositionHistory.count / 2, ballPositionHistory.count - 1),  // Half span
-        ]
-        
-        for (startIdx, endIdx) in indices where startIdx < endIdx && startIdx < ballPositionHistory.count && endIdx < ballPositionHistory.count {
-            let first = ballPositionHistory[startIdx]
-            let last = ballPositionHistory[endIdx]
-            
-            let timeDelta = CMTimeGetSeconds(CMTimeSubtract(last.timestamp, first.timestamp))
-            guard timeDelta > 0.001 else { continue }  // Avoid division by near-zero
-            
-            // Calculate pixel distance by converting each axis independently
-            let dx = last.position.x - first.position.x
-            let dy = last.position.y - first.position.y
-            let dxPixels = dx * viewSize.width
-            let dyPixels = dy * viewSize.height
-            let actualPixelDistance = sqrt(dxPixels * dxPixels + dyPixels * dyPixels)
-            
-            let feetDistance = actualPixelDistance / pixelsPerFt
-            
-            // Calculate speed in feet per second, then convert to mph
-            let feetPerSecond = feetDistance / timeDelta
-            let mph = feetPerSecond * 0.681818 // Convert ft/s to mph
-            
-            // Debug: Log all calculated speeds
-            if ballPositionHistory.count % 10 == 0 {
-                print("[Speed Debug] Calculated: \(String(format: "%.1f", mph)) mph (distance: \(String(format: "%.3f", feetDistance))ft, time: \(String(format: "%.3f", timeDelta))s, pixels/ft: \(String(format: "%.1f", pixelsPerFt)))")
-            }
-            
-            // Only accept reasonable speeds (5-120 mph for baseball)
-            if mph >= 5 && mph <= 120 {
-                speeds.append(mph)
-            }
-        }
-        
-        // Average the calculated speeds
-        guard !speeds.isEmpty else {
-            print("[Speed] No valid speeds calculated")
-            return currentSpeed
-        }
-        
-        let avgSpeed = speeds.reduce(0, +) / Double(speeds.count)
-        
-        // Track peak speed from the raw average BEFORE smoothing so we
-        // capture true peaks rather than the dampened smoothed value.
-        if avgSpeed > peakSpeed {
-            peakSpeed = avgSpeed
-            print("[Speed] 🔥 NEW PEAK SPEED: \(String(format: "%.1f", peakSpeed)) mph")
-        }
-        
-        // Smooth the speed reading (exponential moving average).
-        // Factor of 0.7 gives a responsive display while still filtering jitter.
-        let smoothingFactor: Double = currentSpeed > 0 ? 0.7 : 1.0  // No smoothing for first reading
-        currentSpeed = (smoothingFactor * avgSpeed) + ((1 - smoothingFactor) * currentSpeed)
-        
-        // Debug log periodically
-        if ballPositionHistory.count % 10 == 0 {
-            let first = ballPositionHistory[0]
-            let last = ballPositionHistory[ballPositionHistory.count - 1]
-            let totalTime = CMTimeGetSeconds(CMTimeSubtract(last.timestamp, first.timestamp))
-            print("[Speed] Points: \(ballPositionHistory.count), Span: \(String(format: "%.3f", totalTime))s, Speeds: \(speeds.map { String(format: "%.1f", $0) }), Avg: \(String(format: "%.1f", avgSpeed)) mph, Smoothed: \(String(format: "%.1f", currentSpeed)) mph, Peak: \(String(format: "%.1f", peakSpeed)) mph")
-        }
-        
-        // Update the speed display
-        updateSpeedDisplay(currentSpeed)
-        
-        return currentSpeed
-    }
+   
     
     private func analyzeBiomechanics(ballPosition: CGPoint, poseObservation: VNHumanBodyPoseObservation, viewSize: CGSize? = nil) -> [String: Any] {
         guard let recognizedPoints = try? poseObservation.recognizedPoints(.all) else {
@@ -2240,8 +1937,6 @@ class CameraViewController: UIViewController {
             
             // Reset tracking data for video processing
             self.detectionMarkers.removeAll()
-            self.ballPositionHistory.removeAll()
-            self.currentSpeed = 0.0
             
             await self.exportAnnotatedVideo(asset: asset, track: track)
             
@@ -2544,6 +2239,10 @@ class CameraViewController: UIViewController {
             
             if mirrored { x = rect.width - x - w }
             let drawRect = CGRect(x: x, y: y, width: w, height: h)
+            
+            // Calculate center of the bounding box
+            let centerX = drawRect.midX
+            let centerY = drawRect.midY
 
             let ballUIColor = settings.ballColor.toUIColor()
             ctx.setStrokeColor(ballUIColor.cgColor)
@@ -2552,17 +2251,6 @@ class CameraViewController: UIViewController {
             ctx.strokePath()
             
             if settings.showLabels {
-                let centerX = drawRect.midX
-                let centerY = drawRect.midY
-                
-                // Calculate speed using the normalized center position
-                let normalizedCenter = CGPoint(x: bbox.midX, y: bbox.midY)
-                
-                // Use lastFrameTime for speed calculation during video export
-                if let timestamp = self.lastFrameTime, self.settings.showSpeed {
-                    _ = calculateSpeed(newPosition: normalizedCenter, timestamp: timestamp, actualViewSize: rect.size, ballBoundingBox: bbox)
-                }
-                
                 // Just show confidence on the ball
                 let confidenceText = String(format: "%.0f%%", obs.confidence * 100)
                 
@@ -2629,96 +2317,6 @@ class CameraViewController: UIViewController {
             }
         }
         
-        // Draw peak speed display in bottom-right corner (upright, no rotation).
-        //
-        // For live recordings the pixel buffer is already portrait so drawing
-        // into rect directly works.  For a selected video the raw pixel buffer
-        // may be in a different orientation; the writer's preferredTransform
-        // will rotate the final file, so we need to pre-rotate the context here
-        // to match that final orientation before drawing the pill.
-        if self.settings.showSpeed && self.peakSpeed > 0 {
-            let convertedPeak = self.settings.speedUnit.convert(fromMPH: self.peakSpeed)
-            let peakNumber = String(format: "%.0f", convertedPeak)
-            let unitLabel  = self.settings.speedUnit.rawValue
-
-            let numberAttributes: [NSAttributedString.Key: Any] = [
-                .font: UIFont.monospacedDigitSystemFont(ofSize: 72, weight: .bold),
-                .foregroundColor: UIColor.white
-            ]
-            let unitAttributes: [NSAttributedString.Key: Any] = [
-                .font: UIFont.systemFont(ofSize: 28, weight: .semibold),
-                .foregroundColor: UIColor(white: 0.85, alpha: 1.0)
-            ]
-
-            let numberSize = peakNumber.size(withAttributes: numberAttributes)
-            let unitSize   = unitLabel.size(withAttributes: unitAttributes)
-
-            let padding:  CGFloat = 16
-            let gap:      CGFloat = 6   // vertical gap between number and unit
-            let innerW = max(numberSize.width, unitSize.width)
-            let innerH = numberSize.height + gap + unitSize.height
-            let bgW    = innerW + padding * 2
-            let bgH    = innerH + padding * 2
-
-            // Determine the dimensions of the *final* (post-transform) frame.
-            // For 90° or 270° rotations width and height swap.
-            let finalW: CGFloat
-            let finalH: CGFloat
-            if videoRotationDegrees == 90 || videoRotationDegrees == 270 {
-                finalW = rect.height
-                finalH = rect.width
-            } else {
-                finalW = rect.width
-                finalH = rect.height
-            }
-
-            // Anchor to bottom-right of the *final* frame
-            let bgRect = CGRect(x: finalW  - bgW  - 24,
-                                y: finalH  - bgH  - 24,
-                                width: bgW, height: bgH)
-
-            // Pre-rotate the context so that coordinates match the final
-            // playback orientation.  The transform sequence is:
-            //   1. Translate origin to the corner that becomes (0,0) after rotation.
-            //   2. Rotate by the same angle the writer will apply.
-            // This way drawing at bgRect lands in the correct spot in the raw buffer.
-            ctx.saveGState()
-            switch videoRotationDegrees {
-            case 90:
-                // Writer rotates 90° CCW (i.e. the raw buffer's +X becomes final +Y).
-                // To draw in final-frame coords we rotate our context 90° CW and
-                // shift the origin.
-                ctx.translateBy(x: rect.width, y: 0)
-                ctx.rotate(by: .pi / 2)
-            case 180:
-                ctx.translateBy(x: rect.width, y: rect.height)
-                ctx.rotate(by: .pi)
-            case 270:
-                ctx.translateBy(x: 0, y: rect.height)
-                ctx.rotate(by: -.pi / 2)
-            default:
-                break // 0° — no transform needed
-            }
-
-            // Background pill
-            ctx.setFillColor(UIColor.black.withAlphaComponent(0.65).cgColor)
-            let roundedPath = UIBezierPath(roundedRect: bgRect, cornerRadius: 14)
-            ctx.addPath(roundedPath.cgPath)
-            ctx.fillPath()
-
-            // Number (centred horizontally in the pill)
-            let numberX = bgRect.minX + padding + (innerW - numberSize.width)  / 2
-            let numberY = bgRect.minY + padding
-            peakNumber.draw(at: CGPoint(x: numberX, y: numberY), withAttributes: numberAttributes)
-
-            // Unit label (centred horizontally, below number)
-            let unitX = bgRect.minX + padding + (innerW - unitSize.width) / 2
-            let unitY = numberY + numberSize.height + gap
-            unitLabel.draw(at: CGPoint(x: unitX, y: unitY), withAttributes: unitAttributes)
-
-            ctx.restoreGState()
-        }
-
         let composed = UIGraphicsGetImageFromCurrentImageContext()
         UIGraphicsEndImageContext()
 
@@ -2798,7 +2396,7 @@ class CameraViewController: UIViewController {
     }
     
     // MARK: - Draw Joint Angles on CGContext
-    private func drawJointAnglesOnContext(_ ctx: CGContext, poseObs: VNHumanBodyPoseObservation, 
+    private func drawJointAnglesOnContext(_ ctx: CGContext, poseObs: VNHumanBodyPoseObservation,
                                           rect: CGRect, recognizedPoints: [VNHumanBodyPoseObservation.JointName: VNRecognizedPoint],
                                           convertPt: (CGPoint) -> CGPoint) {
         
@@ -2812,8 +2410,8 @@ class CameraViewController: UIViewController {
         if let rShoulder = recognizedPoints[.rightShoulder],
            let rElbow = recognizedPoints[.rightElbow],
            let rWrist = recognizedPoints[.rightWrist],
-           rShoulder.confidence > angleConfidenceThreshold, 
-           rElbow.confidence > angleConfidenceThreshold, 
+           rShoulder.confidence > angleConfidenceThreshold,
+           rElbow.confidence > angleConfidenceThreshold,
            rWrist.confidence > angleConfidenceThreshold {
             let s = convertPt(rShoulder.location)
             let e = convertPt(rElbow.location)
@@ -2826,8 +2424,8 @@ class CameraViewController: UIViewController {
         if let lShoulder = recognizedPoints[.leftShoulder],
            let lElbow = recognizedPoints[.leftElbow],
            let lWrist = recognizedPoints[.leftWrist],
-           lShoulder.confidence > angleConfidenceThreshold, 
-           lElbow.confidence > angleConfidenceThreshold, 
+           lShoulder.confidence > angleConfidenceThreshold,
+           lElbow.confidence > angleConfidenceThreshold,
            lWrist.confidence > angleConfidenceThreshold {
             let s = convertPt(lShoulder.location)
             let e = convertPt(lElbow.location)
@@ -2840,8 +2438,8 @@ class CameraViewController: UIViewController {
         if let rHip = recognizedPoints[.rightHip],
            let rKnee = recognizedPoints[.rightKnee],
            let rAnkle = recognizedPoints[.rightAnkle],
-           rHip.confidence > angleConfidenceThreshold, 
-           rKnee.confidence > angleConfidenceThreshold, 
+           rHip.confidence > angleConfidenceThreshold,
+           rKnee.confidence > angleConfidenceThreshold,
            rAnkle.confidence > angleConfidenceThreshold {
             let h = convertPt(rHip.location)
             let k = convertPt(rKnee.location)
@@ -2854,8 +2452,8 @@ class CameraViewController: UIViewController {
         if let lHip = recognizedPoints[.leftHip],
            let lKnee = recognizedPoints[.leftKnee],
            let lAnkle = recognizedPoints[.leftAnkle],
-           lHip.confidence > angleConfidenceThreshold, 
-           lKnee.confidence > angleConfidenceThreshold, 
+           lHip.confidence > angleConfidenceThreshold,
+           lKnee.confidence > angleConfidenceThreshold,
            lAnkle.confidence > angleConfidenceThreshold {
             let h = convertPt(lHip.location)
             let k = convertPt(lKnee.location)
@@ -2868,8 +2466,8 @@ class CameraViewController: UIViewController {
         if let rHip = recognizedPoints[.rightHip],
            let rShoulder = recognizedPoints[.rightShoulder],
            let rElbow = recognizedPoints[.rightElbow],
-           rHip.confidence > angleConfidenceThreshold, 
-           rShoulder.confidence > angleConfidenceThreshold, 
+           rHip.confidence > angleConfidenceThreshold,
+           rShoulder.confidence > angleConfidenceThreshold,
            rElbow.confidence > angleConfidenceThreshold {
             let h = convertPt(rHip.location)
             let s = convertPt(rShoulder.location)
@@ -2882,8 +2480,8 @@ class CameraViewController: UIViewController {
         if let lHip = recognizedPoints[.leftHip],
            let lShoulder = recognizedPoints[.leftShoulder],
            let lElbow = recognizedPoints[.leftElbow],
-           lHip.confidence > angleConfidenceThreshold, 
-           lShoulder.confidence > angleConfidenceThreshold, 
+           lHip.confidence > angleConfidenceThreshold,
+           lShoulder.confidence > angleConfidenceThreshold,
            lElbow.confidence > angleConfidenceThreshold {
             let h = convertPt(lHip.location)
             let s = convertPt(lShoulder.location)
@@ -2897,9 +2495,9 @@ class CameraViewController: UIViewController {
            let rShoulder = recognizedPoints[.rightShoulder],
            let lHip = recognizedPoints[.leftHip],
            let rHip = recognizedPoints[.rightHip],
-           lShoulder.confidence > angleConfidenceThreshold, 
+           lShoulder.confidence > angleConfidenceThreshold,
            rShoulder.confidence > angleConfidenceThreshold,
-           lHip.confidence > angleConfidenceThreshold, 
+           lHip.confidence > angleConfidenceThreshold,
            rHip.confidence > angleConfidenceThreshold {
             let ls = convertPt(lShoulder.location)
             let rs = convertPt(rShoulder.location)
@@ -3164,10 +2762,6 @@ class CameraViewController: UIViewController {
         
         // Reset tracking data for video processing
         self.detectionMarkers.removeAll()
-        self.ballPositionHistory.removeAll()
-        self.currentSpeed = 0.0
-        self.peakSpeed = 0.0
-        self.estimatedPixelsPerFoot = nil
         self.poseHistory.removeAll()
         self.fusedFrameData.removeAll()
         self.lastPoseObservation = nil
@@ -3409,27 +3003,6 @@ struct CameraSettingsView: View {
                             Slider(value: $settings.ballConfidenceThreshold, in: 0.1...0.9, step: 0.05)
                         }
                         
-                        Toggle("Show Speed", isOn: $settings.showSpeed)
-                        
-                        if settings.showSpeed {
-                            Picker("Speed Unit", selection: $settings.speedUnit) {
-                                ForEach(CameraSettings.SpeedUnit.allCases, id: \.self) { unit in
-                                    Text(unit.rawValue).tag(unit)
-                                }
-                            }
-                            .pickerStyle(.segmented)
-                            
-                            if !settings.isCalibrated {
-                                HStack {
-                                    Image(systemName: "exclamationmark.triangle.fill")
-                                        .foregroundColor(.orange)
-                                    Text("Using fallback calibration. Calibrate for accuracy")
-                                        .font(.caption)
-                                        .foregroundColor(.secondary)
-                                }
-                            }
-                        }
-                        
                         ColorPicker("Ball Colour", selection: $settings.ballColor)
                         ColorPicker("Trajectory Colour", selection: $settings.trajectoryColor)
                     }
@@ -3458,7 +3031,7 @@ struct CameraSettingsView: View {
                                 .foregroundColor(.orange)
                             Text("Camera not calibrated")
                         }
-                        Text("Tap the ruler button and mark the two front edges of home plate for accurate speed measurements")
+                        Text("Tap the ruler button and mark the two front edges of home plate for accurate measurements")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
@@ -4064,4 +3637,3 @@ class CalibrationCameraViewController: UIViewController {
         }
     }
 }
-
