@@ -1,0 +1,576 @@
+//
+//  VideoPreviewView.swift
+//  Baseball Tracker
+//
+//  Pauses on the first frame of a selected video before processing,
+//  allowing the user to set up the strike zone calibration with
+//  pinch-to-zoom for precision.
+//
+
+import SwiftUI
+import AVFoundation
+import Photos
+
+struct VideoPreviewView: View {
+    let videoURL: URL
+    let phAsset: PHAsset?
+    @ObservedObject var settings: CameraSettings
+    let onProcess: () -> Void
+    let onCancel: () -> Void
+    
+    @State private var firstFrame: UIImage?
+    @State private var isCalibrating = false
+    
+    // Zoom / pan state
+    @State private var zoomScale: CGFloat = 1.0
+    @State private var lastZoomScale: CGFloat = 1.0
+    @State private var panOffset: CGSize = .zero
+    @State private var lastPanOffset: CGSize = .zero
+    
+    // Calibration state — positions stored in NORMALISED image coords (0-1)
+    // so they survive zoom/pan changes
+    @State private var leftEdgeNorm: CGPoint = .zero
+    @State private var rightEdgeNorm: CGPoint = .zero
+    @State private var hasSetLeftEdge = false
+    @State private var hasSetRightEdge = false
+    @State private var plateWidthText: String = "17"
+    @State private var useCentimeters: Bool = false
+    
+    // Layout
+    @State private var containerSize: CGSize = .zero
+    
+    var body: some View {
+        GeometryReader { geo in
+            let imgSize = firstFrame?.size ?? CGSize(width: 1920, height: 1080)
+            let fitRect = fitImageRect(imageSize: imgSize, in: geo.size)
+            
+            ZStack {
+                Color.black.ignoresSafeArea()
+                
+                // Zoomable / pannable first frame
+                if let image = firstFrame {
+                    Image(uiImage: image)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: fitRect.width, height: fitRect.height)
+                        .scaleEffect(zoomScale)
+                        .offset(panOffset)
+                        .position(x: geo.size.width / 2, y: geo.size.height / 2)
+                } else {
+                    ProgressView("Loading preview…")
+                        .foregroundColor(.white)
+                }
+                
+                // Strike zone preview (if calibrated and not currently calibrating)
+                if settings.isCalibrated && !isCalibrating, let _ = firstFrame {
+                    strikeZonePreview(fitRect: fitRect, containerSize: geo.size)
+                }
+                
+                // Calibration overlays
+                if isCalibrating, let _ = firstFrame {
+                    calibrationOverlayView(fitRect: fitRect, containerSize: geo.size)
+                    
+                    // Live strike zone preview while placing markers
+                    if hasSetLeftEdge && hasSetRightEdge {
+                        strikeZonePreviewFromNorm(leftNorm: leftEdgeNorm, rightNorm: rightEdgeNorm,
+                                                  fitRect: fitRect, containerSize: geo.size)
+                    }
+                }
+                
+                // UI Controls
+                VStack {
+                    if !isCalibrating {
+                        topBar
+                    } else {
+                        calibrationHeader
+                    }
+                    
+                    Spacer()
+                    
+                    if isCalibrating {
+                        zoomLabel
+                    }
+                    
+                    Spacer()
+                    
+                    if !isCalibrating {
+                        bottomBar
+                    } else {
+                        calibrationControls
+                    }
+                }
+            }
+            .onAppear {
+                containerSize = geo.size
+                useCentimeters = settings.useCentimeters
+                plateWidthText = settings.isCalibrated
+                    ? String(format: "%.1f", settings.plateWidth)
+                    : (useCentimeters ? "43.2" : "17")
+                extractFirstFrame()
+            }
+            .onChange(of: geo.size) { _, newSize in
+                containerSize = newSize
+            }
+            .gesture(isCalibrating ? magnificationGesture : nil)
+            .highPriorityGesture(isCalibrating && zoomScale > 1.05 ? dragPanGesture : nil)
+        }
+    }
+    
+    // MARK: - Gestures
+    
+    private var magnificationGesture: some Gesture {
+        MagnificationGesture()
+            .onChanged { scale in
+                zoomScale = max(1.0, min(lastZoomScale * scale, 8.0))
+            }
+            .onEnded { scale in
+                zoomScale = max(1.0, min(lastZoomScale * scale, 8.0))
+                lastZoomScale = zoomScale
+                clampPan()
+            }
+    }
+    
+    private var dragPanGesture: some Gesture {
+        DragGesture()
+            .onChanged { value in
+                panOffset = CGSize(
+                    width: lastPanOffset.width + value.translation.width,
+                    height: lastPanOffset.height + value.translation.height
+                )
+            }
+            .onEnded { value in
+                panOffset = CGSize(
+                    width: lastPanOffset.width + value.translation.width,
+                    height: lastPanOffset.height + value.translation.height
+                )
+                lastPanOffset = panOffset
+                clampPan()
+            }
+    }
+    
+    private func clampPan() {
+        let maxX = max(0, containerSize.width * (zoomScale - 1) / 2)
+        let maxY = max(0, containerSize.height * (zoomScale - 1) / 2)
+        panOffset.width = min(max(panOffset.width, -maxX), maxX)
+        panOffset.height = min(max(panOffset.height, -maxY), maxY)
+        lastPanOffset = panOffset
+    }
+    
+    // MARK: - Coordinate Conversion
+    
+    /// Convert a screen tap position to normalised image coordinates (0-1)
+    private func screenToNorm(_ screenPos: CGPoint, fitRect: CGRect, containerSize: CGSize) -> CGPoint {
+        let imageCenter = CGPoint(x: containerSize.width / 2 + panOffset.width,
+                                  y: containerSize.height / 2 + panOffset.height)
+        let scaledW = fitRect.width * zoomScale
+        let scaledH = fitRect.height * zoomScale
+        let imageOrigin = CGPoint(x: imageCenter.x - scaledW / 2,
+                                  y: imageCenter.y - scaledH / 2)
+        
+        return CGPoint(x: (screenPos.x - imageOrigin.x) / scaledW,
+                       y: (screenPos.y - imageOrigin.y) / scaledH)
+    }
+    
+    /// Convert normalised image coordinates (0-1) to screen position
+    private func normToScreen(_ norm: CGPoint, fitRect: CGRect, containerSize: CGSize) -> CGPoint {
+        let imageCenter = CGPoint(x: containerSize.width / 2 + panOffset.width,
+                                  y: containerSize.height / 2 + panOffset.height)
+        let scaledW = fitRect.width * zoomScale
+        let scaledH = fitRect.height * zoomScale
+        let imageOrigin = CGPoint(x: imageCenter.x - scaledW / 2,
+                                  y: imageCenter.y - scaledH / 2)
+        
+        return CGPoint(x: imageOrigin.x + norm.x * scaledW,
+                       y: imageOrigin.y + norm.y * scaledH)
+    }
+    
+    /// Compute the aspect-fit rect for the image within the container
+    private func fitImageRect(imageSize: CGSize, in container: CGSize) -> CGRect {
+        let scale = min(container.width / imageSize.width, container.height / imageSize.height)
+        let w = imageSize.width * scale
+        let h = imageSize.height * scale
+        return CGRect(x: (container.width - w) / 2, y: (container.height - h) / 2, width: w, height: h)
+    }
+    
+    // MARK: - Top Bar
+    private var topBar: some View {
+        HStack {
+            Button(action: onCancel) {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.left")
+                    Text("Back")
+                }
+                .font(.headline)
+                .foregroundColor(.white)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+                .background(Color.black.opacity(0.6))
+                .cornerRadius(10)
+            }
+            
+            Spacer()
+            
+            if settings.isCalibrated {
+                HStack(spacing: 4) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundColor(.green)
+                    Text("Strike Zone Set")
+                        .foregroundColor(.green)
+                }
+                .font(.subheadline.weight(.semibold))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(Color.black.opacity(0.6))
+                .cornerRadius(10)
+            }
+        }
+        .padding()
+    }
+    
+    // MARK: - Bottom Bar
+    private var bottomBar: some View {
+        VStack(spacing: 12) {
+            HStack(spacing: 16) {
+                Button {
+                    loadExistingCalibration()
+                    isCalibrating = true
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: "square.dashed")
+                        Text(settings.isCalibrated ? "Edit Strike Zone" : "Set Strike Zone")
+                    }
+                    .font(.headline)
+                    .foregroundColor(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding()
+                    .background(Color.blue.opacity(0.8))
+                    .cornerRadius(14)
+                }
+                
+                Button(action: onProcess) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "play.fill")
+                        Text("Process Video")
+                    }
+                    .font(.headline)
+                    .foregroundColor(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding()
+                    .background(Color.green.opacity(0.8))
+                    .cornerRadius(14)
+                }
+            }
+        }
+        .padding()
+        .background(
+            LinearGradient(colors: [.clear, .black.opacity(0.7)],
+                          startPoint: .top, endPoint: .bottom)
+                .ignoresSafeArea()
+        )
+    }
+    
+    // MARK: - Zoom Label
+    private var zoomLabel: some View {
+        HStack {
+            Text(String(format: "%.1fx", zoomScale))
+                .font(.subheadline.weight(.semibold))
+                .foregroundColor(.white)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(Color.black.opacity(0.6))
+                .cornerRadius(8)
+            Spacer()
+        }
+        .padding(.leading, 16)
+    }
+    
+    // MARK: - Calibration Header
+    private var calibrationHeader: some View {
+        VStack(spacing: 6) {
+            Text("Set Strike Zone")
+                .font(.title2.weight(.bold))
+                .foregroundColor(.white)
+            
+            Text(calibrationInstruction)
+                .font(.subheadline)
+                .foregroundColor(.white.opacity(0.9))
+                .multilineTextAlignment(.center)
+        }
+        .padding()
+        .frame(maxWidth: .infinity)
+        .background(Color.black.opacity(0.7))
+    }
+    
+    // MARK: - Calibration Overlay
+    private func calibrationOverlayView(fitRect: CGRect, containerSize: CGSize) -> some View {
+        ZStack {
+            // Tap target
+            Color.clear
+                .contentShape(Rectangle())
+                .onTapGesture { location in
+                    handleCalibrationTap(at: location, fitRect: fitRect, containerSize: containerSize)
+                }
+            
+            // Left edge marker
+            if hasSetLeftEdge {
+                let pos = normToScreen(leftEdgeNorm, fitRect: fitRect, containerSize: containerSize)
+                CalibrationMarker(label: "Left Edge", color: .green)
+                    .position(pos)
+                    .allowsHitTesting(false)
+            }
+            
+            // Right edge marker
+            if hasSetRightEdge {
+                let pos = normToScreen(rightEdgeNorm, fitRect: fitRect, containerSize: containerSize)
+                CalibrationMarker(label: "Right Edge", color: .blue)
+                    .position(pos)
+                    .allowsHitTesting(false)
+            }
+            
+            // Line between markers
+            if hasSetLeftEdge && hasSetRightEdge {
+                let leftPos = normToScreen(leftEdgeNorm, fitRect: fitRect, containerSize: containerSize)
+                let rightPos = normToScreen(rightEdgeNorm, fitRect: fitRect, containerSize: containerSize)
+                
+                Path { path in
+                    path.move(to: leftPos)
+                    path.addLine(to: rightPos)
+                }
+                .stroke(Color.yellow, lineWidth: 3)
+                .allowsHitTesting(false)
+                
+                let mid = CGPoint(x: (leftPos.x + rightPos.x) / 2,
+                                  y: (leftPos.y + rightPos.y) / 2)
+                Text("\(plateWidthText)\(useCentimeters ? "cm" : "\"")")
+                    .font(.headline.weight(.bold))
+                    .foregroundColor(.white)
+                    .padding(6)
+                    .background(Color.yellow.opacity(0.8))
+                    .cornerRadius(6)
+                    .position(mid)
+                    .allowsHitTesting(false)
+            }
+        }
+    }
+    
+    // MARK: - Calibration Controls
+    private var calibrationControls: some View {
+        VStack(spacing: 12) {
+            // Plate width
+            VStack(spacing: 8) {
+                Text("Home Plate Width")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundColor(.white)
+                
+                HStack(spacing: 12) {
+                    if useCentimeters {
+                        quickWidthButton("43.2", label: "Baseball (43.2cm)")
+                        quickWidthButton("30.5", label: "Softball (30.5cm)")
+                    } else {
+                        quickWidthButton("17", label: "Baseball (17\")")
+                        quickWidthButton("12", label: "Softball (12\")")
+                    }
+                }
+                
+                HStack {
+                    TextField("Width", text: $plateWidthText)
+                        .textFieldStyle(.roundedBorder)
+                        .keyboardType(.decimalPad)
+                        .frame(width: 80)
+                    Text(useCentimeters ? "cm" : "inches")
+                        .foregroundColor(.white)
+                        .font(.subheadline)
+                }
+            }
+            
+            // Action buttons
+            HStack(spacing: 12) {
+                Button { clearCalibration() } label: {
+                    Text("Clear")
+                        .font(.headline).foregroundColor(.white)
+                        .frame(maxWidth: .infinity).padding(12)
+                        .background(Color.orange.opacity(0.7)).cornerRadius(10)
+                }
+                
+                Button {
+                    resetZoom()
+                    isCalibrating = false
+                } label: {
+                    Text("Cancel")
+                        .font(.headline).foregroundColor(.white)
+                        .frame(maxWidth: .infinity).padding(12)
+                        .background(Color.red.opacity(0.7)).cornerRadius(10)
+                }
+                
+                Button { saveCalibration() } label: {
+                    Text("Save")
+                        .font(.headline).foregroundColor(.white)
+                        .frame(maxWidth: .infinity).padding(12)
+                        .background(canSave ? Color.green : Color.gray.opacity(0.5)).cornerRadius(10)
+                }
+                .disabled(!canSave)
+            }
+        }
+        .padding()
+        .background(Color.black.opacity(0.8))
+    }
+    
+    // MARK: - Quick Width Button
+    private func quickWidthButton(_ value: String, label: String) -> some View {
+        Button { plateWidthText = value } label: {
+            Text(label)
+                .font(.caption).foregroundColor(.white)
+                .padding(.horizontal, 10).padding(.vertical, 6)
+                .background(plateWidthText == value ? Color.blue : Color.gray.opacity(0.5))
+                .cornerRadius(8)
+        }
+    }
+    
+    // MARK: - Strike Zone Preview (from settings)
+    private func strikeZonePreview(fitRect: CGRect, containerSize: CGSize) -> some View {
+        strikeZonePreviewFromNorm(leftNorm: settings.plateLeftEdge,
+                                  rightNorm: settings.plateRightEdge,
+                                  fitRect: fitRect, containerSize: containerSize)
+    }
+    
+    // MARK: - Strike Zone Preview (from normalised points)
+    private func strikeZonePreviewFromNorm(leftNorm: CGPoint, rightNorm: CGPoint,
+                                            fitRect: CGRect, containerSize: CGSize) -> some View {
+        Canvas { context, size in
+            let left = normToScreen(leftNorm, fitRect: fitRect, containerSize: containerSize)
+            let right = normToScreen(rightNorm, fitRect: fitRect, containerSize: containerSize)
+            
+            let plateVec = CGPoint(x: right.x - left.x, y: right.y - left.y)
+            let platePixels = sqrt(plateVec.x * plateVec.x + plateVec.y * plateVec.y)
+            guard platePixels > 1 else { return }
+            
+            let plateInches = useCentimeters ? (Double(plateWidthText) ?? settings.plateWidth) / 2.54
+                                             : Double(plateWidthText) ?? settings.plateWidth
+            let ppi = platePixels / plateInches
+            
+            let upUnit = CGPoint(x: 0, y: -1)
+            let bottomOffset = ppi * settings.strikeZoneBottomOffset
+            let zoneHeight = ppi * settings.strikeZoneHeight
+            
+            let bl = CGPoint(x: left.x + upUnit.x * bottomOffset, y: left.y + upUnit.y * bottomOffset)
+            let br = CGPoint(x: right.x + upUnit.x * bottomOffset, y: right.y + upUnit.y * bottomOffset)
+            let tl = CGPoint(x: left.x + upUnit.x * (bottomOffset + zoneHeight),
+                           y: left.y + upUnit.y * (bottomOffset + zoneHeight))
+            let tr = CGPoint(x: right.x + upUnit.x * (bottomOffset + zoneHeight),
+                           y: right.y + upUnit.y * (bottomOffset + zoneHeight))
+            
+            var fillPath = Path()
+            fillPath.move(to: bl); fillPath.addLine(to: br)
+            fillPath.addLine(to: tr); fillPath.addLine(to: tl)
+            fillPath.closeSubpath()
+            context.fill(fillPath, with: .color(.white.opacity(0.08)))
+            context.stroke(fillPath, with: .color(.white.opacity(0.6)), lineWidth: 2)
+            
+            var midPath = Path()
+            midPath.move(to: CGPoint(x: (bl.x + tl.x) / 2, y: (bl.y + tl.y) / 2))
+            midPath.addLine(to: CGPoint(x: (br.x + tr.x) / 2, y: (br.y + tr.y) / 2))
+            context.stroke(midPath, with: .color(.white.opacity(0.3)),
+                          style: StrokeStyle(lineWidth: 1, dash: [6, 4]))
+        }
+        .allowsHitTesting(false)
+    }
+    
+    // MARK: - Helpers
+    
+    private var calibrationInstruction: String {
+        if !hasSetLeftEdge {
+            return "Pinch to zoom for precision, then tap the LEFT edge of home plate"
+        } else if !hasSetRightEdge {
+            return "Now tap the RIGHT edge of home plate"
+        } else {
+            return "Tap again to reset markers. Adjust width if needed, then Save."
+        }
+    }
+    
+    private var canSave: Bool {
+        hasSetLeftEdge && hasSetRightEdge &&
+        (Double(plateWidthText) ?? 0) > 0
+    }
+    
+    private func handleCalibrationTap(at position: CGPoint, fitRect: CGRect, containerSize: CGSize) {
+        let norm = screenToNorm(position, fitRect: fitRect, containerSize: containerSize)
+        // Ignore taps outside the image
+        guard norm.x >= -0.05 && norm.x <= 1.05 && norm.y >= -0.05 && norm.y <= 1.05 else { return }
+        
+        if !hasSetLeftEdge {
+            leftEdgeNorm = norm
+            hasSetLeftEdge = true
+        } else if !hasSetRightEdge {
+            rightEdgeNorm = norm
+            hasSetRightEdge = true
+        } else {
+            hasSetLeftEdge = false
+            hasSetRightEdge = false
+        }
+    }
+    
+    private func loadExistingCalibration() {
+        useCentimeters = settings.useCentimeters
+        if settings.isCalibrated {
+            hasSetLeftEdge = true
+            hasSetRightEdge = true
+            leftEdgeNorm = settings.plateLeftEdge
+            rightEdgeNorm = settings.plateRightEdge
+            plateWidthText = String(format: "%.1f", settings.plateWidth)
+        } else {
+            hasSetLeftEdge = false
+            hasSetRightEdge = false
+            plateWidthText = useCentimeters ? "43.2" : "17"
+        }
+    }
+    
+    private func clearCalibration() {
+        hasSetLeftEdge = false
+        hasSetRightEdge = false
+        leftEdgeNorm = .zero
+        rightEdgeNorm = .zero
+        settings.isCalibrated = false
+        settings.plateLeftEdge = .zero
+        settings.plateRightEdge = .zero
+        plateWidthText = useCentimeters ? "43.2" : "17"
+    }
+    
+    private func saveCalibration() {
+        guard let width = Double(plateWidthText), width > 0 else { return }
+        
+        // Positions are already in normalised coords — save directly
+        settings.plateLeftEdge = leftEdgeNorm
+        settings.plateRightEdge = rightEdgeNorm
+        settings.plateWidth = width
+        settings.useCentimeters = useCentimeters
+        settings.isCalibrated = true
+        
+        resetZoom()
+        isCalibrating = false
+    }
+    
+    private func resetZoom() {
+        zoomScale = 1.0
+        lastZoomScale = 1.0
+        panOffset = .zero
+        lastPanOffset = .zero
+    }
+    
+    private func extractFirstFrame() {
+        let asset = AVURLAsset(url: videoURL)
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.requestedTimeToleranceBefore = .zero
+        generator.requestedTimeToleranceAfter = CMTime(seconds: 0.1, preferredTimescale: 600)
+        
+        let time = CMTime(seconds: 0, preferredTimescale: 600)
+        generator.generateCGImagesAsynchronously(forTimes: [NSValue(time: time)]) { _, cgImage, _, _, _ in
+            if let cgImage = cgImage {
+                let image = UIImage(cgImage: cgImage)
+                DispatchQueue.main.async {
+                    self.firstFrame = image
+                }
+            }
+        }
+    }
+}
