@@ -1,0 +1,137 @@
+//
+//  SlowMotionHelper.swift
+//  Baseball Tracker
+//
+//  When a user selects a slow-motion video through PHPickerViewController or
+//  UIImagePickerController, iOS delivers a **composed** version: the 240fps
+//  media frames are re-timed to 30fps with the slow-motion effect baked in.
+//  The original high-speed frames are discarded in this process, and the
+//  composed file contains NO metadata indicating it was ever high-speed.
+//
+//  Detection: Use PHAsset.mediaSubtypes.contains(.videoHighFrameRate)
+//  Recovery:  Use PHAssetResourceManager to fetch the .video resource
+//             (original capture) instead of .fullSizeVideo (composed output)
+//
+//  Resource types:
+//    .video           → Original camera capture (240fps for slo-mo)
+//    .fullSizeVideo   → Composed/flattened version (30fps with slo-mo baked in)
+//    .pairedVideo     → Live Photo companion video
+//
+
+import AVFoundation
+import Photos
+
+struct SlowMotionHelper {
+    
+    // MARK: - Fetch Original High-Speed Video
+    
+    /// Fetches the original high-frame-rate video file from a PHAsset,
+    /// bypassing the composed/flattened version that pickers deliver.
+    ///
+    /// - Parameters:
+    ///   - asset: The PHAsset for the slow-motion video
+    ///   - progressHandler: Optional callback with progress (0.0–1.0)
+    ///   - completion: Called with the URL of the original file, or nil on failure
+    ///
+    /// The returned URL points to a temporary file that the caller is
+    /// responsible for cleaning up when no longer needed.
+    static func fetchOriginalSlowMotionVideo(
+        for asset: PHAsset,
+        progressHandler: ((Double) -> Void)? = nil,
+        completion: @escaping (URL?) -> Void
+    ) {
+        let resources = PHAssetResource.assetResources(for: asset)
+        
+        print("[SloMo] Asset resources (\(resources.count)):")
+        for (i, resource) in resources.enumerated() {
+            print("[SloMo]   [\(i)] type=\(resource.type.rawValue) filename=\(resource.originalFilename)")
+        }
+        
+        // Look for the original video resource (.video type = 1)
+        // .video is the original camera capture; .fullSizeVideo is the composed version
+        guard let originalResource = resources.first(where: { $0.type == .video }) else {
+            print("[SloMo] ⚠️ No .video resource found — falling back to .fullSizeVideo")
+            // Fall back to fullSizeVideo if no original is available
+            if let fullSize = resources.first(where: { $0.type == .fullSizeVideo }) {
+                print("[SloMo] Found .fullSizeVideo — this is the composed version")
+                fetchResource(fullSize, progressHandler: progressHandler, completion: completion)
+            } else {
+                print("[SloMo] ❌ No video resources found at all")
+                completion(nil)
+            }
+            return
+        }
+        
+        print("[SloMo] ✅ Found original .video resource: \(originalResource.originalFilename)")
+        fetchResource(originalResource, progressHandler: progressHandler, completion: completion)
+    }
+    
+    // MARK: - Private: Fetch Resource to Temp File
+    
+    private static func fetchResource(
+        _ resource: PHAssetResource,
+        progressHandler: ((Double) -> Void)? = nil,
+        completion: @escaping (URL?) -> Void
+    ) {
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("original_slomo_\(UUID().uuidString).mov")
+        
+        // Clean up any existing file at this path
+        try? FileManager.default.removeItem(at: tempURL)
+        
+        let options = PHAssetResourceRequestOptions()
+        options.isNetworkAccessAllowed = true // Allow fetching from iCloud
+        options.progressHandler = { progress in
+            DispatchQueue.main.async {
+                progressHandler?(progress)
+            }
+        }
+        
+        print("[SloMo] Fetching resource to: \(tempURL.lastPathComponent)")
+        
+        PHAssetResourceManager.default().writeData(
+            for: resource,
+            toFile: tempURL,
+            options: options
+        ) { error in
+            if let error = error {
+                print("[SloMo] ❌ Fetch failed: \(error.localizedDescription)")
+                completion(nil)
+                return
+            }
+            
+            print("[SloMo] ✅ Resource written to temp file")
+            
+            // Verify the fetched file's actual frame rate
+            Task {
+                let fetchedAsset = AVURLAsset(url: tempURL)
+                do {
+                    let tracks = try await fetchedAsset.loadTracks(withMediaType: .video)
+                    if let track = tracks.first {
+                        let nominalFPS = try await track.load(.nominalFrameRate)
+                        let minDuration = try await track.load(.minFrameDuration)
+                        let duration = try await fetchedAsset.load(.duration)
+                        let actualFPS = minDuration.seconds > 0 ? 1.0 / minDuration.seconds : Double(nominalFPS)
+                        let frameCount = Int(CMTimeGetSeconds(duration) * actualFPS)
+                        
+                        print("[SloMo] Fetched file info:")
+                        print("[SloMo]   - Nominal FPS: \(nominalFPS)")
+                        print("[SloMo]   - Actual FPS: \(String(format: "%.2f", actualFPS))")
+                        print("[SloMo]   - Duration: \(String(format: "%.2f", CMTimeGetSeconds(duration)))s")
+                        print("[SloMo]   - Expected frames: ~\(frameCount)")
+                        
+                        if actualFPS >= 120 {
+                            print("[SloMo] ✅ SUCCESS: Original high-speed file recovered at \(String(format: "%.1f", actualFPS))fps!")
+                        } else {
+                            print("[SloMo] ⚠️ WARNING: Fetched file is only \(String(format: "%.1f", actualFPS))fps — may not be the original")
+                        }
+                    }
+                } catch {
+                    print("[SloMo] ⚠️ Could not verify fetched file: \(error)")
+                }
+                
+                completion(tempURL)
+            }
+        }
+    }
+}
