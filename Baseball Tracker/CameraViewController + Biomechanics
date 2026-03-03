@@ -1,0 +1,158 @@
+//
+//  CameraViewController+Biomechanics.swift
+//  Baseball Tracker
+//
+//  Joint angle calculation, biomechanical analysis, and CSV data export.
+//
+
+import UIKit
+import AVFoundation
+import Vision
+
+extension CameraViewController {
+    
+    // MARK: - Joint Angle Calculation
+    func calculateJointAngle(proximal: CGPoint, joint: CGPoint, distal: CGPoint) -> Double {
+        let vector1 = CGPoint(x: proximal.x - joint.x, y: proximal.y - joint.y)
+        let vector2 = CGPoint(x: distal.x - joint.x, y: distal.y - joint.y)
+        
+        let dot = vector1.x * vector2.x + vector1.y * vector2.y
+        let mag1 = sqrt(vector1.x * vector1.x + vector1.y * vector1.y)
+        let mag2 = sqrt(vector2.x * vector2.x + vector2.y * vector2.y)
+        
+        guard mag1 > 0, mag2 > 0 else { return 0 }
+        
+        let cosAngle = max(-1, min(1, dot / (mag1 * mag2)))
+        return acos(cosAngle) * 180.0 / .pi
+    }
+    
+    // MARK: - Dynamic Calibration from Ball Size
+    func estimatePixelsPerFootFromBall(boundingBox: CGRect, viewSize: CGSize) -> Double? {
+        let baseballDiameterInFeet = 0.242
+        
+        let boxWidth = boundingBox.width * viewSize.width
+        let boxHeight = boundingBox.height * viewSize.height
+        let avgBallSizeInPixels = (boxWidth + boxHeight) / 2.0
+        
+        guard avgBallSizeInPixels >= 10 && avgBallSizeInPixels <= 200 else {
+            print("[Calibration Debug] Ball size out of range (10-200px), rejecting")
+            return nil
+        }
+        
+        let rawPixelsPerFoot = avgBallSizeInPixels / baseballDiameterInFeet
+        let pixelsPerFoot = rawPixelsPerFoot
+        print("[Calibration Debug] Ball box: \(String(format: "%.1f", boxWidth))px × \(String(format: "%.1f", boxHeight))px, avg: \(String(format: "%.1f", avgBallSizeInPixels))px, lens: \(String(format: "%.1f", settings.selectedLens))x")
+        print("[Calibration Debug] Calculated pixels/ft: \(String(format: "%.1f", pixelsPerFoot))")
+        
+        guard pixelsPerFoot >= 10 && pixelsPerFoot <= 500 else {
+            print("[Calibration Debug] Pixels/ft out of range (10-500), rejecting: \(String(format: "%.1f", pixelsPerFoot))")
+            return nil
+        }
+        
+        return pixelsPerFoot
+    }
+    
+    // MARK: - Biomechanical Analysis
+    func analyzeBiomechanics(ballPosition: CGPoint, poseObservation: VNHumanBodyPoseObservation, viewSize: CGSize? = nil) -> [String: Any] {
+        guard let recognizedPoints = try? poseObservation.recognizedPoints(.all) else { return [:] }
+        
+        let pixelSize: CGSize
+        if let provided = viewSize {
+            pixelSize = provided
+        } else {
+            let orientation = UIDevice.current.orientation
+            let isPortrait = orientation == .portrait || orientation == .portraitUpsideDown
+            if isPortrait {
+                pixelSize = CGSize(width: CGFloat(activeDimensions.height), height: CGFloat(activeDimensions.width))
+            } else {
+                pixelSize = CGSize(width: CGFloat(activeDimensions.width), height: CGFloat(activeDimensions.height))
+            }
+        }
+        
+        func toPixels(_ pt: CGPoint) -> CGPoint {
+            return CGPoint(x: pt.x * pixelSize.width, y: pt.y * pixelSize.height)
+        }
+        
+        var analysis: [String: Any] = [:]
+        
+        // Elbow angles
+        if let rS = recognizedPoints[.rightShoulder], let rE = recognizedPoints[.rightElbow], let rW = recognizedPoints[.rightWrist],
+           rS.confidence > 0.5, rE.confidence > 0.5, rW.confidence > 0.5 {
+            analysis["rightElbowAngle"] = calculateJointAngle(proximal: toPixels(rS.location), joint: toPixels(rE.location), distal: toPixels(rW.location))
+        }
+        if let lS = recognizedPoints[.leftShoulder], let lE = recognizedPoints[.leftElbow], let lW = recognizedPoints[.leftWrist],
+           lS.confidence > 0.5, lE.confidence > 0.5, lW.confidence > 0.5 {
+            analysis["leftElbowAngle"] = calculateJointAngle(proximal: toPixels(lS.location), joint: toPixels(lE.location), distal: toPixels(lW.location))
+        }
+        
+        // Knee angles
+        if let rH = recognizedPoints[.rightHip], let rK = recognizedPoints[.rightKnee], let rA = recognizedPoints[.rightAnkle],
+           rH.confidence > 0.5, rK.confidence > 0.5, rA.confidence > 0.5 {
+            analysis["rightKneeAngle"] = calculateJointAngle(proximal: toPixels(rH.location), joint: toPixels(rK.location), distal: toPixels(rA.location))
+        }
+        if let lH = recognizedPoints[.leftHip], let lK = recognizedPoints[.leftKnee], let lA = recognizedPoints[.leftAnkle],
+           lH.confidence > 0.5, lK.confidence > 0.5, lA.confidence > 0.5 {
+            analysis["leftKneeAngle"] = calculateJointAngle(proximal: toPixels(lH.location), joint: toPixels(lK.location), distal: toPixels(lA.location))
+        }
+        
+        // Shoulder angles
+        if let rS = recognizedPoints[.rightShoulder], let rH = recognizedPoints[.rightHip], let rE = recognizedPoints[.rightElbow],
+           rS.confidence > 0.5, rH.confidence > 0.5, rE.confidence > 0.5 {
+            analysis["rightShoulderAngle"] = calculateJointAngle(proximal: toPixels(rH.location), joint: toPixels(rS.location), distal: toPixels(rE.location))
+        }
+        if let lS = recognizedPoints[.leftShoulder], let lH = recognizedPoints[.leftHip], let lE = recognizedPoints[.leftElbow],
+           lS.confidence > 0.5, lH.confidence > 0.5, lE.confidence > 0.5 {
+            analysis["leftShoulderAngle"] = calculateJointAngle(proximal: toPixels(lH.location), joint: toPixels(lS.location), distal: toPixels(lE.location))
+        }
+        
+        // Wrist-to-ball distances
+        if let rW = recognizedPoints[.rightWrist], rW.confidence > 0.5 {
+            let d = sqrt(pow(ballPosition.x - rW.location.x, 2) + pow(ballPosition.y - rW.location.y, 2))
+            analysis["rightWristToBallDistance"] = d
+        }
+        if let lW = recognizedPoints[.leftWrist], lW.confidence > 0.5 {
+            let d = sqrt(pow(ballPosition.x - lW.location.x, 2) + pow(ballPosition.y - lW.location.y, 2))
+            analysis["leftWristToBallDistance"] = d
+        }
+        
+        analysis["ballPosition"] = ballPosition
+        return analysis
+    }
+    
+    // MARK: - Export Biomechanical Data
+    func exportBiomechanicalData() -> String {
+        var csv = "Timestamp,BallX,BallY,RightElbowAngle,LeftElbowAngle,RightKneeAngle,LeftKneeAngle,RightShoulderAngle,LeftShoulderAngle,RightWristDistance,LeftWristDistance\n"
+        
+        for frameData in fusedFrameData {
+            let timestamp = CMTimeGetSeconds(frameData.timestamp)
+            let ballPos = frameData.ballPosition
+            
+            if let poseObs = frameData.poseObservation, let ballPosition = ballPos {
+                let a = analyzeBiomechanics(ballPosition: ballPosition, poseObservation: poseObs)
+                csv += "\(timestamp),\(ballPosition.x),\(ballPosition.y),"
+                csv += "\(a["rightElbowAngle"] as? Double ?? 0),\(a["leftElbowAngle"] as? Double ?? 0),"
+                csv += "\(a["rightKneeAngle"] as? Double ?? 0),\(a["leftKneeAngle"] as? Double ?? 0),"
+                csv += "\(a["rightShoulderAngle"] as? Double ?? 0),\(a["leftShoulderAngle"] as? Double ?? 0),"
+                csv += "\(a["rightWristToBallDistance"] as? Double ?? 0),\(a["leftWristToBallDistance"] as? Double ?? 0)\n"
+            } else if let ballPosition = ballPos {
+                csv += "\(timestamp),\(ballPosition.x),\(ballPosition.y),0,0,0,0,0,0,0,0\n"
+            }
+        }
+        
+        return csv
+    }
+    
+    func saveBiomechanicalDataToFile() {
+        let csv = exportBiomechanicalData()
+        let fileName = "biomechanics_\(UUID().uuidString).csv"
+        let fileURL = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
+        
+        do {
+            try csv.write(to: fileURL, atomically: true, encoding: .utf8)
+            print("[Biomechanics] Exported data to: \(fileURL.path)")
+            print("[Biomechanics] Total frames analyzed: \(fusedFrameData.count)")
+        } catch {
+            print("[Biomechanics] Error saving CSV: \(error)")
+        }
+    }
+}
