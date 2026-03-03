@@ -1,0 +1,176 @@
+//
+//  CameraViewController+VideoProcessing.swift
+//  Baseball Tracker
+//
+//  Processing of imported/selected video files.
+//
+//  Slow-motion handling:
+//  When users pick a slo-mo video through iOS's standard photo pickers,
+//  the system delivers a **composed** 30fps version with the slow-motion
+//  effect baked in. The original 240fps frames are lost — and the composed
+//  file contains NO metadata indicating it was ever high-speed.
+//
+//  The ONLY reliable way to detect this is via PHAsset.mediaSubtypes
+//  (.videoHighFrameRate). The file itself is indistinguishable from a
+//  normal 30fps video.
+//
+
+import UIKit
+import AVFoundation
+import Photos
+
+extension CameraViewController {
+    
+    // MARK: - Video File Processing
+    func processVideoFile(_ url: URL) {
+        showProcessingOverlay(message: "Analyzing video…")
+        
+        // Reset tracking data
+        self.detectionMarkers.removeAll()
+        self.poseHistory.removeAll()
+        self.fusedFrameData.removeAll()
+        self.lastPoseObservation = nil
+        self.currentROI = nil
+        self.framesWithoutDetection = 0
+
+        // Show video preview immediately
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.player = AVPlayer(url: url)
+            let playerLayer = AVPlayerLayer(player: self.player)
+            playerLayer.frame = self.view.bounds
+            playerLayer.videoGravity = .resizeAspectFill
+            self.previewLayer = playerLayer
+            self.view.layer.insertSublayer(self.previewLayer, at: 0)
+            self.player?.play()
+        }
+
+        Task {
+            // Step 1: Check if the PHAsset is a high-frame-rate (slo-mo) video.
+            // This is the ONLY reliable signal — the composed file the picker
+            // delivers looks like a plain 30fps video with no slo-mo metadata.
+            let isSloMoAsset = self.phAsset?.mediaSubtypes.contains(.videoHighFrameRate) ?? false
+            
+            print("[VideoProcessing] PHAsset available: \(self.phAsset != nil)")
+            if let asset = self.phAsset {
+                print("[VideoProcessing] PHAsset mediaSubtypes: \(asset.mediaSubtypes.rawValue)")
+                print("[VideoProcessing] .videoHighFrameRate: \(asset.mediaSubtypes.contains(.videoHighFrameRate))")
+                print("[VideoProcessing] .videoTimelapse: \(asset.mediaSubtypes.contains(.videoTimelapse))")
+                print("[VideoProcessing] Duration: \(String(format: "%.2f", asset.duration))s")
+            }
+            
+            // Step 2: If slo-mo, fetch the original high-speed file
+            if isSloMoAsset, let phAsset = self.phAsset {
+                print("")
+                print("⚠️⚠️⚠️ [VideoProcessing] SLO-MO VIDEO DETECTED via PHAsset.mediaSubtypes")
+                print("[VideoProcessing] The picker delivered a composed 30fps file.")
+                print("[VideoProcessing] Fetching original high-speed capture via PHAssetResourceManager…")
+                
+                await MainActor.run {
+                    self.updateProcessingMessage("Fetching original high-speed video…")
+                }
+                
+                let originalURL = await withCheckedContinuation { continuation in
+                    SlowMotionHelper.fetchOriginalSlowMotionVideo(
+                        for: phAsset,
+                        progressHandler: { progress in
+                            DispatchQueue.main.async {
+                                self.updateProcessingMessage(
+                                    "Fetching original video… \(Int(progress * 100))%"
+                                )
+                            }
+                        },
+                        completion: { url in
+                            continuation.resume(returning: url)
+                        }
+                    )
+                }
+                
+                if let originalURL = originalURL {
+                    print("[VideoProcessing] ✅ Got original file — switching to high-speed source")
+                    
+                    // Update the preview to play the original file
+                    await MainActor.run {
+                        self.player?.pause()
+                        self.player = AVPlayer(url: originalURL)
+                        if let playerLayer = self.previewLayer as? AVPlayerLayer {
+                            playerLayer.player = self.player
+                        }
+                        self.player?.play()
+                        self.updateProcessingMessage("Analysing & Exporting…")
+                    }
+                    
+                    // Process the ORIGINAL high-speed file instead
+                    await self.processVideoAsset(url: originalURL)
+                    return
+                } else {
+                    print("[VideoProcessing] ⚠️ Could not fetch original — falling back to composed version")
+                    await MainActor.run {
+                        self.updateProcessingMessage("Original unavailable, using composed version…")
+                    }
+                    try? await Task.sleep(nanoseconds: 1_500_000_000)
+                }
+                
+            } else if self.phAsset == nil {
+                // Log a helpful warning if no PHAsset was provided
+                print("")
+                print("⚠️ [VideoProcessing] NO PHAsset provided — cannot detect slo-mo or fetch originals.")
+                print("⚠️ [VideoProcessing] Pass the PHAsset when creating CameraView:")
+                print("⚠️ [VideoProcessing]   CameraView(videoURL: url, phAsset: phAsset, ...)")
+                print("")
+            }
+            
+            // Step 3: Process the file (either original high-speed, or fallback)
+            await MainActor.run { self.updateProcessingMessage("Analysing & Exporting…") }
+            await self.processVideoAsset(url: url)
+        }
+    }
+    
+    // MARK: - Process Video Asset (Internal)
+    /// Common path for processing a video URL — called either with the original
+    /// picker URL or with the recovered high-speed slo-mo file.
+    private func processVideoAsset(url: URL) async {
+        let asset = AVURLAsset(url: url)
+        
+        do {
+            let tracks = try await asset.loadTracks(withMediaType: .video)
+            guard let track = tracks.first else {
+                await MainActor.run { self.hideProcessingOverlay() }
+                return
+            }
+
+            let t = try await track.load(.preferredTransform)
+            
+            let angle = atan2(Double(t.b), Double(t.a))
+            var degrees = Int(round(angle * 180.0 / .pi))
+            degrees = (degrees % 360 + 360) % 360
+            let snapped: Int = {
+                let options = [0, 90, 180, 270]
+                let diffs = options.map { abs($0 - degrees) }
+                if let idx = diffs.enumerated().min(by: { $0.element < $1.element })?.offset {
+                    return options[idx]
+                }
+                return 0
+            }()
+
+            var mirrored = false
+            switch snapped {
+            case 0, 180:
+                mirrored = (t.a < 0)
+            case 90, 270:
+                mirrored = (t.d < 0)
+            default:
+                mirrored = false
+            }
+            self.mirrored = mirrored
+
+            self.contentUpsideDown = (snapped == 180)
+            self.videoRotationDegrees = snapped
+            self.contentFlippedVertically = false
+
+            await self.exportAnnotatedVideo(asset: asset, track: track)
+        } catch {
+            await MainActor.run { self.hideProcessingOverlay() }
+        }
+    }
+}
