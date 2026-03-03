@@ -1,0 +1,51 @@
+//
+//  CameraSettings.swift
+//  Baseball Tracker
+//
+
+import SwiftUI
+import Combine
+
+// MARK: - Settings Model
+class CameraSettings: ObservableObject {
+    @Published var ballDetectionEnabled: Bool = true
+    @Published var poseEstimationEnabled: Bool = true
+    @Published var showLabels: Bool = true
+    @Published var ballConfidenceThreshold: Float = 0.35
+    @Published var poseConfidenceThreshold: Float = 0.3
+    
+    // Calibration (using home plate width)
+    @Published var isCalibrated: Bool = false
+    @Published var plateLeftEdge: CGPoint = .zero // Normalized coordinates (0-1)
+    @Published var plateRightEdge: CGPoint = .zero // Normalized coordinates (0-1)
+    @Published var plateWidth: Double = 17.0 // inches (regulation baseball home plate)
+    @Published var useCentimeters: Bool = false // false = inches, true = centimeters
+    @Published var selectedLens: Double = 1.0 // Lens choice (1x, 2x, 4x, 8x)
+    
+    // Colors
+    @Published var ballColor: Color = .red
+    @Published var trajectoryColor: Color = .red
+    @Published var skeletonColor: Color = .cyan
+    @Published var jointColor: Color = .yellow
+    @Published var elbowAngleColor: Color = .green
+    @Published var kneeAngleColor: Color = .orange
+    @Published var shoulderAngleColor: Color = .purple
+    @Published var separationColor: Color = .cyan
+    
+    // Strike zone
+    @Published var showStrikeZone: Bool = true
+    @Published var strikeZoneColor: Color = .white
+    // Generic strike zone height in inches (MLB regulation ~22", adjustable for age groups)
+    @Published var strikeZoneHeight: Double = 22.0
+    // Distance in inches from home plate up to the bottom of the strike zone
+    // (~knee height; MLB regulation is roughly 18–20 inches above the plate)
+    @Published var strikeZoneBottomOffset: Double = 18.0
+    
+    // Export options
+    @Published var exportCleanVideo: Bool = false
+    
+    // Debug options
+    @Published var showROI: Bool = false
+    @Published var enableROI: Bool = true // Toggle to enable/disable ROI tracking
+    @Published var showDetectionMarkers: Bool = false // Show individual detection dots on export
+}
