@@ -1,0 +1,1183 @@
+//
+//  CameraViewController+Export.swift
+//  Baseball Tracker
+//
+//  Post-processing: annotated video export with:
+//    - Full-frame CoreML detection (no ROI crop)
+//    - Spatial validation filter (rejects false positives)
+//    - Adaptive confidence threshold (lower when tracking, ramps up on misses)
+//    - VNTrackObjectRequest fallback (takes over when CoreML misses)
+//    - CGContext-based annotation renderer
+//    - Save-to-photos completion flow
+//
+
+import UIKit
+import AVFoundation
+import Vision
+import Photos
+
+extension CameraViewController {
+    
+    // MARK: - Post-Process Video with Annotations
+    func postProcessVideoWithAnnotations(rawVideoURL: URL) async {
+        print("[PostProcess] Loading video asset from: \(rawVideoURL.path)")
+        
+        self.currentRawVideoURL = rawVideoURL
+        
+        let asset = AVURLAsset(url: rawVideoURL)
+        
+        do {
+            let tracks = try await asset.loadTracks(withMediaType: .video)
+            guard let track = tracks.first else {
+                print("[PostProcess] ERROR: No video track found")
+                await MainActor.run { self.hideProcessingOverlay() }
+                return
+            }
+            
+            self.detectionMarkers.removeAll()
+            await self.exportAnnotatedVideo(asset: asset, track: track)
+            
+        } catch {
+            print("[PostProcess] Error: \(error)")
+            await MainActor.run {
+                self.hideProcessingOverlay()
+                self.saveToPhotosThenAlert(outputURL: rawVideoURL)
+            }
+        }
+    }
+    
+    // MARK: - Export Annotated Video
+    func exportAnnotatedVideo(asset: AVAsset, track: AVAssetTrack) async {
+        do {
+            let trimDuration = CMTime(seconds: 0.5, preferredTimescale: 600)
+            let duration = try await asset.load(.duration)
+            let startTime = trimDuration
+            let endTime = duration
+            let timeRange = CMTimeRange(start: startTime, end: endTime)
+            
+            let nominalFrameRate = try await track.load(.nominalFrameRate)
+            let minFrameDuration = try await track.load(.minFrameDuration)
+            let actualFPS = minFrameDuration.seconds > 0 ? 1.0 / minFrameDuration.seconds : Double(nominalFrameRate)
+            
+            // Load the video's preferred transform to handle portrait/landscape correctly.
+            // Portrait videos are stored as landscape with a 90° rotation transform.
+            let preferredTransform = try await track.load(.preferredTransform)
+            
+            // Determine orientation from transform for Vision/CoreML
+            let videoOrientation: CGImagePropertyOrientation
+            let angle = atan2(preferredTransform.b, preferredTransform.a)
+            let angleDeg = angle * 180 / .pi
+            let isPortrait: Bool
+            if abs(angleDeg - 90) < 5 || abs(angleDeg + 270) < 5 {
+                videoOrientation = .right        // 90° CW — typical iPhone portrait
+                isPortrait = true
+            } else if abs(angleDeg + 90) < 5 || abs(angleDeg - 270) < 5 {
+                videoOrientation = .left          // 90° CCW — upside-down portrait
+                isPortrait = true
+            } else if abs(angleDeg - 180) < 5 || abs(angleDeg + 180) < 5 {
+                videoOrientation = .down          // 180° — upside-down landscape
+                isPortrait = false
+            } else {
+                videoOrientation = .up            // 0° — standard landscape
+                isPortrait = false
+            }
+            
+            // CRITICAL: Update activeFrameRate from the actual video FPS.
+            let previousActiveFrameRate = self.activeFrameRate
+            self.activeFrameRate = actualFPS
+            
+            let isHighSpeed = actualFPS >= 120
+            let expectedFrameCount = Int(CMTimeGetSeconds(duration) * actualFPS)
+            
+            print("[Export] Video Info:")
+            print("[Export]   - Nominal frame rate: \(nominalFrameRate) fps")
+            print("[Export]   - Min frame duration: \(minFrameDuration.value)/\(minFrameDuration.timescale) = \(String(format: "%.4f", minFrameDuration.seconds))s")
+            print("[Export]   - Calculated actual FPS: \(String(format: "%.1f", actualFPS))")
+            print("[Export]   - Duration: \(String(format: "%.2f", CMTimeGetSeconds(duration)))s")
+            print("[Export]   - Expected frame count: ~\(expectedFrameCount)")
+            print("[Export]   - activeFrameRate updated: \(String(format: "%.1f", previousActiveFrameRate)) → \(String(format: "%.1f", actualFPS))")
+            print("[Export]   - High-speed source: \(isHighSpeed)")
+            print("[Export]   - Transform angle: \(String(format: "%.1f", angleDeg))°, orientation: \(videoOrientation.rawValue), portrait: \(isPortrait)")
+            
+            let reader = try AVAssetReader(asset: asset)
+            reader.timeRange = timeRange
+            let outputSettings: [String: Any] = [kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA)]
+            let readerOutput = AVAssetReaderTrackOutput(track: track, outputSettings: outputSettings)
+
+            reader.add(readerOutput)
+            reader.startReading()
+
+            let naturalSize = try await track.load(.naturalSize)
+            // Raw pixel buffer dimensions (always landscape for iPhone video)
+            let rawWidth = Int(abs(naturalSize.width))
+            let rawHeight = Int(abs(naturalSize.height))
+            // Output dimensions: swap for portrait so the file metadata matches
+            let width = isPortrait ? rawHeight : rawWidth
+            let height = isPortrait ? rawWidth : rawHeight
+
+            let outputURL = FileManager.default.temporaryDirectory.appendingPathComponent("annotatedVideo_\(UUID().uuidString).mov")
+            try? FileManager.default.removeItem(at: outputURL)
+
+            guard let writer = try? AVAssetWriter(outputURL: outputURL, fileType: .mov) else { return }
+            let baseBitrate = 20_000_000.0
+            let scaledBitrate = Int(min(baseBitrate * max(1.0, actualFPS / 30.0), 100_000_000))
+            print("[Export] Writer config: \(width)x\(height) (raw: \(rawWidth)x\(rawHeight)) @ \(String(format: "%.1f", self.activeFrameRate))fps, bitrate=\(scaledBitrate / 1_000_000)Mbps")
+            let videoSettings: [String: Any] = [
+                AVVideoCodecKey: AVVideoCodecType.h264,
+                AVVideoWidthKey: width,
+                AVVideoHeightKey: height,
+                AVVideoCompressionPropertiesKey: [
+                    AVVideoExpectedSourceFrameRateKey: Int(self.activeFrameRate),
+                    AVVideoAverageBitRateKey: scaledBitrate,
+                    AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel
+                ]
+            ]
+            let writerInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+            writerInput.expectsMediaDataInRealTime = false
+            
+            let mediaTimeScale = CMTimeScale(max(600, Int32(self.activeFrameRate * 10)))
+            writer.movieTimeScale = mediaTimeScale
+            writerInput.mediaTimeScale = mediaTimeScale
+
+            let sourcePixelAttributes: [String: Any] = [
+                kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
+                kCVPixelBufferWidthKey as String: width,
+                kCVPixelBufferHeightKey as String: height
+            ]
+            let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: writerInput, sourcePixelBufferAttributes: sourcePixelAttributes)
+
+            writer.add(writerInput)
+            writer.startWriting()
+            writer.startSession(atSourceTime: .zero)
+
+            var exportFrameCount = 0
+            var detectionCount = 0
+            var trackerCount = 0
+            var missedFrameCount = 0
+            var lastPTS: CMTime?
+            
+            // ── Spatial validation state ──
+            var validationCenter: CGPoint? = nil
+            var validationRadius: CGFloat = 0
+            var missedStreak: Int = 0
+            let baseRadius: CGFloat = 0.08
+            let expansionRate: CGFloat = 1.10
+            let maxRadius: CGFloat = 0.5
+            // Scale with FPS: ~0.5s of real time before resetting
+            let maxMissedBeforeReset: Int = max(60, Int(actualFPS / 2))
+            var rejectedCount = 0
+            
+            // ── Adaptive confidence threshold ──
+            let userThreshold = self.settings.ballConfidenceThreshold
+            let trackedFloor: Float = 0.25
+            // Scale with FPS: ramp back to user threshold over ~0.25s of real time
+            let rampFrames: Int = max(30, Int(actualFPS / 4))
+            
+            // ── VNTrackObjectRequest state ──
+            // VNSequenceRequestHandler maintains internal state between frames
+            // for the tracker. It must be fed every frame in order.
+            let sequenceHandler = VNSequenceRequestHandler()
+            var lastTrackedObservation: VNDetectedObjectObservation? = nil
+            let trackerConfidenceFloor: Float = 0.3  // Below this, stop trusting the tracker
+            // Scale max tracker frames with FPS: ~1 second of real time.
+            // At 30fps = 30 frames, at 240fps = 240 frames.
+            let maxTrackerFrames: Int = max(30, Int(actualFPS))
+            var trackerConsecutiveFrames: Int = 0
+            
+            // ── Pitch-end detection ──
+            // Detects when the ball has been hit (sharp direction reversal) or
+            // is rolling (sustained horizontal movement near frame bottom).
+            // Once triggered, new detections still feed the spatial filter &
+            // tracker, but are NOT appended to the visible trail.
+            var pitchEnded = false
+            var recentPositions: [CGPoint] = []    // Sliding window of last N accepted positions
+            let directionWindowSize = 5            // Points needed to establish direction
+            let reversalAngleThreshold: CGFloat = 90.0  // Degrees — direction change > this = pitch over
+            var pitchEndFrame: Int = 0
+            
+            print("========================================")
+            print("🎬 STARTING VIDEO EXPORT WITH DETECTION LOGGING")
+            print("Video FPS: \(String(format: "%.1f", actualFPS))")
+            print("Detection mode: full-frame CoreML + VNTrackObjectRequest fallback")
+            print("Ball Confidence Threshold: \(userThreshold) (adaptive: \(trackedFloor) → \(userThreshold) over \(rampFrames) missed frames)")
+            print("Tracker config: confidence floor=\(trackerConfidenceFloor), max consecutive=\(maxTrackerFrames)")
+            print("========================================")
+            
+            while reader.status == .reading {
+                guard let sampleBuffer = readerOutput.copyNextSampleBuffer(),
+                      let px = CMSampleBufferGetImageBuffer(sampleBuffer) else { break }
+
+                autoreleasepool {
+                    exportFrameCount += 1
+                    
+                    let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+                    self.lastFrameTime = pts
+                    
+                    var frameDeltaInfo = ""
+                    if let last = lastPTS {
+                        let delta = CMTimeGetSeconds(CMTimeSubtract(pts, last))
+                        let instantFPS = delta > 0 ? 1.0 / delta : 0
+                        frameDeltaInfo = String(format: " [Δ=%.4fs, %.1ffps]", delta, instantFPS)
+                    }
+                    lastPTS = pts
+                    
+                    // Adaptive threshold
+                    let effectiveThreshold: Float
+                    if validationCenter != nil && missedStreak < maxMissedBeforeReset {
+                        let t = Float(min(missedStreak, rampFrames)) / Float(rampFrames)
+                        effectiveThreshold = trackedFloor + (userThreshold - trackedFloor) * t
+                    } else {
+                        effectiveThreshold = userThreshold
+                    }
+                    
+                    // ── Phase 1: CoreML Detection (full-frame) ──
+                    let req = VNCoreMLRequest(model: self.visionModel)
+                    let handler = VNImageRequestHandler(cvPixelBuffer: px, orientation: videoOrientation, options: [:])
+                
+                    var allRequests: [VNRequest] = []
+                    if self.settings.ballDetectionEnabled {
+                        allRequests.append(req)
+                    }
+                    if self.settings.poseEstimationEnabled, let poseReq = self.poseRequest {
+                        allRequests.append(poseReq)
+                    }
+                    
+                    var results: [VNRecognizedObjectObservation] = []
+                    
+                    if !allRequests.isEmpty {
+                        try? handler.perform(allRequests)
+                        results = (req.results as? [VNRecognizedObjectObservation]) ?? []
+                    }
+                    
+                    // Track source of accepted detection for this frame
+                    var detectionSource: String = "none"
+                    var acceptedBBox: CGRect? = nil
+                    
+                    if self.settings.ballDetectionEnabled {
+                        
+                        let rawBaseballResults = results.filter { obs in
+                            guard let label = obs.labels.first else { return false }
+                            return label.identifier == "baseball"
+                        }.sorted { $0.confidence > $1.confidence }
+                        
+                        let baseballDetections = results.filter { obs in
+                            guard let label = obs.labels.first else { return false }
+                            let bbox = obs.boundingBox
+                            let isValidBox = bbox.minX >= -0.1 && bbox.maxX <= 1.1 &&
+                                            bbox.minY >= -0.1 && bbox.maxY <= 1.1 &&
+                                            bbox.width > 0.005 && bbox.width <= 0.5 &&
+                                            bbox.height > 0.005 && bbox.height <= 0.5
+                            return label.identifier == "baseball" &&
+                                   obs.confidence >= effectiveThreshold &&
+                                   isValidBox
+                        }.sorted { $0.confidence > $1.confidence }
+                        
+                        let timestamp = CMTimeGetSeconds(pts)
+                        
+                        // ── Spatial Validation Filter on CoreML results ──
+                        var acceptedDetection: VNRecognizedObjectObservation? = nil
+                        var rejectedByFilter = false
+                        
+                        if let detection = baseballDetections.first {
+                            let detCenter = CGPoint(x: detection.boundingBox.midX,
+                                                    y: detection.boundingBox.midY)
+                            
+                            if let vc = validationCenter, missedStreak < maxMissedBeforeReset {
+                                let dx = detCenter.x - vc.x
+                                let dy = detCenter.y - vc.y
+                                let distance = sqrt(dx * dx + dy * dy)
+                                
+                                if distance <= validationRadius {
+                                    acceptedDetection = detection
+                                } else {
+                                    for alt in baseballDetections.dropFirst() {
+                                        let altCenter = CGPoint(x: alt.boundingBox.midX,
+                                                                y: alt.boundingBox.midY)
+                                        let altDx = altCenter.x - vc.x
+                                        let altDy = altCenter.y - vc.y
+                                        let altDist = sqrt(altDx * altDx + altDy * altDy)
+                                        if altDist <= validationRadius {
+                                            acceptedDetection = alt
+                                            break
+                                        }
+                                    }
+                                    if acceptedDetection == nil {
+                                        rejectedByFilter = true
+                                    }
+                                }
+                            } else {
+                                // No tracking — accept to bootstrap
+                                acceptedDetection = detection
+                            }
+                        }
+                        
+                        if let detection = acceptedDetection {
+                            // ── CoreML accepted ──
+                            detectionCount += 1
+                            let bbox = detection.boundingBox
+                            let detCenter = CGPoint(x: bbox.midX, y: bbox.midY)
+                            let filterInfo = validationCenter != nil
+                                ? String(format: "filter=pass(r=%.3f) thresh=%.3f", validationRadius, effectiveThreshold)
+                                : String(format: "filter=bootstrap thresh=%.3f", effectiveThreshold)
+                            let pitchTag = pitchEnded ? " [PITCH ENDED]" : ""
+                            print("[Export Frame \(exportFrameCount) @ \(String(format: "%.3f", timestamp))s\(frameDeltaInfo)] ✅ COREML: conf=\(String(format: "%.3f", detection.confidence)) bbox=(\(String(format: "%.3f,%.3f %.3fx%.3f", bbox.origin.x, bbox.origin.y, bbox.width, bbox.height))) \(filterInfo) missedStreak=\(missedStreak)\(pitchTag)")
+                            
+                            // Check for direction reversal before adding to trail
+                            if !pitchEnded {
+                                if recentPositions.count >= directionWindowSize {
+                                    let oldDir = self.directionVector(from: recentPositions, endIndex: recentPositions.count - 1, window: directionWindowSize)
+                                    let newDir = CGPoint(x: detCenter.x - recentPositions.last!.x,
+                                                         y: detCenter.y - recentPositions.last!.y)
+                                    let angle = self.angleBetween(oldDir, newDir)
+                                    if angle > reversalAngleThreshold {
+                                        pitchEnded = true
+                                        pitchEndFrame = exportFrameCount
+                                        print("⚡️ PITCH END DETECTED at frame \(exportFrameCount) — direction reversal \(String(format: "%.1f", angle))° > \(String(format: "%.0f", reversalAngleThreshold))° threshold")
+                                    }
+                                }
+                            }
+                            
+                            if !pitchEnded {
+                                self.detectionMarkers.append(detCenter)
+                                recentPositions.append(detCenter)
+                                if recentPositions.count > directionWindowSize * 3 {
+                                    recentPositions.removeFirst(recentPositions.count - directionWindowSize * 3)
+                                }
+                            }
+                            
+                            validationCenter = detCenter
+                            validationRadius = baseRadius
+                            missedStreak = 0
+                            acceptedBBox = bbox
+                            detectionSource = "coreml"
+                            
+                            // Seed the tracker with this detection for future fallback.
+                            // VNDetectedObjectObservation is what VNTrackObjectRequest expects.
+                            lastTrackedObservation = VNDetectedObjectObservation(boundingBox: bbox)
+                            trackerConsecutiveFrames = 0
+                            
+                        } else {
+                            // ── CoreML failed — try VNTrackObjectRequest fallback ──
+                            var trackerSucceeded = false
+                            
+                            if let trackedObs = lastTrackedObservation,
+                               trackerConsecutiveFrames < maxTrackerFrames {
+                                
+                                let trackRequest = VNTrackObjectRequest(detectedObjectObservation: trackedObs)
+                                trackRequest.trackingLevel = .accurate
+                                
+                                do {
+                                    try sequenceHandler.perform([trackRequest], on: px, orientation: videoOrientation)
+                                    
+                                    if let trackerResult = trackRequest.results?.first as? VNDetectedObjectObservation,
+                                       trackerResult.confidence >= trackerConfidenceFloor {
+                                        
+                                        let tBBox = trackerResult.boundingBox
+                                        let tCenter = CGPoint(x: tBBox.midX, y: tBBox.midY)
+                                        
+                                        // Validate tracker result against spatial filter too
+                                        var trackerPassesSpatial = true
+                                        if let vc = validationCenter, missedStreak < maxMissedBeforeReset {
+                                            let dx = tCenter.x - vc.x
+                                            let dy = tCenter.y - vc.y
+                                            let dist = sqrt(dx * dx + dy * dy)
+                                            // Use a larger radius for tracker — it's less precise
+                                            trackerPassesSpatial = dist <= validationRadius * 1.5
+                                        }
+                                        
+                                        if trackerPassesSpatial {
+                                            trackerCount += 1
+                                            trackerConsecutiveFrames += 1
+                                            
+                                            let pitchTag = pitchEnded ? " [PITCH ENDED]" : ""
+                                            print("[Export Frame \(exportFrameCount) @ \(String(format: "%.3f", timestamp))s\(frameDeltaInfo)] 🔍 TRACKER: conf=\(String(format: "%.3f", trackerResult.confidence)) bbox=(\(String(format: "%.3f,%.3f %.3fx%.3f", tBBox.origin.x, tBBox.origin.y, tBBox.width, tBBox.height))) consecutive=\(trackerConsecutiveFrames)/\(maxTrackerFrames) missedStreak=\(missedStreak)\(pitchTag)")
+                                            
+                                            // Check for direction reversal
+                                            if !pitchEnded {
+                                                if recentPositions.count >= directionWindowSize {
+                                                    let oldDir = self.directionVector(from: recentPositions, endIndex: recentPositions.count - 1, window: directionWindowSize)
+                                                    let newDir = CGPoint(x: tCenter.x - recentPositions.last!.x,
+                                                                         y: tCenter.y - recentPositions.last!.y)
+                                                    let angle = self.angleBetween(oldDir, newDir)
+                                                    if angle > reversalAngleThreshold {
+                                                        pitchEnded = true
+                                                        pitchEndFrame = exportFrameCount
+                                                        print("⚡️ PITCH END DETECTED at frame \(exportFrameCount) — direction reversal \(String(format: "%.1f", angle))° > \(String(format: "%.0f", reversalAngleThreshold))° threshold")
+                                                    }
+                                                }
+                                            }
+                                            
+                                            if !pitchEnded {
+                                                self.detectionMarkers.append(tCenter)
+                                                recentPositions.append(tCenter)
+                                                if recentPositions.count > directionWindowSize * 3 {
+                                                    recentPositions.removeFirst(recentPositions.count - directionWindowSize * 3)
+                                                }
+                                            }
+                                            
+                                            validationCenter = tCenter
+                                            validationRadius = baseRadius
+                                            missedStreak = 0
+                                            acceptedBBox = tBBox
+                                            detectionSource = "tracker"
+                                            
+                                            // Feed result back as input for next frame's tracking
+                                            lastTrackedObservation = trackerResult
+                                            trackerSucceeded = true
+                                        } else {
+                                            print("[Export Frame \(exportFrameCount) @ \(String(format: "%.3f", timestamp))s\(frameDeltaInfo)] 🔍 TRACKER rejected by spatial filter: conf=\(String(format: "%.3f", trackerResult.confidence)) bbox=(\(String(format: "%.3f,%.3f %.3fx%.3f", tBBox.origin.x, tBBox.origin.y, tBBox.width, tBBox.height)))")
+                                            // Tracker drifted — kill it
+                                            lastTrackedObservation = nil
+                                            trackerConsecutiveFrames = 0
+                                        }
+                                    } else {
+                                        let conf = (trackRequest.results?.first as? VNDetectedObjectObservation)?.confidence ?? 0
+                                        print("[Export Frame \(exportFrameCount) @ \(String(format: "%.3f", timestamp))s\(frameDeltaInfo)] 🔍 TRACKER low confidence: \(String(format: "%.3f", conf)) < \(trackerConfidenceFloor)")
+                                        lastTrackedObservation = nil
+                                        trackerConsecutiveFrames = 0
+                                    }
+                                } catch {
+                                    print("[Export Frame \(exportFrameCount)] 🔍 TRACKER error: \(error.localizedDescription)")
+                                    lastTrackedObservation = nil
+                                    trackerConsecutiveFrames = 0
+                                }
+                            }
+                            
+                            if !trackerSucceeded {
+                                // ── Both CoreML and tracker failed ──
+                                missedFrameCount += 1
+                                missedStreak += 1
+                                
+                                if validationCenter != nil && missedStreak < maxMissedBeforeReset {
+                                    validationRadius = min(validationRadius * expansionRate, maxRadius)
+                                    if validationRadius >= maxRadius {
+                                        validationCenter = nil
+                                        missedStreak = maxMissedBeforeReset
+                                        lastTrackedObservation = nil
+                                        trackerConsecutiveFrames = 0
+                                        // Reset pitch-end for next pitch
+                                        if pitchEnded {
+                                            print("🔄 Tracking reset — pitch-end cleared, ready for next pitch")
+                                        }
+                                        pitchEnded = false
+                                        recentPositions.removeAll()
+                                    }
+                                }
+                                
+                                var reason = "no results"
+                                if rejectedByFilter, let best = baseballDetections.first {
+                                    let bbox = best.boundingBox
+                                    let detCenter = CGPoint(x: bbox.midX, y: bbox.midY)
+                                    let dx = detCenter.x - (validationCenter?.x ?? 0)
+                                    let dy = detCenter.y - (validationCenter?.y ?? 0)
+                                    let dist = sqrt(dx * dx + dy * dy)
+                                    reason = String(format: "REJECTED by spatial filter: dist=%.3f > radius=%.3f conf=%.3f bbox=(%.3f,%.3f %.3fx%.3f)",
+                                                    dist, validationRadius, best.confidence,
+                                                    bbox.origin.x, bbox.origin.y, bbox.width, bbox.height)
+                                    rejectedCount += 1
+                                } else if !rawBaseballResults.isEmpty {
+                                    let best = rawBaseballResults.first!
+                                    let bbox = best.boundingBox
+                                    let isValidBox = bbox.minX >= -0.1 && bbox.maxX <= 1.1 &&
+                                                    bbox.minY >= -0.1 && bbox.maxY <= 1.1 &&
+                                                    bbox.width > 0.005 && bbox.width <= 0.5 &&
+                                                    bbox.height > 0.005 && bbox.height <= 0.5
+                                    if best.confidence < effectiveThreshold {
+                                        reason = String(format: "conf=%.3f < threshold=%.3f", best.confidence, effectiveThreshold)
+                                    } else if !isValidBox {
+                                        reason = String(format: "invalid bbox=(%.3f,%.3f %.3fx%.3f)", bbox.origin.x, bbox.origin.y, bbox.width, bbox.height)
+                                    } else {
+                                        reason = "filtered out (unknown)"
+                                    }
+                                    reason += String(format: " best=(%.3f,%.3f %.3fx%.3f conf=%.3f)", bbox.origin.x, bbox.origin.y, bbox.width, bbox.height, best.confidence)
+                                }
+                                
+                                let filterInfo = validationCenter != nil
+                                    ? String(format: "filter(r=%.3f) thresh=%.3f", validationRadius, effectiveThreshold)
+                                    : String(format: "filter=none thresh=%.3f", effectiveThreshold)
+                                print("[Export Frame \(exportFrameCount) @ \(String(format: "%.3f", timestamp))s\(frameDeltaInfo)] ❌ MISSED: \(reason) \(filterInfo) missedStreak=\(missedStreak)")
+                            }
+                        }
+                        
+                        if self.detectionMarkers.count > 1000 {
+                            self.detectionMarkers.removeFirst(self.detectionMarkers.count - 1000)
+                        }
+                    }
+
+                    while !writerInput.isReadyForMoreMediaData {
+                        Thread.sleep(forTimeInterval: 0.001)
+                    }
+                    if let annotated = self.makeAnnotatedPixelBuffer(
+                        from: px, observations: results, pool: adaptor.pixelBufferPool,
+                        validationCenter: validationCenter, validationRadius: validationRadius,
+                        missedStreak: missedStreak, effectiveThreshold: effectiveThreshold,
+                        trackerBBox: detectionSource == "tracker" ? acceptedBBox : nil,
+                        videoOrientation: videoOrientation
+                    ) {
+                        _ = adaptor.append(annotated, withPresentationTime: pts)
+                    } else if videoOrientation == .up {
+                        // Landscape — raw buffer matches writer dimensions
+                        _ = adaptor.append(px, withPresentationTime: pts)
+                    }
+                    // For rotated video, skip frame if annotation fails (rare)
+                }
+            }
+
+            let totalDetections = detectionCount + trackerCount
+            print("========================================")
+            print("🎬 EXPORT COMPLETE")
+            print("Video FPS: \(String(format: "%.1f", actualFPS))")
+            print("Total Frames: \(exportFrameCount)")
+            print("CoreML Detections: \(detectionCount)")
+            print("Tracker Detections: \(trackerCount)")
+            print("Total Detections: \(totalDetections)")
+            print("Missed Frames: \(missedFrameCount)")
+            print("Rejected (false positives): \(rejectedCount)")
+            print("Pitch end detected: \(pitchEnded ? "frame \(pitchEndFrame)" : "no")")
+            print("Trail points: \(self.detectionMarkers.count)")
+            print("Detection Rate: \(String(format: "%.1f", Double(totalDetections) / Double(max(exportFrameCount, 1)) * 100))% (CoreML: \(String(format: "%.1f", Double(detectionCount) / Double(max(exportFrameCount, 1)) * 100))% + Tracker: \(String(format: "%.1f", Double(trackerCount) / Double(max(exportFrameCount, 1)) * 100))%)")
+            print("Mode: full-frame CoreML + VNTrackObjectRequest fallback + spatial validation + adaptive threshold + pitch-end detection")
+            print("========================================")
+
+            writerInput.markAsFinished()
+            await writer.finishWriting()
+            await self.saveAndShowExportCompletion(outputURL: outputURL)
+
+        } catch { print("Error exporting annotated video: \(error)") }
+    }
+    
+    // MARK: - Pitch-End Detection Helpers
+    
+    /// Compute average direction vector from the last `window` points ending at `endIndex`
+    private func directionVector(from points: [CGPoint], endIndex: Int, window: Int) -> CGPoint {
+        let startIdx = max(0, endIndex - window + 1)
+        guard startIdx < endIndex else { return .zero }
+        var dx: CGFloat = 0
+        var dy: CGFloat = 0
+        for i in startIdx..<endIndex {
+            dx += points[i + 1].x - points[i].x
+            dy += points[i + 1].y - points[i].y
+        }
+        let count = CGFloat(endIndex - startIdx)
+        return CGPoint(x: dx / count, y: dy / count)
+    }
+    
+    /// Angle in degrees between two direction vectors (0-180)
+    private func angleBetween(_ v1: CGPoint, _ v2: CGPoint) -> CGFloat {
+        let mag1 = sqrt(v1.x * v1.x + v1.y * v1.y)
+        let mag2 = sqrt(v2.x * v2.x + v2.y * v2.y)
+        guard mag1 > 1e-9 && mag2 > 1e-9 else { return 0 }
+        let dot = v1.x * v2.x + v1.y * v2.y
+        let cosAngle = max(-1, min(1, dot / (mag1 * mag2)))
+        return acos(cosAngle) * 180.0 / .pi
+    }
+    
+    // MARK: - Save to Photos and Show Completion
+
+    @MainActor
+    func saveAndShowExportCompletion(outputURL: URL) async {
+        await withCheckedContinuation { continuation in
+            self.ensurePhotoLibraryPermission { granted in
+                
+                Task { @MainActor in
+                    guard granted else {
+                        self.onVideoSaved?("")
+                        let alert = UIAlertController(title: "Photos Access Denied",
+                                                      message: "Annotated video exported to a temporary file, but app does not have permission to save to Photos. Please enable Photos access in Settings.",
+                                                      preferredStyle: .alert)
+                        alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in
+                            self.hideProcessingOverlay()
+                            self.dismiss(animated: true)
+                        })
+                        self.topMostViewController().present(alert, animated: true)
+                        continuation.resume()
+                        return
+                    }
+                    
+                    func saveToPhotos(_ url: URL) async -> String? {
+                        return await withCheckedContinuation { saveCont in
+                            var localId: String?
+                            PHPhotoLibrary.shared().performChanges({
+                                if let placeholder = PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)?.placeholderForCreatedAsset {
+                                    localId = placeholder.localIdentifier
+                                }
+                            }) { _, _ in
+                                saveCont.resume(returning: localId)
+                            }
+                        }
+                    }
+                    
+                    if self.settings.exportCleanVideo, let rawURL = self.currentRawVideoURL {
+                        self.updateProcessingMessage("Saving clean video…")
+                        let cleanId = await saveToPhotos(rawURL)
+                        if cleanId != nil {
+                            print("[Export] Clean video saved (id: \(cleanId!))")
+                        } else {
+                            print("[Export] WARNING: Clean video save returned nil identifier")
+                        }
+                    }
+                    
+                    self.updateProcessingMessage("Saving annotated video…")
+                    let annotatedId = await saveToPhotos(outputURL)
+                    
+                    self.currentRawVideoURL = nil
+                    
+                    if let id = annotatedId {
+                        self.onVideoSaved?(id)
+                        let message = self.settings.exportCleanVideo
+                            ? "Both the annotated and clean videos have been saved to Photos."
+                            : "Annotated video saved to Photos."
+                        let alert = UIAlertController(title: "Success",
+                                                      message: message,
+                                                      preferredStyle: .alert)
+                        alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in
+                            self.hideProcessingOverlay()
+                            self.dismiss(animated: true)
+                        })
+                        self.topMostViewController().present(alert, animated: true)
+                    } else {
+                        self.onVideoSaved?("")
+                        let alert = UIAlertController(title: "Save Failed",
+                                                      message: "Could not save video to Photos. Please check permissions or available space.",
+                                                      preferredStyle: .alert)
+                        alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in
+                            self.hideProcessingOverlay()
+                            self.dismiss(animated: true)
+                        })
+                        self.topMostViewController().present(alert, animated: true)
+                    }
+                    continuation.resume()
+                }
+            }
+        }
+    }
+
+    // MARK: - Annotation Renderer
+    func makeAnnotatedPixelBuffer(from pixelBuffer: CVPixelBuffer,
+                                  observations: [VNRecognizedObjectObservation],
+                                  pool: CVPixelBufferPool?,
+                                  validationCenter: CGPoint? = nil,
+                                  validationRadius: CGFloat = 0,
+                                  missedStreak: Int = 0,
+                                  effectiveThreshold: Float? = nil,
+                                  trackerBBox: CGRect? = nil,
+                                  videoOrientation: CGImagePropertyOrientation = .up) -> CVPixelBuffer? {
+        guard let pool = pool else { return nil }
+
+        var outPixelBuffer: CVPixelBuffer?
+        let status = CVPixelBufferPoolCreatePixelBuffer(nil, pool, &outPixelBuffer)
+        guard status == kCVReturnSuccess, let output = outPixelBuffer else { return nil }
+
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        CVPixelBufferLockBaseAddress(output, [])
+        defer {
+            CVPixelBufferUnlockBaseAddress(output, [])
+            CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
+        }
+
+        // Output rect matches the writer dimensions (portrait-aware)
+        let rect = CGRect(x: 0, y: 0,
+                          width: CVPixelBufferGetWidth(output),
+                          height: CVPixelBufferGetHeight(output))
+
+        UIGraphicsBeginImageContextWithOptions(rect.size, false, 1.0)
+        guard let ctx = UIGraphicsGetCurrentContext() else {
+            UIGraphicsEndImageContext()
+            return output
+        }
+
+        // Draw the source frame with correct orientation.
+        // For portrait video, the raw buffer is landscape; UIImage orientation
+        // tells Core Graphics to rotate it into the portrait output rect.
+        let srcImage = CIImage(cvPixelBuffer: pixelBuffer)
+        let uiOrientation: UIImage.Orientation
+        switch videoOrientation {
+        case .right:        uiOrientation = .right
+        case .left:         uiOrientation = .left
+        case .down:         uiOrientation = .down
+        default:            uiOrientation = .up
+        }
+        let uiImage = UIImage(ciImage: srcImage, scale: 1.0, orientation: uiOrientation)
+        uiImage.draw(in: rect)
+
+        // Strike zone (drawn first so it sits behind all other overlays)
+        if self.settings.isCalibrated && self.settings.showStrikeZone {
+            drawStrikeZoneOnContext(ctx, rect: rect)
+        }
+
+        let baseballDetections = observations.filter { obs in
+            guard let label = obs.labels.first else { return false }
+            return label.identifier == "baseball" && obs.confidence >= self.settings.ballConfidenceThreshold
+        }.sorted { $0.confidence > $1.confidence }
+        
+        // Draw pose skeleton if available
+        if let poseObs = self.lastPoseObservation, self.settings.poseEstimationEnabled {
+            drawPoseOnContext(ctx, poseObs: poseObs, rect: rect)
+        }
+        
+        // Draw ball detection circle + confidence (CoreML) — behind showDetectionMarkers
+        if self.settings.showDetectionMarkers, self.settings.ballDetectionEnabled,
+           let obs = baseballDetections.first, trackerBBox == nil {
+            let bbox = obs.boundingBox
+            var x = bbox.origin.x * rect.width
+            var y = bbox.origin.y * rect.height
+            let w = bbox.width * rect.width
+            let h = bbox.height * rect.height
+            if !contentFlippedVertically { y = rect.height - y - h }
+            if mirrored { x = rect.width - x - w }
+            let drawRect = CGRect(x: x, y: y, width: w, height: h)
+            
+            let centerX = drawRect.midX
+            let centerY = drawRect.midY
+
+            let ballUIColor = settings.ballColor.toUIColor()
+            ctx.setStrokeColor(ballUIColor.cgColor)
+            ctx.setLineWidth(3)
+            ctx.addEllipse(in: drawRect)
+            ctx.strokePath()
+            
+            if settings.showLabels {
+                let confidenceText = String(format: "%.0f%%", obs.confidence * 100)
+                let fontSize: CGFloat = 28
+                let attributes: [NSAttributedString.Key: Any] = [
+                    .font: UIFont.boldSystemFont(ofSize: fontSize),
+                    .foregroundColor: ballUIColor
+                ]
+                ctx.saveGState()
+                ctx.translateBy(x: centerX, y: centerY)
+                ctx.rotate(by: -.pi / 2)
+                let textSize = confidenceText.size(withAttributes: attributes)
+                confidenceText.draw(at: CGPoint(x: -textSize.width / 2, y: -textSize.height / 2),
+                                   withAttributes: attributes)
+                ctx.restoreGState()
+            }
+        }
+        
+        // Draw tracker-provided detection circle — behind showDetectionMarkers
+        if self.settings.showDetectionMarkers, let tBBox = trackerBBox {
+            var x = tBBox.origin.x * rect.width
+            var y = tBBox.origin.y * rect.height
+            let w = tBBox.width * rect.width
+            let h = tBBox.height * rect.height
+            if !contentFlippedVertically { y = rect.height - y - h }
+            if mirrored { x = rect.width - x - w }
+            let drawRect = CGRect(x: x, y: y, width: w, height: h)
+            
+            let trackerColor = UIColor.orange
+            ctx.setStrokeColor(trackerColor.cgColor)
+            ctx.setLineWidth(3)
+            ctx.setLineDash(phase: 0, lengths: [6, 3])
+            ctx.addEllipse(in: drawRect)
+            ctx.strokePath()
+            ctx.setLineDash(phase: 0, lengths: [])
+            
+            if settings.showLabels {
+                let label = "TRACK"
+                let fontSize: CGFloat = 22
+                let attributes: [NSAttributedString.Key: Any] = [
+                    .font: UIFont.boldSystemFont(ofSize: fontSize),
+                    .foregroundColor: trackerColor
+                ]
+                ctx.saveGState()
+                ctx.translateBy(x: drawRect.midX, y: drawRect.midY)
+                ctx.rotate(by: -.pi / 2)
+                let textSize = label.size(withAttributes: attributes)
+                label.draw(at: CGPoint(x: -textSize.width / 2, y: -textSize.height / 2),
+                          withAttributes: attributes)
+                ctx.restoreGState()
+            }
+        }
+        
+        // Trajectory trail with fade + lightweight moving average
+        // Moving average (window=5) removes per-frame jitter without fighting
+        // real physics like gravity curves and bounces.
+        if self.detectionMarkers.count >= 2 {
+            let raw = self.detectionMarkers
+            let window = 5
+            var smoothed: [CGPoint] = []
+            smoothed.reserveCapacity(raw.count)
+            
+            for i in 0..<raw.count {
+                let halfW = window / 2
+                let lo = max(0, i - halfW)
+                let hi = min(raw.count - 1, i + halfW)
+                let count = CGFloat(hi - lo + 1)
+                var sx: CGFloat = 0
+                var sy: CGFloat = 0
+                for j in lo...hi {
+                    sx += raw[j].x
+                    sy += raw[j].y
+                }
+                smoothed.append(CGPoint(x: sx / count, y: sy / count))
+            }
+            
+            let totalSegments = smoothed.count - 1
+            let trajectoryUIColor = settings.trajectoryColor.toUIColor()
+            
+            for i in 0..<totalSegments {
+                let progress = CGFloat(i) / CGFloat(max(totalSegments - 1, 1))
+                let alpha = 0.05 + progress * 0.55
+                
+                var x0 = smoothed[i].x * rect.width
+                var y0 = smoothed[i].y * rect.height
+                if !contentFlippedVertically { y0 = rect.height - y0 }
+                if mirrored { x0 = rect.width - x0 }
+                
+                var x1 = smoothed[i + 1].x * rect.width
+                var y1 = smoothed[i + 1].y * rect.height
+                if !contentFlippedVertically { y1 = rect.height - y1 }
+                if mirrored { x1 = rect.width - x1 }
+                
+                ctx.setStrokeColor(trajectoryUIColor.withAlphaComponent(alpha).cgColor)
+                ctx.setLineWidth(25)
+                ctx.setLineCap(.round)
+                ctx.move(to: CGPoint(x: x0, y: y0))
+                ctx.addLine(to: CGPoint(x: x1, y: y1))
+                ctx.strokePath()
+            }
+        }
+        
+        // Detection marker dots (optional — off by default)
+        if self.settings.showDetectionMarkers && !self.detectionMarkers.isEmpty {
+            for normCenter in self.detectionMarkers {
+                var cx = normCenter.x * rect.width
+                var cy = normCenter.y * rect.height
+                if !contentFlippedVertically { cy = rect.height - cy }
+                if mirrored { cx = rect.width - cx }
+                let markerSize: CGFloat = 12
+                let markerRect = CGRect(x: cx - markerSize/2, y: cy - markerSize/2,
+                                        width: markerSize, height: markerSize)
+                let ballUIColor = settings.ballColor.toUIColor()
+                ctx.setFillColor(ballUIColor.cgColor)
+                ctx.fillEllipse(in: markerRect)
+                ctx.setStrokeColor(UIColor.white.withAlphaComponent(0.8).cgColor)
+                ctx.setLineWidth(2)
+                ctx.strokeEllipse(in: markerRect)
+            }
+        }
+        
+        // ROI box if enabled (live recording)
+        if self.settings.showROI, let roi = self.currentROI, self.settings.enableROI {
+            var roiX = roi.origin.x * rect.width
+            var roiY = roi.origin.y * rect.height
+            let roiW = roi.width * rect.width
+            let roiH = roi.height * rect.height
+            if !contentFlippedVertically { roiY = rect.height - roiY - roiH }
+            if mirrored { roiX = rect.width - roiX - roiW }
+            let roiRect = CGRect(x: roiX, y: roiY, width: roiW, height: roiH)
+            
+            ctx.setFillColor(UIColor.yellow.withAlphaComponent(0.1).cgColor)
+            ctx.fill(roiRect)
+            ctx.setStrokeColor(UIColor.yellow.withAlphaComponent(0.8).cgColor)
+            ctx.setLineWidth(3)
+            ctx.setLineDash(phase: 0, lengths: [10, 5])
+            ctx.stroke(roiRect)
+            ctx.setLineDash(phase: 0, lengths: [])
+            
+            let roiLabel = "ROI (missed: \(self.framesWithoutDetection))"
+            let labelAttributes: [NSAttributedString.Key: Any] = [
+                .font: UIFont.boldSystemFont(ofSize: 14),
+                .foregroundColor: UIColor.white
+            ]
+            let labelSize = roiLabel.size(withAttributes: labelAttributes)
+            let labelPadding: CGFloat = 4
+            let labelBgRect = CGRect(x: roiRect.minX, y: roiRect.minY - labelSize.height - labelPadding * 2 - 2,
+                                     width: labelSize.width + labelPadding * 2, height: labelSize.height + labelPadding * 2)
+            ctx.setFillColor(UIColor.yellow.withAlphaComponent(0.8).cgColor)
+            ctx.fill(labelBgRect)
+            roiLabel.draw(at: CGPoint(x: labelBgRect.minX + labelPadding, y: labelBgRect.minY + labelPadding),
+                         withAttributes: labelAttributes)
+        }
+        
+        // Spatial validation region (export tracking visualisation)
+        if let vc = validationCenter, self.settings.showROI {
+            var cx = vc.x * rect.width
+            var cy = vc.y * rect.height
+            if !contentFlippedVertically { cy = rect.height - cy }
+            if mirrored { cx = rect.width - cx }
+            
+            let pixelRadius = validationRadius * ((rect.width + rect.height) / 2.0)
+            
+            let circleRect = CGRect(x: cx - pixelRadius, y: cy - pixelRadius,
+                                     width: pixelRadius * 2, height: pixelRadius * 2)
+            
+            ctx.setFillColor(UIColor.cyan.withAlphaComponent(0.06).cgColor)
+            ctx.fillEllipse(in: circleRect)
+            
+            ctx.setStrokeColor(UIColor.cyan.withAlphaComponent(0.8).cgColor)
+            ctx.setLineWidth(2)
+            ctx.setLineDash(phase: 0, lengths: [8, 4])
+            ctx.strokeEllipse(in: circleRect)
+            ctx.setLineDash(phase: 0, lengths: [])
+            
+            let crossSize: CGFloat = 6
+            ctx.setStrokeColor(UIColor.cyan.withAlphaComponent(0.6).cgColor)
+            ctx.setLineWidth(1)
+            ctx.move(to: CGPoint(x: cx - crossSize, y: cy))
+            ctx.addLine(to: CGPoint(x: cx + crossSize, y: cy))
+            ctx.move(to: CGPoint(x: cx, y: cy - crossSize))
+            ctx.addLine(to: CGPoint(x: cx, y: cy + crossSize))
+            ctx.strokePath()
+            
+            let threshStr = effectiveThreshold != nil ? String(format: " conf≥%.0f%%", effectiveThreshold! * 100) : ""
+            let filterLabel = missedStreak > 0
+                ? "Tracking (missed: \(missedStreak))\(threshStr)"
+                : "Tracking\(threshStr)"
+            let filterAttributes: [NSAttributedString.Key: Any] = [
+                .font: UIFont.boldSystemFont(ofSize: 14),
+                .foregroundColor: UIColor.white
+            ]
+            let filterLabelSize = filterLabel.size(withAttributes: filterAttributes)
+            let filterPadding: CGFloat = 4
+            let filterBgRect = CGRect(
+                x: cx - filterLabelSize.width / 2 - filterPadding,
+                y: circleRect.minY - filterLabelSize.height - filterPadding * 2 - 4,
+                width: filterLabelSize.width + filterPadding * 2,
+                height: filterLabelSize.height + filterPadding * 2
+            )
+            ctx.setFillColor(UIColor.cyan.withAlphaComponent(0.8).cgColor)
+            ctx.fill(filterBgRect)
+            filterLabel.draw(
+                at: CGPoint(x: filterBgRect.minX + filterPadding, y: filterBgRect.minY + filterPadding),
+                withAttributes: filterAttributes
+            )
+        }
+        
+        let composed = UIGraphicsGetImageFromCurrentImageContext()
+        UIGraphicsEndImageContext()
+
+        if let composed = composed, let cgImage = composed.cgImage {
+            let ci = CIImage(cgImage: cgImage)
+            ciContext.render(ci, to: output)
+        }
+
+        return output
+    }
+    
+    // MARK: - Draw Pose on CGContext
+    func drawPoseOnContext(_ ctx: CGContext, poseObs: VNHumanBodyPoseObservation, rect: CGRect) {
+        guard let recognizedPoints = try? poseObs.recognizedPoints(.all) else { return }
+        
+        let connections: [(VNHumanBodyPoseObservation.JointName, VNHumanBodyPoseObservation.JointName)] = [
+            (.neck, .rightShoulder), (.neck, .leftShoulder),
+            (.rightShoulder, .rightHip), (.leftShoulder, .leftHip),
+            (.rightHip, .leftHip),
+            (.rightShoulder, .rightElbow), (.rightElbow, .rightWrist),
+            (.leftShoulder, .leftElbow), (.leftElbow, .leftWrist),
+            (.rightHip, .rightKnee), (.rightKnee, .rightAnkle),
+            (.leftHip, .leftKnee), (.leftKnee, .leftAnkle)
+        ]
+        
+        func convertPt(_ normPt: CGPoint) -> CGPoint {
+            var x = normPt.x * rect.width
+            var y = normPt.y * rect.height
+            if !contentFlippedVertically { y = rect.height - y }
+            if mirrored { x = rect.width - x }
+            return CGPoint(x: x, y: y)
+        }
+        
+        let skeletonUIColor = settings.skeletonColor.toUIColor()
+        ctx.setStrokeColor(skeletonUIColor.cgColor)
+        ctx.setLineWidth(3)
+        ctx.setLineCap(.round)
+        
+        for (startJoint, endJoint) in connections {
+            guard let startPoint = recognizedPoints[startJoint],
+                  let endPoint = recognizedPoints[endJoint],
+                  startPoint.confidence > settings.poseConfidenceThreshold,
+                  endPoint.confidence > settings.poseConfidenceThreshold else { continue }
+            let start = convertPt(startPoint.location)
+            let end = convertPt(endPoint.location)
+            ctx.move(to: start)
+            ctx.addLine(to: end)
+        }
+        ctx.strokePath()
+        
+        let jointUIColor = settings.jointColor.toUIColor()
+        for (_, point) in recognizedPoints {
+            guard point.confidence > settings.poseConfidenceThreshold else { continue }
+            let pt = convertPt(point.location)
+            let jointSize: CGFloat = 8
+            let jointRect = CGRect(x: pt.x - jointSize/2, y: pt.y - jointSize/2, width: jointSize, height: jointSize)
+            ctx.setFillColor(jointUIColor.cgColor)
+            ctx.fillEllipse(in: jointRect)
+            ctx.setStrokeColor(UIColor.white.cgColor)
+            ctx.setLineWidth(2)
+            ctx.strokeEllipse(in: jointRect)
+        }
+        
+        if settings.showLabels {
+            drawJointAnglesOnContext(ctx, poseObs: poseObs, rect: rect, recognizedPoints: recognizedPoints, convertPt: convertPt)
+        }
+    }
+    
+    // MARK: - Draw Joint Angles on CGContext
+    func drawJointAnglesOnContext(_ ctx: CGContext, poseObs: VNHumanBodyPoseObservation,
+                                  rect: CGRect, recognizedPoints: [VNHumanBodyPoseObservation.JointName: VNRecognizedPoint],
+                                  convertPt: (CGPoint) -> CGPoint) {
+        let t = settings.poseConfidenceThreshold
+        let elbowColor = settings.elbowAngleColor.toUIColor()
+        let kneeColor = settings.kneeAngleColor.toUIColor()
+        let shoulderColor = settings.shoulderAngleColor.toUIColor()
+        
+        if let rS = recognizedPoints[.rightShoulder], let rE = recognizedPoints[.rightElbow], let rW = recognizedPoints[.rightWrist],
+           rS.confidence > t, rE.confidence > t, rW.confidence > t {
+            let (s, e, w) = (convertPt(rS.location), convertPt(rE.location), convertPt(rW.location))
+            drawAngleOnContext(ctx, at: e, from: s, to: w, angle: calculateJointAngle(proximal: s, joint: e, distal: w), label: "R Elbow", color: elbowColor)
+        }
+        if let lS = recognizedPoints[.leftShoulder], let lE = recognizedPoints[.leftElbow], let lW = recognizedPoints[.leftWrist],
+           lS.confidence > t, lE.confidence > t, lW.confidence > t {
+            let (s, e, w) = (convertPt(lS.location), convertPt(lE.location), convertPt(lW.location))
+            drawAngleOnContext(ctx, at: e, from: s, to: w, angle: calculateJointAngle(proximal: s, joint: e, distal: w), label: "L Elbow", color: elbowColor)
+        }
+        if let rH = recognizedPoints[.rightHip], let rK = recognizedPoints[.rightKnee], let rA = recognizedPoints[.rightAnkle],
+           rH.confidence > t, rK.confidence > t, rA.confidence > t {
+            let (h, k, a) = (convertPt(rH.location), convertPt(rK.location), convertPt(rA.location))
+            drawAngleOnContext(ctx, at: k, from: h, to: a, angle: calculateJointAngle(proximal: h, joint: k, distal: a), label: "R Knee", color: kneeColor)
+        }
+        if let lH = recognizedPoints[.leftHip], let lK = recognizedPoints[.leftKnee], let lA = recognizedPoints[.leftAnkle],
+           lH.confidence > t, lK.confidence > t, lA.confidence > t {
+            let (h, k, a) = (convertPt(lH.location), convertPt(lK.location), convertPt(lA.location))
+            drawAngleOnContext(ctx, at: k, from: h, to: a, angle: calculateJointAngle(proximal: h, joint: k, distal: a), label: "L Knee", color: kneeColor)
+        }
+        if let rH = recognizedPoints[.rightHip], let rS = recognizedPoints[.rightShoulder], let rE = recognizedPoints[.rightElbow],
+           rH.confidence > t, rS.confidence > t, rE.confidence > t {
+            let (h, s, e) = (convertPt(rH.location), convertPt(rS.location), convertPt(rE.location))
+            drawAngleOnContext(ctx, at: s, from: h, to: e, angle: calculateJointAngle(proximal: h, joint: s, distal: e), label: "R Shoulder", color: shoulderColor)
+        }
+        if let lH = recognizedPoints[.leftHip], let lS = recognizedPoints[.leftShoulder], let lE = recognizedPoints[.leftElbow],
+           lH.confidence > t, lS.confidence > t, lE.confidence > t {
+            let (h, s, e) = (convertPt(lH.location), convertPt(lS.location), convertPt(lE.location))
+            drawAngleOnContext(ctx, at: s, from: h, to: e, angle: calculateJointAngle(proximal: h, joint: s, distal: e), label: "L Shoulder", color: shoulderColor)
+        }
+        
+        // Hip-Shoulder Separation
+        if let lS = recognizedPoints[.leftShoulder], let rS = recognizedPoints[.rightShoulder],
+           let lH = recognizedPoints[.leftHip], let rH = recognizedPoints[.rightHip],
+           lS.confidence > t, rS.confidence > t, lH.confidence > t, rH.confidence > t {
+            let (ls, rs, lh, rh) = (convertPt(lS.location), convertPt(rS.location), convertPt(lH.location), convertPt(rH.location))
+            let sAngle = atan2(rs.y - ls.y, rs.x - ls.x)
+            let hAngle = atan2(rh.y - lh.y, rh.x - lh.x)
+            var sep = abs(sAngle - hAngle) * 180.0 / .pi
+            if sep > 180 { sep = 360 - sep }
+            let center = CGPoint(x: (ls.x + rs.x + lh.x + rh.x) / 4, y: (ls.y + rs.y + lh.y + rh.y) / 4)
+            drawSeparationOnContext(ctx, at: center, angle: sep, label: "Hip-Shoulder Sep")
+        }
+    }
+    
+    // MARK: - Draw Angle on CGContext
+    func drawAngleOnContext(_ ctx: CGContext, at joint: CGPoint, from p1: CGPoint, to p2: CGPoint,
+                            angle: Double, label: String, color: UIColor) {
+        let arcRadius: CGFloat = 30
+        let angle1 = atan2(p1.y - joint.y, p1.x - joint.x)
+        let angle2 = atan2(p2.y - joint.y, p2.x - joint.x)
+        var startAngle = angle1; var endAngle = angle2
+        var angleDiff = endAngle - startAngle
+        if angleDiff > .pi { angleDiff -= 2 * .pi }
+        if angleDiff < -.pi { angleDiff += 2 * .pi }
+        if angleDiff < 0 { swap(&startAngle, &endAngle) }
+        
+        ctx.setStrokeColor(color.cgColor)
+        ctx.setLineWidth(2)
+        ctx.addArc(center: joint, radius: arcRadius, startAngle: startAngle, endAngle: endAngle, clockwise: false)
+        ctx.strokePath()
+        
+        let midAngle = startAngle + (endAngle - startAngle) / 2
+        let labelDistance: CGFloat = arcRadius + 20
+        let labelCenter = CGPoint(x: joint.x + cos(midAngle) * labelDistance, y: joint.y + sin(midAngle) * labelDistance)
+        
+        let text = "\(label) \(Int(angle))°"
+        let attributes: [NSAttributedString.Key: Any] = [.font: UIFont.boldSystemFont(ofSize: 14), .foregroundColor: color]
+        let textSize = text.size(withAttributes: attributes)
+        let padding: CGFloat = 4
+        let bgRect = CGRect(x: labelCenter.x - textSize.width/2 - padding, y: labelCenter.y - textSize.height/2 - padding,
+                           width: textSize.width + padding * 2, height: textSize.height + padding * 2)
+        ctx.setFillColor(UIColor.black.withAlphaComponent(0.6).cgColor)
+        ctx.fill(bgRect)
+        text.draw(at: CGPoint(x: labelCenter.x - textSize.width/2, y: labelCenter.y - textSize.height/2), withAttributes: attributes)
+    }
+    
+    // MARK: - Draw Separation on CGContext
+    func drawSeparationOnContext(_ ctx: CGContext, at center: CGPoint, angle: Double, label: String) {
+        let separationUIColor = settings.separationColor.toUIColor()
+        let text = "\(label) \(Int(angle))°"
+        let attributes: [NSAttributedString.Key: Any] = [.font: UIFont.boldSystemFont(ofSize: 16), .foregroundColor: separationUIColor]
+        let textSize = text.size(withAttributes: attributes)
+        let padding: CGFloat = 6
+        let bgRect = CGRect(x: center.x - textSize.width/2 - padding, y: center.y - textSize.height/2 - padding,
+                           width: textSize.width + padding * 2, height: textSize.height + padding * 2)
+        ctx.setFillColor(UIColor.black.withAlphaComponent(0.7).cgColor)
+        ctx.fill(bgRect)
+        ctx.setStrokeColor(separationUIColor.cgColor)
+        ctx.setLineWidth(2)
+        ctx.stroke(bgRect)
+        text.draw(at: CGPoint(x: center.x - textSize.width/2, y: center.y - textSize.height/2), withAttributes: attributes)
+    }
+
+    // MARK: - Draw Strike Zone on CGContext
+    func drawStrikeZoneOnContext(_ ctx: CGContext, rect: CGRect) {
+        func calibrationPtToContext(_ normPt: CGPoint) -> CGPoint {
+            var x = normPt.x * rect.width
+            let y = normPt.y * rect.height
+            if mirrored { x = rect.width - x }
+            return CGPoint(x: x, y: y)
+        }
+
+        let left  = calibrationPtToContext(settings.plateLeftEdge)
+        let right = calibrationPtToContext(settings.plateRightEdge)
+
+        let plateVec = CGPoint(x: right.x - left.x, y: right.y - left.y)
+        let platePixels = sqrt(plateVec.x * plateVec.x + plateVec.y * plateVec.y)
+        guard platePixels > 1 else { return }
+
+        let plateInches: Double = settings.useCentimeters ? settings.plateWidth / 2.54 : settings.plateWidth
+        let pixelsPerInch = platePixels / CGFloat(plateInches)
+
+        let aboveLeft = calibrationPtToContext(CGPoint(x: settings.plateLeftEdge.x, y: settings.plateLeftEdge.y - 0.01))
+        let upVec = CGPoint(x: aboveLeft.x - left.x, y: aboveLeft.y - left.y)
+        let upLen = sqrt(upVec.x * upVec.x + upVec.y * upVec.y)
+        guard upLen > 0 else { return }
+        let upUnit = CGPoint(x: upVec.x / upLen, y: upVec.y / upLen)
+
+        let bottomOffsetPixels = pixelsPerInch * CGFloat(settings.strikeZoneBottomOffset)
+        let zoneHeightPixels   = pixelsPerInch * CGFloat(settings.strikeZoneHeight)
+
+        let bl = CGPoint(x: left.x  + upUnit.x * bottomOffsetPixels, y: left.y  + upUnit.y * bottomOffsetPixels)
+        let br = CGPoint(x: right.x + upUnit.x * bottomOffsetPixels, y: right.y + upUnit.y * bottomOffsetPixels)
+        let tl = CGPoint(x: left.x  + upUnit.x * (bottomOffsetPixels + zoneHeightPixels), y: left.y  + upUnit.y * (bottomOffsetPixels + zoneHeightPixels))
+        let tr = CGPoint(x: right.x + upUnit.x * (bottomOffsetPixels + zoneHeightPixels), y: right.y + upUnit.y * (bottomOffsetPixels + zoneHeightPixels))
+
+        let szColor = settings.strikeZoneColor.toUIColor()
+
+        ctx.saveGState()
+        ctx.setFillColor(szColor.withAlphaComponent(0.08).cgColor)
+        ctx.beginPath(); ctx.move(to: bl); ctx.addLine(to: br); ctx.addLine(to: tr); ctx.addLine(to: tl); ctx.closePath()
+        ctx.fillPath()
+        ctx.restoreGState()
+
+        ctx.saveGState()
+        ctx.setStrokeColor(szColor.withAlphaComponent(0.7).cgColor)
+        ctx.setLineWidth(2.5); ctx.setLineCap(.round); ctx.setLineJoin(.round)
+        ctx.beginPath(); ctx.move(to: bl); ctx.addLine(to: br); ctx.addLine(to: tr); ctx.addLine(to: tl); ctx.closePath()
+        ctx.strokePath()
+        ctx.restoreGState()
+
+        ctx.saveGState()
+        ctx.setStrokeColor(szColor.withAlphaComponent(0.35).cgColor)
+        ctx.setLineWidth(1.0); ctx.setLineDash(phase: 0, lengths: [6, 4])
+        let midLeft  = CGPoint(x: (bl.x + tl.x) / 2, y: (bl.y + tl.y) / 2)
+        let midRight = CGPoint(x: (br.x + tr.x) / 2, y: (br.y + tr.y) / 2)
+        ctx.beginPath(); ctx.move(to: midLeft); ctx.addLine(to: midRight); ctx.strokePath()
+        ctx.restoreGState()
+    }
+
+    // MARK: - Export Completion / Redirect
+    func showExportCompletion(url: URL) {
+        DispatchQueue.main.async {
+            self.onVideoSaved?(url.path)
+            let alert = UIAlertController(title: "Success", message: "Recorded video saved to Photos.", preferredStyle: .alert)
+            alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in self.dismiss(animated: true) })
+            self.present(alert, animated: true)
+        }
+    }
+}
