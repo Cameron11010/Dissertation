@@ -1,0 +1,270 @@
+//
+//  CameraViewController+Vision.swift
+//  Baseball Tracker
+//
+//  CoreML model setup, ROI tracking, and pose estimation configuration.
+//
+
+import UIKit
+import Vision
+import CoreML
+
+extension CameraViewController {
+    
+    // MARK: - Overlay & CoreML
+    func setupOverlay() {
+        overlayLayer.frame = view.bounds
+        overlayLayer.backgroundColor = UIColor.clear.cgColor
+        view.layer.addSublayer(overlayLayer)
+    }
+    
+    func setupModel() {
+        guard let modelURL = Bundle.main.url(forResource: "best_v2", withExtension: "mlmodelc"),
+              let mlmodel = try? MLModel(contentsOf: modelURL),
+              let visionModel = try? VNCoreMLModel(for: mlmodel) else {
+            fatalError("Could not load CoreML model. Ensure 'best_v2.mlmodel' is added to your project.")
+        }
+        self.visionModel = visionModel
+        
+        let request = VNCoreMLRequest(model: visionModel) { [weak self] request, _ in
+            guard let self = self else { return }
+            let results = (request.results as? [VNRecognizedObjectObservation]) ?? []
+            self.lastObservations = results
+            
+            // Debug: Log what ROI Vision is actually using
+            if self.settings.showROI && self.settings.enableROI && self.frameCount % 30 == 0 {
+                if let coreMLRequest = request as? VNCoreMLRequest {
+                    let roi = coreMLRequest.regionOfInterest
+                    print("[ROI Debug] Vision request ROI: x=\(String(format: "%.3f", roi.origin.x)) y=\(String(format: "%.3f", roi.origin.y)) w=\(String(format: "%.3f", roi.width)) h=\(String(format: "%.3f", roi.height))")
+                    print("[ROI Debug] Got \(results.count) total results from Vision")
+                }
+            }
+            
+            // Use the user's confidence threshold consistently
+            let effectiveThreshold = self.settings.ballConfidenceThreshold
+            
+            let baseballDetections = results.filter { obs in
+                guard let label = obs.labels.first else { return false }
+                
+                let bbox = obs.boundingBox
+                let isValidBox = bbox.minX >= -0.1 && bbox.maxX <= 1.1 &&
+                                bbox.minY >= -0.1 && bbox.maxY <= 1.1 &&
+                                bbox.width > 0.005 && bbox.width <= 0.5 &&
+                                bbox.height > 0.005 && bbox.height <= 0.5
+                
+                if !isValidBox && self.settings.showROI {
+                    print("[ROI] ⚠️ Rejecting invalid detection: bbox=\(bbox), conf=\(String(format: "%.2f", obs.confidence))")
+                }
+                
+                let passed = label.identifier == "baseball" &&
+                       obs.confidence >= effectiveThreshold &&
+                       isValidBox
+                
+                if self.settings.showROI && self.settings.enableROI && self.frameCount % 30 == 0 {
+                    if label.identifier == "baseball" {
+                        let currentROIString = self.currentROI != nil ? String(format: "ROI(%.2f,%.2f %.2fx%.2f)", self.currentROI!.origin.x, self.currentROI!.origin.y, self.currentROI!.width, self.currentROI!.height) : "NO ROI"
+                        print("[ROI Debug] Detection: conf=\(String(format: "%.2f", obs.confidence)) bbox=(\(String(format: "%.3f,%.3f %.3fx%.3f", bbox.origin.x, bbox.origin.y, bbox.width, bbox.height))) passed=\(passed) \(currentROIString)")
+                    }
+                }
+                
+                return passed
+            }.sorted { $0.confidence > $1.confidence }
+            
+            // Update ROI based on detection (only if ROI is enabled)
+            if self.settings.enableROI {
+                if let bestDetection = baseballDetections.first {
+                    self.updateROI(from: bestDetection.boundingBox)
+                } else {
+                    self.expandROI()
+                }
+            }
+            
+            DispatchQueue.main.async {
+                self.overlayLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+                
+                if self.settings.ballDetectionEnabled, let bestDetection = baseballDetections.first {
+                    self.drawBoundingBox(bestDetection.boundingBox,
+                                         bufferSize: self.view.bounds.size,
+                                         confidence: bestDetection.confidence,
+                                         mirrored: self.mirrored,
+                                         contentFlippedVertically: self.contentFlippedVertically)
+                }
+                
+                if let poseObs = self.lastPoseObservation, self.settings.poseEstimationEnabled {
+                    self.drawPoseSkeleton(poseObs, bufferSize: self.view.bounds.size)
+                }
+                
+                if self.settings.isCalibrated {
+                    self.drawCalibrationOverlay(bufferSize: self.view.bounds.size)
+                }
+                
+                if self.settings.isCalibrated && self.settings.showStrikeZone {
+                    self.drawStrikeZone(bufferSize: self.view.bounds.size)
+                }
+                
+                if self.settings.showROI, let roi = self.currentROI, self.settings.enableROI {
+                    self.drawROI(roi, bufferSize: self.view.bounds.size)
+                }
+            }
+        }
+        request.imageCropAndScaleOption = VNImageCropAndScaleOption.scaleFill
+        self.requests = [request]
+        
+        setupPoseEstimation()
+    }
+    
+    func setupPoseEstimation() {
+        poseRequest = VNDetectHumanBodyPoseRequest { [weak self] request, error in
+            guard let self = self else { return }
+            
+            if let error = error {
+                print("[Pose] Error: \(error.localizedDescription)")
+                return
+            }
+            
+            guard let observations = request.results as? [VNHumanBodyPoseObservation],
+                  let observation = observations.first else { return }
+            
+            self.lastPoseObservation = observation
+            
+            if let lastFrameTime = self.lastFrameTime {
+                self.poseHistory.append((timestamp: lastFrameTime, observation: observation))
+                
+                let cutoffTime = CMTimeSubtract(lastFrameTime, CMTime(seconds: 5, preferredTimescale: 600))
+                self.poseHistory.removeAll { CMTimeCompare($0.timestamp, cutoffTime) < 0 }
+            }
+            
+            if !self.settings.ballDetectionEnabled && self.settings.poseEstimationEnabled {
+                DispatchQueue.main.async {
+                    self.overlayLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+                    self.drawPoseSkeleton(observation, bufferSize: self.view.bounds.size)
+                }
+            }
+        }
+    }
+    
+    // MARK: - ROI Management
+    
+    /// Updates the ROI based on a successful ball detection
+    func updateROI(from boundingBox: CGRect) {
+        guard boundingBox.minX >= -0.1 && boundingBox.maxX <= 1.1 &&
+              boundingBox.minY >= -0.1 && boundingBox.maxY <= 1.1 &&
+              boundingBox.width > 0 && boundingBox.height > 0 &&
+              boundingBox.width <= 1.0 && boundingBox.height <= 1.0 else {
+            print("[ROI] ⚠️ Invalid bounding box detected: \(boundingBox) - ignoring")
+            expandROI()
+            return
+        }
+        
+        if let existingROI = currentROI, framesWithoutDetection == 0 {
+            let center = CGPoint(x: boundingBox.midX, y: boundingBox.midY)
+            let expandedROI = existingROI.insetBy(dx: -existingROI.width * 0.5, dy: -existingROI.height * 0.5)
+            if !expandedROI.contains(center) {
+                print("[ROI] ⚠️ Detection too far from current ROI at 240fps, likely false positive - expanding instead")
+                expandROI()
+                return
+            }
+        }
+        
+        framesWithoutDetection = 0
+        
+        let centerX = max(0, min(1, boundingBox.midX))
+        let centerY = max(0, min(1, boundingBox.midY))
+        
+        let baseROIWidth = max(boundingBox.width * initialROIScale, minROISize)
+        let baseROIHeight = max(boundingBox.height * initialROIScale, minROISize)
+        let roiWidth = min(baseROIWidth, 1.0)
+        let roiHeight = min(baseROIHeight, 1.0)
+        
+        var roi = CGRect(
+            x: centerX - roiWidth / 2,
+            y: centerY - roiHeight / 2,
+            width: roiWidth,
+            height: roiHeight
+        )
+        
+        roi = roi.intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
+        
+        guard !roi.isEmpty else {
+            print("[ROI] ⚠️ Empty ROI after clamping - resetting to full frame")
+            currentROI = nil
+            if let request = requests.first as? VNCoreMLRequest {
+                request.regionOfInterest = CGRect(x: 0, y: 0, width: 1, height: 1)
+            }
+            return
+        }
+        
+        currentROI = roi
+        
+        if let request = requests.first as? VNCoreMLRequest {
+            request.regionOfInterest = roi
+            
+            if settings.showROI && frameCount % 60 == 0 {
+                print("[ROI] ✅ Applied ROI to request: \(String(format: "x:%.3f y:%.3f w:%.3f h:%.3f", roi.origin.x, roi.origin.y, roi.width, roi.height))")
+            }
+        }
+        
+        if settings.showROI && frameCount % 30 == 0 {
+            print("[ROI] ✅ Ball detected at 240fps: center(\(String(format: "%.3f,%.3f", centerX, centerY))) ball size(\(String(format: "%.3fx%.3f", boundingBox.width, boundingBox.height))) → ROI(\(String(format: "%.3fx%.3f", roi.width, roi.height)))")
+        }
+    }
+    
+    /// Expands the ROI when no ball is detected, or resets it after too many frames
+    func expandROI() {
+        framesWithoutDetection += 1
+        
+        if framesWithoutDetection >= maxFramesWithoutDetection {
+            currentROI = nil
+            if let request = requests.first as? VNCoreMLRequest {
+                request.regionOfInterest = CGRect(x: 0, y: 0, width: 1, height: 1)
+            }
+            
+            #if DEBUG
+            if framesWithoutDetection == maxFramesWithoutDetection {
+                print("[ROI] Reset to full frame after \(maxFramesWithoutDetection) frames")
+            }
+            #endif
+            return
+        }
+        
+        guard var roi = currentROI else { return }
+        
+        let newWidth = min(roi.width * roiExpansionRate, 1.0)
+        let newHeight = min(roi.height * roiExpansionRate, 1.0)
+        
+        let averageSize = (newWidth + newHeight) / 2.0
+        if averageSize >= maxROISize {
+            print("[ROI] ROI expanded beyond max size (\(String(format: "%.2f", averageSize))), resetting to full frame")
+            currentROI = nil
+            framesWithoutDetection = maxFramesWithoutDetection
+            if let request = requests.first as? VNCoreMLRequest {
+                request.regionOfInterest = CGRect(x: 0, y: 0, width: 1, height: 1)
+            }
+            return
+        }
+        
+        let centerX = roi.midX
+        let centerY = roi.midY
+        
+        roi = CGRect(
+            x: max(0, centerX - newWidth / 2),
+            y: max(0, centerY - newHeight / 2),
+            width: min(newWidth, 1.0),
+            height: min(newHeight, 1.0)
+        )
+        
+        roi = roi.intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
+        
+        currentROI = roi
+        
+        if let request = requests.first as? VNCoreMLRequest {
+            request.regionOfInterest = roi
+        }
+        
+        #if DEBUG
+        if framesWithoutDetection % 10 == 0 {
+            print("[ROI] Expanded (\(framesWithoutDetection) frames): \(String(format: "%.3fx%.3f", roi.width, roi.height))")
+        }
+        #endif
+    }
+}
