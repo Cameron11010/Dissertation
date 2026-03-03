@@ -1,0 +1,169 @@
+//
+//  CameraSettingsView.swift
+//  Baseball Tracker
+//
+//  SwiftUI settings panel for camera configuration.
+//
+
+import SwiftUI
+
+struct CameraSettingsView: View {
+    @ObservedObject var settings: CameraSettings
+    @Environment(\.dismiss) var dismiss
+    
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Detection") {
+                    Toggle("Ball Detection", isOn: $settings.ballDetectionEnabled)
+                    
+                    if settings.ballDetectionEnabled {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Ball Confidence: \(String(format: "%.0f%%", settings.ballConfidenceThreshold * 100))")
+                                .font(.subheadline)
+                            Slider(value: $settings.ballConfidenceThreshold, in: 0.1...0.9, step: 0.05)
+                        }
+                        
+                        ColorPicker("Ball Colour", selection: $settings.ballColor)
+                        ColorPicker("Trajectory Colour", selection: $settings.trajectoryColor)
+                    }
+                }
+                
+                Section("Calibration") {
+                    Toggle("Use Centimeters", isOn: $settings.useCentimeters)
+                    
+                    if settings.isCalibrated {
+                        HStack {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundColor(.green)
+                            Text("Camera is calibrated")
+                        }
+                        
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Plate Width: \(String(format: "%.1f", settings.plateWidth)) \(settings.useCentimeters ? "cm" : "inches")")
+                                .font(.subheadline)
+                            Text("Use the ruler button to recalibrate")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    } else {
+                        HStack {
+                            Image(systemName: "exclamationmark.circle.fill")
+                                .foregroundColor(.orange)
+                            Text("Camera not calibrated")
+                        }
+                        Text("Tap the ruler button and mark the two front edges of home plate for accurate measurements")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                
+                Section("Strike Zone") {
+                    Toggle("Show Strike Zone", isOn: $settings.showStrikeZone)
+                    
+                    if settings.showStrikeZone {
+                        if settings.isCalibrated {
+                            ColorPicker("Strike Zone Colour", selection: $settings.strikeZoneColor)
+                            
+                            VStack(alignment: .leading, spacing: 8) {
+                                let heightLabel: String = settings.useCentimeters
+                                    ? String(format: "Strike Zone Height: %.1f cm", settings.strikeZoneHeight * 2.54)
+                                    : String(format: "Strike Zone Height: %.1f\"", settings.strikeZoneHeight)
+                                Text(heightLabel)
+                                    .font(.subheadline)
+                                Slider(value: $settings.strikeZoneHeight, in: 18...26, step: 0.5)
+                            }
+                            
+                            VStack(alignment: .leading, spacing: 8) {
+                                let offsetLabel: String = settings.useCentimeters
+                                    ? String(format: "Bottom Offset (above plate): %.1f cm", settings.strikeZoneBottomOffset * 2.54)
+                                    : String(format: "Bottom Offset (above plate): %.1f\"", settings.strikeZoneBottomOffset)
+                                Text(offsetLabel)
+                                    .font(.subheadline)
+                                Slider(value: $settings.strikeZoneBottomOffset, in: 14...24, step: 0.5)
+                            }
+                            
+                            Text("Generic height based on MLB regulation (~22\"). Bottom offset is the distance from the plate up to the batter's knees (~18\"). Adjust both for age group or batter height.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        } else {
+                            HStack {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .foregroundColor(.orange)
+                                Text("Calibrate first to display the strike zone")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                    }
+                }
+                
+                Section("Pose Estimation") {
+                    Toggle("Pose Estimation", isOn: $settings.poseEstimationEnabled)
+                    
+                    if settings.poseEstimationEnabled {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Pose Confidence: \(String(format: "%.0f%%", settings.poseConfidenceThreshold * 100))")
+                                .font(.subheadline)
+                            Slider(value: $settings.poseConfidenceThreshold, in: 0.1...0.9, step: 0.05)
+                        }
+                        
+                        ColorPicker("Skeleton Colour", selection: $settings.skeletonColor)
+                        ColorPicker("Joint Colour", selection: $settings.jointColor)
+                        ColorPicker("Elbow Angle Colour", selection: $settings.elbowAngleColor)
+                        ColorPicker("Knee Angle Colour", selection: $settings.kneeAngleColor)
+                        ColorPicker("Shoulder Angle Colour", selection: $settings.shoulderAngleColor)
+                        ColorPicker("Separation Colour", selection: $settings.separationColor)
+                    }
+                }
+                
+                Section("Display") {
+                    Toggle("Show Labels", isOn: $settings.showLabels)
+                    
+                    Toggle("Show Detection Markers", isOn: $settings.showDetectionMarkers)
+                    if settings.showDetectionMarkers {
+                        Text("Shows detection circles (CoreML/tracker), confidence labels, and individual position dots on exported video.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    
+                    Toggle("Enable ROI Tracking", isOn: $settings.enableROI)
+                    
+                    if settings.enableROI {
+                        Toggle("Show ROI Box (Debug)", isOn: $settings.showROI)
+                        
+                        if settings.showROI {
+                            Text("Shows a yellow box indicating the active detection region. ROI automatically focuses on the ball to improve tracking performance at 240fps.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        
+                        Text("ROI is active during live recording and during export of high-speed video (≥120fps). It is automatically disabled for standard frame-rate exports.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    } else {
+                        Text("⚠️ ROI tracking is disabled. Detection will search the entire frame.")
+                            .font(.caption)
+                            .foregroundColor(.orange)
+                    }
+                }
+                
+                Section("Export") {
+                    Toggle("Also Export Clean Video", isOn: $settings.exportCleanVideo)
+                    Text("When enabled, the original recording without any overlays is saved to Photos alongside the annotated version.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+            .navigationTitle("Camera Settings")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") {
+                        dismiss()
+                    }
+                }
+            }
+        }
+    }
+}
