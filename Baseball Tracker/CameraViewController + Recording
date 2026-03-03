@@ -1,0 +1,180 @@
+//
+//  CameraViewController+Recording.swift
+//  Baseball Tracker
+//
+//  Start/stop custom recording, asset writer management, and save-to-photos.
+//
+
+import UIKit
+import AVFoundation
+import Photos
+
+extension CameraViewController {
+    
+    func startCustomRecording() {
+        guard !isRecording else { return }
+        
+        let orientation = UIDevice.current.orientation
+        let isPortrait = orientation == .portrait || orientation == .portraitUpsideDown
+        let baseWidth = Int(self.activeDimensions.width)
+        let baseHeight = Int(self.activeDimensions.height)
+        let videoWidth = isPortrait ? min(baseWidth, baseHeight) : max(baseWidth, baseHeight)
+        let videoHeight = isPortrait ? max(baseWidth, baseHeight) : min(baseWidth, baseHeight)
+        let videoTransform = CGAffineTransform.identity
+        
+        let outputFileName = UUID().uuidString
+        let outputFilePath = (NSTemporaryDirectory() as NSString).appendingPathComponent(outputFileName + ".mov")
+        let outputURL = URL(fileURLWithPath: outputFilePath)
+        
+        do {
+            assetWriter = try AVAssetWriter(outputURL: outputURL, fileType: .mov)
+        } catch {
+            print("Failed to create AVAssetWriter: \(error)")
+            return
+        }
+        
+        print("[Recording] Using ProRes for \(videoWidth)x\(videoHeight) @ \(self.activeFrameRate) fps")
+        
+        let videoSettings: [String: Any] = [
+            AVVideoCodecKey: AVVideoCodecType.proRes422Proxy,
+            AVVideoWidthKey: videoWidth,
+            AVVideoHeightKey: videoHeight
+        ]
+        
+        assetWriterInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+        assetWriterInput?.expectsMediaDataInRealTime = true
+        
+        let mediaTimeScale = CMTimeScale(max(600, Int32(self.activeFrameRate * 10)))
+        assetWriter?.movieTimeScale = mediaTimeScale
+        assetWriterInput?.mediaTimeScale = mediaTimeScale
+        
+        assetWriterInput?.performsMultiPassEncodingIfSupported = false
+        assetWriterInput?.transform = videoTransform
+        
+        guard let assetWriter = assetWriter,
+              let assetWriterInput = assetWriterInput else {
+            print("Asset writer or input not available")
+            return
+        }
+        
+        if assetWriter.canAdd(assetWriterInput) {
+            assetWriter.add(assetWriterInput)
+        } else {
+            print("Cannot add asset writer input")
+            return
+        }
+        
+        let sourcePixelBufferAttributes: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+            kCVPixelBufferWidthKey as String: videoWidth,
+            kCVPixelBufferHeightKey as String: videoHeight,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+        ]
+        
+        pixelBufferAdaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: assetWriterInput,
+                                                                  sourcePixelBufferAttributes: sourcePixelBufferAttributes)
+        
+        recordingStartTime = nil
+        
+        self.detectionMarkers.removeAll()
+        self.poseHistory.removeAll()
+        self.fusedFrameData.removeAll()
+        self.lastPoseObservation = nil
+        self.videoRotationDegrees = 0
+        
+        self.currentROI = nil
+        self.framesWithoutDetection = 0
+        
+        self.lastFrameTime = nil
+        self.frameCount = 0
+        
+        isRecording = true
+        updateRecordButton(isRecording: true)
+        onRecordingStateChanged?(true)
+        
+        print("[Recording] Started recording at \(self.activeFrameRate) fps using ProRes 422 Proxy")
+    }
+    
+    func stopCustomRecording() {
+        guard isRecording, let assetWriter = assetWriter, let assetWriterInput = assetWriterInput else { return }
+        
+        isRecording = false
+        updateRecordButton(isRecording: false)
+        onRecordingStateChanged?(false)
+        
+        if let startTime = recordingStartTime, let endTime = lastFrameTime {
+            let duration = CMTimeGetSeconds(CMTimeSubtract(endTime, startTime))
+            let avgFPS = Double(frameCount) / duration
+            print("[Recording] Stopped. Recorded \(frameCount) frames in \(String(format: "%.2f", duration))s = \(String(format: "%.1f", avgFPS)) fps average")
+        }
+        
+        assetWriterInput.markAsFinished()
+        assetWriter.finishWriting { [weak self] in
+            guard let self = self else { return }
+            let rawVideoURL = assetWriter.outputURL
+            
+            print("[Recording] Raw video saved to: \(rawVideoURL.path)")
+            print("[Recording] Starting annotation post-processing...")
+            
+            self.saveBiomechanicalDataToFile()
+            
+            DispatchQueue.main.async {
+                self.showProcessingOverlay(message: "Adding annotations to video...")
+            }
+            
+            Task {
+                await self.postProcessVideoWithAnnotations(rawVideoURL: rawVideoURL)
+            }
+            
+            self.assetWriter = nil
+            self.assetWriterInput = nil
+            self.pixelBufferAdaptor = nil
+            self.recordingStartTime = nil
+        }
+    }
+    
+    func saveToPhotosThenAlert(outputURL: URL) {
+        Task { @MainActor in
+            await withCheckedContinuation { continuation in
+                self.ensurePhotoLibraryPermission { granted in
+                    Task { @MainActor in
+                        guard granted else {
+                            let alert = UIAlertController(title: "Photos Access Denied",
+                                                          message: "Annotated video exported to a temporary file, but app does not have permission to save to Photos. Please enable Photos access in Settings.",
+                                                          preferredStyle: .alert)
+                            alert.addAction(UIAlertAction(title: "OK", style: .default))
+                            self.dismissToRootAndPresentAlert(alert)
+                            continuation.resume()
+                            return
+                        }
+                        var localIdentifier: String?
+                        PHPhotoLibrary.shared().performChanges({
+                            if let placeholder = PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: outputURL)?.placeholderForCreatedAsset {
+                                localIdentifier = placeholder.localIdentifier
+                            }
+                        }) { success, error in
+                            Task { @MainActor in
+                                if success, let id = localIdentifier {
+                                    self.onVideoSaved?(id)
+                                    let alert = UIAlertController(title: "Success",
+                                                                  message: "Annotated video saved to Photos.",
+                                                                  preferredStyle: .alert)
+                                    alert.addAction(UIAlertAction(title: "OK", style: .default))
+                                    self.dismissToRootAndPresentAlert(alert)
+                                } else {
+                                    self.onVideoSaved?("")
+                                    let alert = UIAlertController(title: "Save Failed",
+                                                                  message: "Could not save video to Photos. Please check permissions or available space.",
+                                                                  preferredStyle: .alert)
+                                    alert.addAction(UIAlertAction(title: "OK", style: .default))
+                                    self.dismissToRootAndPresentAlert(alert)
+                                }
+                                continuation.resume()
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
