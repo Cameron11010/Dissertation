@@ -1,0 +1,733 @@
+//
+//  CameraViewController.swift
+//  Baseball Tracker
+//
+//  Core view controller: properties, lifecycle, camera setup, and UI setup.
+//  Extensions are in separate files:
+//    - CameraViewController+Vision.swift       (CoreML, ROI, pose setup)
+//    - CameraViewController+Overlay.swift       (live overlay drawing)
+//    - CameraViewController+Recording.swift     (start/stop recording)
+//    - CameraViewController+Export.swift         (video export & annotation renderer)
+//    - CameraViewController+Biomechanics.swift   (analysis & CSV export)
+//    - CameraViewController+LiveCapture.swift    (sample buffer delegate)
+//    - CameraViewController+VideoProcessing.swift(imported video handling)
+//
+
+import UIKit
+import SwiftUI
+import AVFoundation
+import Vision
+import CoreML
+import Photos
+import Combine
+
+class CameraViewController: UIViewController {
+    
+    // MARK: - Settings
+    var settings: CameraSettings = CameraSettings()
+    var settingsCancellables = Set<AnyCancellable>()
+    
+    // MARK: - Camera
+    let captureSession = AVCaptureSession()
+    let sessionQueue = DispatchQueue(label: "camera.session.queue")
+    let visionQueue = DispatchQueue(label: "camera.vision.queue", qos: .userInteractive)
+    
+    var videoDeviceInput: AVCaptureDeviceInput!
+    var videoOutput: AVCaptureVideoDataOutput!
+    var previewLayer: CALayer!
+    var player: AVPlayer?
+    
+    // MARK: - Recording
+    var recordButton: UIButton!
+    var isRecording = false
+    
+    var assetWriter: AVAssetWriter?
+    var assetWriterInput: AVAssetWriterInput?
+    var pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
+    var recordingStartTime: CMTime?
+    
+    var lastFrameTime: CMTime?
+    var frameCount: Int = 0
+    
+    var activeFrameRate: Double = 30
+    var activeDimensions: CMVideoDimensions = CMVideoDimensions(width: 1920, height: 1080)
+    
+    // MARK: - CoreML / Vision
+    var visionModel: VNCoreMLModel!
+    var requests = [VNRequest]()
+    var lastObservations: [VNRecognizedObjectObservation] = []
+    let allowedClasses = ["baseball"]
+    
+    // MARK: - ROI Tracking
+    // Region of Interest (ROI) tracking focuses the vision model on a smaller area
+    // where the ball is likely to be, improving performance and reducing false positives.
+    //
+    // How it works:
+    // 1. When a ball is detected, create an ROI 3x the ball size (minimum 15% of frame)
+    // 2. On subsequent frames, only search within this ROI
+    // 3. If ball is still detected, update ROI to follow it
+    // 4. If ball is not detected, gradually expand ROI by 8% per frame
+    // 5. After 60 frames (~0.25 seconds at 240fps) or when ROI exceeds 70% of frame, reset to full frame
+    // 6. Detections far outside the current ROI are rejected as false positives
+    //
+    // The confidence threshold is kept CONSTANT in ROI mode - do not lower it.
+    // The whole point of ROI is to reduce false positives by constraining the search area.
+    //
+    // At 240fps, the ball barely moves between frames, so tight tracking is appropriate.
+    //
+    // ROI can be toggled on/off via settings.enableROI
+    var currentROI: CGRect? = nil
+    var framesWithoutDetection: Int = 0
+    let maxFramesWithoutDetection = 60 // ~0.25 second at 240fps
+    let initialROIScale: CGFloat = 3.0 // Initial ROI is 3x the ball size (perfect for 240fps)
+    let minROISize: CGFloat = 0.15 // Minimum ROI size (15% of frame)
+    let maxROISize: CGFloat = 0.7 // Maximum ROI size before resetting to full frame
+    let roiExpansionRate: CGFloat = 1.08 // Expand by 8% per frame without detection (gentle for 240fps)
+    
+    // MARK: - Pose Estimation
+    var poseRequest: VNDetectHumanBodyPoseRequest!
+    var lastPoseObservation: VNHumanBodyPoseObservation?
+    var poseHistory: [(timestamp: CMTime, observation: VNHumanBodyPoseObservation)] = []
+    
+    // MARK: - Frame Fusion Data
+    var fusedFrameData: [(timestamp: CMTime, ballPosition: CGPoint?, poseObservation: VNHumanBodyPoseObservation?)] = []
+    
+    // MARK: - Overlay
+    var overlayLayer = CALayer()
+    
+    var detectionMarkers: [CGPoint] = []
+    
+    // MARK: - UI
+    var processingOverlay: UIView?
+    var processingLabel: UILabel?
+    var processingSpinner: UIActivityIndicatorView?
+    
+    var backButton: UIButton!
+    var settingsButton: UIButton!
+    var calibrateButton: UIButton!
+    var zoomSlider: UISlider!
+    var zoomStackView: UIStackView!
+    
+    // MARK: - Zoom
+    var currentZoomFactor: CGFloat = 1.0
+    
+    var videoURL: URL? = nil
+    /// The PHAsset for the selected video. When set, enables automatic
+    /// recovery of original 240fps frames from composed slow-motion videos.
+    var phAsset: PHAsset? = nil
+    var onVideoSaved: ((String) -> Void)?
+    var onRecordingStateChanged: ((Bool) -> Void)?
+    
+    // URL of the most-recent raw (unannotated) recording, kept alive until
+    // the annotated export (and optional clean save) have both finished.
+    var currentRawVideoURL: URL? = nil
+    
+    // MARK: - CIContext
+    let ciContext = CIContext()
+    
+    // MARK: - Orientation Flags
+    var mirrored = false
+    var contentFlippedVertically = false
+    var contentUpsideDown = false
+    /// The snapped rotation (0 / 90 / 180 / 270) derived from the selected
+    /// video's preferredTransform.  Zero for live-camera recordings (their
+    /// pixel buffers are already portrait).  Used to rotate the CGContext in
+    /// makeAnnotatedPixelBuffer for proper overlay positioning after the writer
+    /// applies the transform.
+    var videoRotationDegrees: Int = 0
+    
+    // MARK: - Lifecycle
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        print("🎥 CameraViewController viewDidLoad started")
+        view.backgroundColor = .black
+        onRecordingStateChanged?(false)
+        
+        setupOverlay()
+        setupModel()
+        setupBackButton()
+        setupSettingsButton()
+        setupCalibrateButton()
+        setupZoomControls()
+        setupRecordButton()
+        setupSettingsObservers()
+        
+        self.detectionMarkers.removeAll()
+        
+        if let url = videoURL {
+            print("🎥 Processing video file mode")
+            processVideoFile(url)
+        } else {
+            print("🎥 Live camera mode - setting up camera...")
+            sessionQueue.async { [weak self] in
+                self?.setupCamera()
+            }
+        }
+    }
+    
+    // MARK: - Settings Observers
+    func setupSettingsObservers() {
+        settings.$ballDetectionEnabled
+            .dropFirst()
+            .sink { [weak self] enabled in
+                guard let self = self, !enabled else { return }
+                if !self.settings.poseEstimationEnabled {
+                    DispatchQueue.main.async {
+                        self.overlayLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+                    }
+                }
+            }
+            .store(in: &settingsCancellables)
+        
+        settings.$poseEstimationEnabled
+            .dropFirst()
+            .sink { [weak self] enabled in
+                guard let self = self, !enabled else { return }
+                if !self.settings.ballDetectionEnabled {
+                    DispatchQueue.main.async {
+                        self.overlayLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+                    }
+                }
+            }
+            .store(in: &settingsCancellables)
+    }
+    
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        previewLayer?.frame = view.bounds
+        overlayLayer.frame = view.bounds
+        overlayLayer.position = CGPoint(x: view.bounds.midX, y: view.bounds.midY)
+        processingOverlay?.frame = view.bounds
+        
+        if let preview = previewLayer {
+            overlayLayer.removeFromSuperlayer()
+            view.layer.insertSublayer(overlayLayer, above: preview)
+        }
+        
+        if let backButton = backButton {
+            let safeArea = view.safeAreaInsets
+            let buttonHeight: CGFloat = 44
+            let buttonWidth: CGFloat = 70
+            backButton.frame = CGRect(x: 16, y: safeArea.top + 8, width: buttonWidth, height: buttonHeight)
+            view.bringSubviewToFront(backButton)
+        }
+        
+        if let settingsButton = settingsButton {
+            let safeArea = view.safeAreaInsets
+            let buttonSize: CGFloat = 44
+            settingsButton.frame = CGRect(x: view.bounds.width - buttonSize - 16,
+                                         y: safeArea.top + 8,
+                                         width: buttonSize,
+                                         height: buttonSize)
+            view.bringSubviewToFront(settingsButton)
+        }
+        
+        if let calibrateButton = calibrateButton {
+            let safeArea = view.safeAreaInsets
+            let buttonSize: CGFloat = 44
+            calibrateButton.frame = CGRect(x: view.bounds.width - (buttonSize + 16) * 2,
+                                          y: safeArea.top + 8,
+                                          width: buttonSize,
+                                          height: buttonSize)
+            view.bringSubviewToFront(calibrateButton)
+        }
+        
+        if let recordButton = recordButton {
+            let safeArea = view.safeAreaInsets
+            let buttonSize: CGFloat = 70
+            recordButton.frame = CGRect(x: (view.bounds.width - buttonSize) / 2,
+                                        y: view.bounds.height - safeArea.bottom - buttonSize - 16,
+                                        width: buttonSize,
+                                        height: buttonSize)
+            view.bringSubviewToFront(recordButton)
+        }
+        
+        if let stackView = zoomStackView {
+            stackView.frame.origin = CGPoint(x: 16, y: (view.bounds.height - stackView.frame.height) / 2)
+            view.bringSubviewToFront(stackView)
+        }
+    }
+    
+    // MARK: - Back Button Setup
+    func setupBackButton() {
+        let button = UIButton(type: .system)
+        button.setTitle("Back", for: .normal)
+        button.setTitleColor(.white, for: .normal)
+        button.titleLabel?.font = UIFont.systemFont(ofSize: 18, weight: .medium)
+        button.backgroundColor = UIColor.black.withAlphaComponent(0.4)
+        button.layer.cornerRadius = 8
+        button.addTarget(self, action: #selector(backButtonTapped), for: .touchUpInside)
+        button.accessibilityLabel = "Back"
+        button.accessibilityHint = "Dismisses the camera view"
+        button.translatesAutoresizingMaskIntoConstraints = false
+        
+        view.addSubview(button)
+        self.backButton = button
+        
+        NSLayoutConstraint.activate([
+            button.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 16),
+            button.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8),
+            button.widthAnchor.constraint(equalToConstant: 70),
+            button.heightAnchor.constraint(equalToConstant: 44)
+        ])
+    }
+    
+    @objc func backButtonTapped() {
+        if isRecording {
+            stopCustomRecording()
+        }
+        sessionQueue.async { [weak self] in
+            self?.captureSession.stopRunning()
+        }
+        self.dismiss(animated: true)
+    }
+    
+    // MARK: - Settings Button Setup
+    func setupSettingsButton() {
+        let button = UIButton(type: .system)
+        let config = UIImage.SymbolConfiguration(pointSize: 24, weight: .medium)
+        let image = UIImage(systemName: "gearshape.fill", withConfiguration: config)
+        button.setImage(image, for: .normal)
+        button.tintColor = .white
+        button.backgroundColor = UIColor.black.withAlphaComponent(0.4)
+        button.layer.cornerRadius = 22
+        button.addTarget(self, action: #selector(settingsButtonTapped), for: .touchUpInside)
+        button.accessibilityLabel = "Settings"
+        button.accessibilityHint = "Opens camera settings"
+        button.translatesAutoresizingMaskIntoConstraints = false
+        
+        view.addSubview(button)
+        self.settingsButton = button
+    }
+    
+    @objc func settingsButtonTapped() {
+        let hostingController = UIHostingController(rootView: CameraSettingsView(settings: settings))
+        hostingController.modalPresentationStyle = .pageSheet
+        
+        if let sheet = hostingController.sheetPresentationController {
+            sheet.detents = [.medium(), .large()]
+            sheet.prefersGrabberVisible = true
+        }
+        
+        present(hostingController, animated: true)
+    }
+    
+    // MARK: - Calibrate Button Setup
+    func setupCalibrateButton() {
+        let button = UIButton(type: .system)
+        let config = UIImage.SymbolConfiguration(pointSize: 24, weight: .medium)
+        let image = UIImage(systemName: "ruler", withConfiguration: config)
+        button.setImage(image, for: .normal)
+        button.tintColor = .white
+        button.backgroundColor = settings.isCalibrated ? UIColor.green.withAlphaComponent(0.6) : UIColor.black.withAlphaComponent(0.4)
+        button.layer.cornerRadius = 22
+        button.addTarget(self, action: #selector(calibrateButtonTapped), for: .touchUpInside)
+        button.accessibilityLabel = "Calibrate"
+        button.accessibilityHint = "Opens calibration screen"
+        button.translatesAutoresizingMaskIntoConstraints = false
+        
+        view.addSubview(button)
+        self.calibrateButton = button
+    }
+    
+    @objc func calibrateButtonTapped() {
+        let currentZoom = self.currentZoomFactor
+        
+        let hostingController = UIHostingController(rootView: CalibrationView(
+            settings: settings,
+            minimumZoom: currentZoom,
+            onDismiss: { [weak self] in
+                self?.updateCalibrateButtonAppearance()
+                if let self = self {
+                    self.updateZoom(to: currentZoom)
+                }
+            }
+        ))
+        hostingController.modalPresentationStyle = .fullScreen
+        
+        present(hostingController, animated: true)
+    }
+    
+    func updateCalibrateButtonAppearance() {
+        DispatchQueue.main.async {
+            self.calibrateButton.backgroundColor = self.settings.isCalibrated ?
+                UIColor.green.withAlphaComponent(0.6) : UIColor.black.withAlphaComponent(0.4)
+        }
+    }
+    
+    // MARK: - Zoom Controls Setup
+    func setupZoomControls() {
+        guard videoURL == nil else { return }
+        
+        let stackView = UIStackView()
+        stackView.axis = .vertical
+        stackView.spacing = 8
+        stackView.alignment = .leading
+        stackView.translatesAutoresizingMaskIntoConstraints = false
+        
+        let lensOptions: [Double] = [1.0, 2.0, 4.0, 8.0]
+        
+        for lens in lensOptions {
+            let button = UIButton(type: .system)
+            button.setTitle(String(format: "%.0fx", lens), for: .normal)
+            button.titleLabel?.font = UIFont.monospacedDigitSystemFont(ofSize: 18, weight: .semibold)
+            button.tintColor = .white
+            button.backgroundColor = UIColor.black.withAlphaComponent(0.6)
+            button.layer.cornerRadius = 8
+            button.tag = Int(lens * 10)
+            button.addTarget(self, action: #selector(lensButtonTapped(_:)), for: .touchUpInside)
+            button.translatesAutoresizingMaskIntoConstraints = false
+            
+            NSLayoutConstraint.activate([
+                button.widthAnchor.constraint(equalToConstant: 60),
+                button.heightAnchor.constraint(equalToConstant: 44)
+            ])
+            
+            stackView.addArrangedSubview(button)
+        }
+        
+        view.addSubview(stackView)
+        self.zoomSlider = nil
+        self.zoomStackView = stackView
+        
+        updateLensButtonAppearance()
+    }
+    
+    @objc func lensButtonTapped(_ sender: UIButton) {
+        let lens = Double(sender.tag) / 10.0
+        currentZoomFactor = CGFloat(lens)
+        settings.selectedLens = lens
+        updateZoom(to: currentZoomFactor)
+        updateLensButtonAppearance()
+        
+        print("[Zoom] Selected \(String(format: "%.0f", lens))x lens")
+    }
+    
+    func updateLensButtonAppearance() {
+        guard let stackView = zoomStackView else { return }
+        
+        for case let button as UIButton in stackView.arrangedSubviews {
+            let lens = Double(button.tag) / 10.0
+            if abs(lens - settings.selectedLens) < 0.1 {
+                button.backgroundColor = UIColor.systemBlue.withAlphaComponent(0.8)
+                button.transform = CGAffineTransform(scaleX: 1.1, y: 1.1)
+            } else {
+                button.backgroundColor = UIColor.black.withAlphaComponent(0.6)
+                button.transform = .identity
+            }
+        }
+    }
+    
+    @objc func zoomSliderChanged(_ sender: UISlider) {
+        // Not used anymore, but keeping for compatibility
+    }
+    
+    func updateZoom(to factor: CGFloat) {
+        guard let device = videoDeviceInput?.device else { return }
+        
+        do {
+            try device.lockForConfiguration()
+            let maxZoom = min(device.activeFormat.videoMaxZoomFactor, 10.0)
+            let clampedFactor = max(1.0, min(factor, maxZoom))
+            device.videoZoomFactor = clampedFactor
+            device.unlockForConfiguration()
+            print("[Zoom] Set zoom to \(String(format: "%.1f", clampedFactor))x")
+        } catch {
+            print("[Zoom] Error setting zoom: \(error)")
+        }
+    }
+    
+    // MARK: - Record Button Setup
+    func setupRecordButton() {
+        let button = UIButton(type: .custom)
+        button.backgroundColor = UIColor.red.withAlphaComponent(0.7)
+        button.layer.cornerRadius = 35
+        button.layer.borderColor = UIColor.white.cgColor
+        button.layer.borderWidth = 2
+        button.addTarget(self, action: #selector(recordButtonTapped), for: .touchUpInside)
+        button.accessibilityLabel = "Record"
+        button.accessibilityHint = "Start or stop video recording"
+        button.translatesAutoresizingMaskIntoConstraints = false
+        
+        view.addSubview(button)
+        self.recordButton = button
+        
+        updateRecordButton(isRecording: false)
+    }
+    
+    func updateRecordButton(isRecording: Bool) {
+        DispatchQueue.main.async {
+            if isRecording {
+                self.recordButton.backgroundColor = UIColor.red.withAlphaComponent(1.0)
+                self.recordButton.layer.borderWidth = 0
+            } else {
+                self.recordButton.backgroundColor = UIColor.red.withAlphaComponent(0.7)
+                self.recordButton.layer.borderWidth = 2
+            }
+        }
+    }
+    
+    @objc func recordButtonTapped() {
+        if isRecording {
+            stopCustomRecording()
+        } else {
+            startCustomRecording()
+        }
+    }
+    
+    // MARK: - Processing Overlay
+    func showProcessingOverlay(message: String) {
+        if processingOverlay == nil {
+            let overlay = UIView(frame: view.bounds)
+            overlay.backgroundColor = UIColor.black.withAlphaComponent(0.4)
+            
+            let spinner = UIActivityIndicatorView(style: .large)
+            spinner.translatesAutoresizingMaskIntoConstraints = false
+            spinner.startAnimating()
+            
+            let label = UILabel()
+            label.translatesAutoresizingMaskIntoConstraints = false
+            label.textColor = .white
+            label.font = UIFont.preferredFont(forTextStyle: .headline)
+            label.textAlignment = .center
+            label.numberOfLines = 0
+            
+            overlay.addSubview(spinner)
+            overlay.addSubview(label)
+            
+            NSLayoutConstraint.activate([
+                spinner.centerXAnchor.constraint(equalTo: overlay.centerXAnchor),
+                spinner.centerYAnchor.constraint(equalTo: overlay.centerYAnchor, constant: -12),
+                label.topAnchor.constraint(equalTo: spinner.bottomAnchor, constant: 12),
+                label.leadingAnchor.constraint(equalTo: overlay.leadingAnchor, constant: 24),
+                label.trailingAnchor.constraint(equalTo: overlay.trailingAnchor, constant: -24)
+            ])
+            
+            processingOverlay = overlay
+            processingLabel = label
+            processingSpinner = spinner
+            view.addSubview(overlay)
+        }
+        processingOverlay?.isHidden = false
+        updateProcessingMessage(message)
+    }
+    
+    func hideProcessingOverlay() {
+        processingOverlay?.isHidden = true
+    }
+    
+    func updateProcessingMessage(_ message: String) {
+        processingLabel?.text = message
+    }
+    
+    // MARK: - Camera Setup
+    func setupCamera() {
+        print("🎥 setupCamera() called on thread: \(Thread.current)")
+        captureSession.beginConfiguration()
+
+        captureSession.sessionPreset = .inputPriority
+        
+        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else {
+            print("❌ ERROR: Could not get camera device")
+            return
+        }
+        
+        print("✅ Got camera device: \(device.localizedName)")
+        
+        let preferredDims: [(width: Int32, height: Int32)] = [
+            (1920, 1080), (1080, 1920),
+            (1280, 720), (720, 1280)
+        ]
+        
+        func maxFPS(for format: AVCaptureDevice.Format) -> Double {
+            return format.videoSupportedFrameRateRanges.map { $0.maxFrameRate }.max() ?? 0
+        }
+        
+        let globalMaxFPS = device.formats.map { maxFPS(for: $0) }.max() ?? 0
+        print("[Camera] Found \(device.formats.count) formats, max fps available: \(globalMaxFPS)")
+        
+        let highestFPSFormats = device.formats.filter { maxFPS(for: $0) == globalMaxFPS }
+        print("[Camera] \(highestFPSFormats.count) formats support \(globalMaxFPS) fps")
+        
+        let preferredHighSpeedFormat: AVCaptureDevice.Format? = {
+            for dim in preferredDims {
+                if let match = highestFPSFormats.first(where: { fmt in
+                    let d = CMVideoFormatDescriptionGetDimensions(fmt.formatDescription)
+                    return (d.width == dim.width && d.height == dim.height)
+                }) {
+                    return match
+                }
+            }
+            return nil
+        }()
+        
+        let chosenFormat: AVCaptureDevice.Format? = preferredHighSpeedFormat ?? device.formats.max(by: { f1, f2 in
+            let fps1 = maxFPS(for: f1)
+            let fps2 = maxFPS(for: f2)
+            if fps1 == fps2 {
+                let d1 = CMVideoFormatDescriptionGetDimensions(f1.formatDescription)
+                let d2 = CMVideoFormatDescriptionGetDimensions(f2.formatDescription)
+                let area1 = Int(d1.width) * Int(d1.height)
+                let area2 = Int(d2.width) * Int(d2.height)
+                return area1 < area2
+            }
+            return fps1 < fps2
+        })
+        
+        if let bestFormat = chosenFormat {
+            let maxFrameRate = maxFPS(for: bestFormat)
+            let dims = CMVideoFormatDescriptionGetDimensions(bestFormat.formatDescription)
+            print("[Camera] Chose format: \(dims.width)x\(dims.height) supporting max \(maxFrameRate) fps")
+            
+            do {
+                try device.lockForConfiguration()
+                device.activeFormat = bestFormat
+                let desc = CMVideoFormatDescriptionGetDimensions(bestFormat.formatDescription)
+                self.activeDimensions = desc
+                if let frameRateRange = bestFormat.videoSupportedFrameRateRanges.first(where: { $0.maxFrameRate == maxFrameRate }) {
+                    let duration = CMTimeMake(value: 1, timescale: Int32(frameRateRange.maxFrameRate.rounded()))
+                    device.activeVideoMinFrameDuration = duration
+                    device.activeVideoMaxFrameDuration = duration
+                    print("[Camera] Set frame duration to \(duration.value)/\(duration.timescale)")
+                }
+                device.unlockForConfiguration()
+                
+                let actualDuration = device.activeVideoMaxFrameDuration
+                if actualDuration.seconds > 0 {
+                    self.activeFrameRate = 1.0 / actualDuration.seconds
+                } else {
+                    self.activeFrameRate = Double(maxFrameRate)
+                }
+                
+                print("[Camera] Active configuration: \(self.activeDimensions.width)x\(self.activeDimensions.height) @ \(self.activeFrameRate) fps")
+                
+                if self.activeFrameRate >= 240 {
+                    print("[Camera] ✅ SUCCESS: Running at 240fps or higher!")
+                } else if self.activeFrameRate >= 120 {
+                    print("[Camera] ⚠️ WARNING: Running at 120fps (not 240fps)")
+                } else {
+                    print("[Camera] ⚠️ WARNING: Running at \(self.activeFrameRate)fps (expected 240fps)")
+                }
+            } catch {
+                print("Failed to configure device for highest frame rate: \(error)")
+            }
+        } else {
+            print("[Camera] ERROR: No suitable format found!")
+        }
+        
+        do {
+            videoDeviceInput = try AVCaptureDeviceInput(device: device)
+        } catch {
+            print("Error creating device input: \(error)")
+            return
+        }
+        
+        guard videoDeviceInput != nil else { return }
+        captureSession.addInput(videoDeviceInput)
+        
+        videoOutput = AVCaptureVideoDataOutput()
+        videoOutput.videoSettings = [
+            kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+        ]
+        
+        let videoQueue = DispatchQueue(label: "videoQueue", qos: .userInteractive, attributes: [], autoreleaseFrequency: .workItem)
+        videoOutput.setSampleBufferDelegate(self, queue: videoQueue)
+        
+        if captureSession.canAddOutput(videoOutput) {
+            captureSession.addOutput(videoOutput)
+        }
+        
+        videoOutput.alwaysDiscardsLateVideoFrames = false
+        
+        if let connection = videoOutput.connection(with: .video) {
+            if #available(iOS 17.0, *) {
+                let desiredAngle: CGFloat = 90
+                if connection.isVideoRotationAngleSupported(desiredAngle) {
+                    connection.videoRotationAngle = desiredAngle
+                }
+            } else {
+                if connection.isVideoOrientationSupported {
+                    connection.videoOrientation = .portrait
+                }
+            }
+            
+            self.mirrored = (videoDeviceInput.device.position == .front)
+            self.contentFlippedVertically = false
+        }
+        
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            let bounds = self.view.bounds
+            let preview = AVCaptureVideoPreviewLayer(session: self.captureSession)
+            preview.videoGravity = .resizeAspectFill
+            preview.frame = bounds
+            self.previewLayer = preview
+            self.view.layer.insertSublayer(preview, at: 0)
+        }
+        
+        self.sessionQueue.async { [weak self] in
+            self?.captureSession.startRunning()
+        }
+        
+        captureSession.commitConfiguration()
+    }
+    
+    // MARK: - Navigation Helpers
+    func dismissToRootAndPresentAlert(_ alert: UIAlertController) {
+        DispatchQueue.main.async {
+            let presentAlert = {
+                if let root = self.view.window?.rootViewController {
+                    var top = root
+                    while let presented = top.presentedViewController { top = presented }
+                    top.present(alert, animated: true)
+                } else {
+                    self.topMostViewController().present(alert, animated: true)
+                }
+            }
+            if let nav = self.navigationController {
+                nav.popToRootViewController(animated: true)
+                nav.dismiss(animated: true) {
+                    presentAlert()
+                }
+            } else if let presenting = self.presentingViewController {
+                var rootPresenter = presenting
+                while let p = rootPresenter.presentingViewController { rootPresenter = p }
+                rootPresenter.presentedViewController?.dismiss(animated: true) {
+                    presentAlert()
+                }
+            } else {
+                self.view.window?.rootViewController?.dismiss(animated: true) {
+                    presentAlert()
+                }
+            }
+        }
+    }
+    
+    // MARK: - Permissions Helper
+    func ensurePhotoLibraryPermission(completion: @escaping (Bool) -> Void) {
+        let status = PHPhotoLibrary.authorizationStatus(for: .addOnly)
+        switch status {
+        case .authorized, .limited:
+            completion(true)
+        case .notDetermined:
+            PHPhotoLibrary.requestAuthorization(for: .addOnly) { newStatus in
+                DispatchQueue.main.async {
+                    completion(newStatus == .authorized || newStatus == .limited)
+                }
+            }
+        default:
+            completion(false)
+        }
+    }
+}
+
+// MARK: - UIViewController extension for safe alert presentation
+extension UIViewController {
+    func topMostViewController() -> UIViewController {
+        var top = self
+        while let presented = top.presentedViewController {
+            top = presented
+        }
+        return top
+    }
+}
