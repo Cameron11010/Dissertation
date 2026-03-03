@@ -1,0 +1,504 @@
+//
+//  CameraViewController+Overlay.swift
+//  Baseball Tracker
+//
+//  Live overlay drawing using CALayers: bounding boxes, pose skeleton,
+//  joint angles, calibration markers, strike zone, and ROI debug box.
+//
+
+import UIKit
+import Vision
+import CoreGraphics
+
+extension CameraViewController {
+    
+    // MARK: - Coordinate Conversion
+    func convertBoundingBox(_ rect: CGRect, bufferSize: CGSize, mirrored: Bool, contentFlippedVertically: Bool) -> CGRect {
+        var x = rect.origin.x * bufferSize.width
+        var y = rect.origin.y * bufferSize.height
+        let w = rect.width * bufferSize.width
+        let h = rect.height * bufferSize.height
+
+        if mirrored { x = bufferSize.width - x - w }
+        if !contentFlippedVertically {
+            y = bufferSize.height - y - h
+        }
+
+        return CGRect(x: x, y: y, width: w, height: h)
+    }
+
+    func convertPoint(_ point: CGPoint, bufferSize: CGSize, mirrored: Bool, contentFlippedVertically: Bool) -> CGPoint {
+        var x = point.x * bufferSize.width
+        var y = point.y * bufferSize.height
+
+        if mirrored { x = bufferSize.width - x }
+        if !contentFlippedVertically {
+            y = bufferSize.height - y
+        }
+
+        return CGPoint(x: x, y: y)
+    }
+    
+    // MARK: - Ball Bounding Box
+    func drawBoundingBox(_ rect: CGRect, bufferSize: CGSize,
+                         confidence: VNConfidence, mirrored: Bool,
+                         contentFlippedVertically: Bool) {
+        let boxRect = convertBoundingBox(rect, bufferSize: bufferSize,
+                                         mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+        
+        let centerX = boxRect.midX
+        let centerY = boxRect.midY
+        
+        let ballUIColor = settings.ballColor.toUIColor()
+        
+        let circleLayer = CAShapeLayer()
+        let circlePath = UIBezierPath(ovalIn: CGRect(x: boxRect.minX,
+                                                      y: boxRect.minY,
+                                                      width: boxRect.width,
+                                                      height: boxRect.height))
+        circleLayer.path = circlePath.cgPath
+        circleLayer.strokeColor = ballUIColor.cgColor
+        circleLayer.fillColor = UIColor.clear.cgColor
+        circleLayer.lineWidth = 3
+        
+        overlayLayer.addSublayer(circleLayer)
+        
+        if settings.showLabels {
+            let textLayer = CATextLayer()
+            textLayer.string = String(format: "%.0f%%", confidence * 100)
+            textLayer.foregroundColor = ballUIColor.cgColor
+            textLayer.backgroundColor = UIColor.clear.cgColor
+            textLayer.fontSize = 28
+            textLayer.alignmentMode = .center
+            textLayer.contentsScale = view.traitCollection.displayScale
+            
+            let textWidth: CGFloat = 80
+            let textHeight: CGFloat = 35
+            textLayer.frame = CGRect(x: centerX - textWidth / 2,
+                                    y: centerY - textHeight / 2,
+                                    width: textWidth,
+                                    height: textHeight)
+            
+            overlayLayer.addSublayer(textLayer)
+        }
+    }
+    
+    // MARK: - Pose Skeleton Drawing
+    func drawPoseSkeleton(_ observation: VNHumanBodyPoseObservation, bufferSize: CGSize) {
+        let connections: [(VNHumanBodyPoseObservation.JointName, VNHumanBodyPoseObservation.JointName)] = [
+            (.neck, .rightShoulder), (.neck, .leftShoulder),
+            (.rightShoulder, .rightHip), (.leftShoulder, .leftHip),
+            (.rightHip, .leftHip),
+            (.rightShoulder, .rightElbow), (.rightElbow, .rightWrist),
+            (.leftShoulder, .leftElbow), (.leftElbow, .leftWrist),
+            (.rightHip, .rightKnee), (.rightKnee, .rightAnkle),
+            (.leftHip, .leftKnee), (.leftKnee, .leftAnkle)
+        ]
+        
+        guard let recognizedPoints = try? observation.recognizedPoints(.all) else { return }
+        
+        let skeletonUIColor = settings.skeletonColor.toUIColor()
+        let jointUIColor = settings.jointColor.toUIColor()
+        
+        for (startJoint, endJoint) in connections {
+            guard let startPoint = recognizedPoints[startJoint],
+                  let endPoint = recognizedPoints[endJoint],
+                  startPoint.confidence > settings.poseConfidenceThreshold,
+                  endPoint.confidence > settings.poseConfidenceThreshold else { continue }
+            
+            let start = convertPoint(startPoint.location, bufferSize: bufferSize,
+                                    mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let end = convertPoint(endPoint.location, bufferSize: bufferSize,
+                                  mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            
+            let bonePath = UIBezierPath()
+            bonePath.move(to: start)
+            bonePath.addLine(to: end)
+            
+            let boneLayer = CAShapeLayer()
+            boneLayer.path = bonePath.cgPath
+            boneLayer.strokeColor = skeletonUIColor.cgColor
+            boneLayer.lineWidth = 3
+            boneLayer.lineCap = .round
+            
+            overlayLayer.addSublayer(boneLayer)
+        }
+        
+        for (_, point) in recognizedPoints {
+            guard point.confidence > settings.poseConfidenceThreshold else { continue }
+            
+            let location = convertPoint(point.location, bufferSize: bufferSize,
+                                       mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            
+            let jointSize: CGFloat = 8
+            let jointRect = CGRect(x: location.x - jointSize/2,
+                                  y: location.y - jointSize/2,
+                                  width: jointSize,
+                                  height: jointSize)
+            
+            let jointLayer = CAShapeLayer()
+            jointLayer.path = UIBezierPath(ovalIn: jointRect).cgPath
+            jointLayer.fillColor = jointUIColor.cgColor
+            jointLayer.strokeColor = UIColor.white.cgColor
+            jointLayer.lineWidth = 2
+            
+            overlayLayer.addSublayer(jointLayer)
+        }
+        
+        if settings.showLabels {
+            drawJointAngles(observation, bufferSize: bufferSize)
+        }
+    }
+    
+    // MARK: - Draw Joint Angles with Labels
+    func drawJointAngles(_ observation: VNHumanBodyPoseObservation, bufferSize: CGSize) {
+        guard let recognizedPoints = try? observation.recognizedPoints(.all) else { return }
+        
+        let angleConfidenceThreshold = settings.poseConfidenceThreshold
+        
+        if frameCount % 60 == 0 {
+            var detectedJoints: [String] = []
+            for (jointName, point) in recognizedPoints where point.confidence > angleConfidenceThreshold {
+                detectedJoints.append("\(jointName.rawValue): \(String(format: "%.2f", point.confidence))")
+            }
+            print("[Pose Debug] Detected joints: \(detectedJoints.joined(separator: ", "))")
+        }
+        
+        let elbowColor = settings.elbowAngleColor.toUIColor()
+        let kneeColor = settings.kneeAngleColor.toUIColor()
+        let shoulderColor = settings.shoulderAngleColor.toUIColor()
+        
+        // Right Elbow Angle
+        if let rightShoulder = recognizedPoints[.rightShoulder],
+           let rightElbow = recognizedPoints[.rightElbow],
+           let rightWrist = recognizedPoints[.rightWrist],
+           rightShoulder.confidence > angleConfidenceThreshold,
+           rightElbow.confidence > angleConfidenceThreshold,
+           rightWrist.confidence > angleConfidenceThreshold {
+            let s = convertPoint(rightShoulder.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let e = convertPoint(rightElbow.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let w = convertPoint(rightWrist.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let angle = calculateJointAngle(proximal: s, joint: e, distal: w)
+            drawAngleArc(at: e, from: s, to: w, angle: angle, label: "R Elbow", color: elbowColor)
+        }
+        
+        // Left Elbow Angle
+        if let leftShoulder = recognizedPoints[.leftShoulder],
+           let leftElbow = recognizedPoints[.leftElbow],
+           let leftWrist = recognizedPoints[.leftWrist],
+           leftShoulder.confidence > angleConfidenceThreshold,
+           leftElbow.confidence > angleConfidenceThreshold,
+           leftWrist.confidence > angleConfidenceThreshold {
+            let s = convertPoint(leftShoulder.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let e = convertPoint(leftElbow.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let w = convertPoint(leftWrist.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let angle = calculateJointAngle(proximal: s, joint: e, distal: w)
+            drawAngleArc(at: e, from: s, to: w, angle: angle, label: "L Elbow", color: elbowColor)
+        }
+        
+        // Right Knee Angle
+        if let rightHip = recognizedPoints[.rightHip],
+           let rightKnee = recognizedPoints[.rightKnee],
+           let rightAnkle = recognizedPoints[.rightAnkle],
+           rightHip.confidence > angleConfidenceThreshold,
+           rightKnee.confidence > angleConfidenceThreshold,
+           rightAnkle.confidence > angleConfidenceThreshold {
+            let h = convertPoint(rightHip.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let k = convertPoint(rightKnee.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let a = convertPoint(rightAnkle.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let angle = calculateJointAngle(proximal: h, joint: k, distal: a)
+            drawAngleArc(at: k, from: h, to: a, angle: angle, label: "R Knee", color: kneeColor)
+        }
+        
+        // Left Knee Angle
+        if let leftHip = recognizedPoints[.leftHip],
+           let leftKnee = recognizedPoints[.leftKnee],
+           let leftAnkle = recognizedPoints[.leftAnkle],
+           leftHip.confidence > angleConfidenceThreshold,
+           leftKnee.confidence > angleConfidenceThreshold,
+           leftAnkle.confidence > angleConfidenceThreshold {
+            let h = convertPoint(leftHip.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let k = convertPoint(leftKnee.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let a = convertPoint(leftAnkle.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let angle = calculateJointAngle(proximal: h, joint: k, distal: a)
+            drawAngleArc(at: k, from: h, to: a, angle: angle, label: "L Knee", color: kneeColor)
+        }
+        
+        // Right Shoulder Angle
+        if let rightHip = recognizedPoints[.rightHip],
+           let rightShoulder = recognizedPoints[.rightShoulder],
+           let rightElbow = recognizedPoints[.rightElbow],
+           rightHip.confidence > angleConfidenceThreshold,
+           rightShoulder.confidence > angleConfidenceThreshold,
+           rightElbow.confidence > angleConfidenceThreshold {
+            let h = convertPoint(rightHip.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let s = convertPoint(rightShoulder.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let e = convertPoint(rightElbow.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let angle = calculateJointAngle(proximal: h, joint: s, distal: e)
+            drawAngleArc(at: s, from: h, to: e, angle: angle, label: "R Shoulder", color: shoulderColor)
+        }
+        
+        // Left Shoulder Angle
+        if let leftHip = recognizedPoints[.leftHip],
+           let leftShoulder = recognizedPoints[.leftShoulder],
+           let leftElbow = recognizedPoints[.leftElbow],
+           leftHip.confidence > angleConfidenceThreshold,
+           leftShoulder.confidence > angleConfidenceThreshold,
+           leftElbow.confidence > angleConfidenceThreshold {
+            let h = convertPoint(leftHip.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let s = convertPoint(leftShoulder.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let e = convertPoint(leftElbow.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let angle = calculateJointAngle(proximal: h, joint: s, distal: e)
+            drawAngleArc(at: s, from: h, to: e, angle: angle, label: "L Shoulder", color: shoulderColor)
+        }
+        
+        // Hip-Shoulder Separation
+        if let leftShoulder = recognizedPoints[.leftShoulder],
+           let rightShoulder = recognizedPoints[.rightShoulder],
+           let leftHip = recognizedPoints[.leftHip],
+           let rightHip = recognizedPoints[.rightHip],
+           leftShoulder.confidence > angleConfidenceThreshold,
+           rightShoulder.confidence > angleConfidenceThreshold,
+           leftHip.confidence > angleConfidenceThreshold,
+           rightHip.confidence > angleConfidenceThreshold {
+            let lShoulder = convertPoint(leftShoulder.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let rShoulder = convertPoint(rightShoulder.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let lHip = convertPoint(leftHip.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let rHip = convertPoint(rightHip.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            
+            let shoulderAngle = atan2(rShoulder.y - lShoulder.y, rShoulder.x - lShoulder.x)
+            let hipAngle = atan2(rHip.y - lHip.y, rHip.x - lHip.x)
+            var separation = abs(shoulderAngle - hipAngle) * 180.0 / .pi
+            if separation > 180 { separation = 360 - separation }
+            
+            let torsoCenter = CGPoint(x: (lShoulder.x + rShoulder.x + lHip.x + rHip.x) / 4,
+                                     y: (lShoulder.y + rShoulder.y + lHip.y + rHip.y) / 4)
+            
+            drawSeparationIndicator(at: torsoCenter, angle: separation, label: "Hip-Shoulder Sep")
+        }
+    }
+    
+    // MARK: - Draw Angle Arc with Label
+    func drawAngleArc(at joint: CGPoint, from point1: CGPoint, to point2: CGPoint,
+                      angle: Double, label: String, color: UIColor) {
+        let arcRadius: CGFloat = 30
+        
+        let angle1 = atan2(point1.y - joint.y, point1.x - joint.x)
+        let angle2 = atan2(point2.y - joint.y, point2.x - joint.x)
+        
+        var startAngle = angle1
+        var endAngle = angle2
+        
+        var angleDiff = endAngle - startAngle
+        if angleDiff > .pi { angleDiff -= 2 * .pi }
+        if angleDiff < -.pi { angleDiff += 2 * .pi }
+        
+        if angleDiff < 0 {
+            swap(&startAngle, &endAngle)
+        }
+        
+        let arcPath = UIBezierPath(arcCenter: joint,
+                                   radius: arcRadius,
+                                   startAngle: startAngle,
+                                   endAngle: endAngle,
+                                   clockwise: true)
+        
+        let arcLayer = CAShapeLayer()
+        arcLayer.path = arcPath.cgPath
+        arcLayer.strokeColor = color.cgColor
+        arcLayer.fillColor = UIColor.clear.cgColor
+        arcLayer.lineWidth = 2
+        
+        overlayLayer.addSublayer(arcLayer)
+        
+        let midAngle = startAngle + (endAngle - startAngle) / 2
+        let labelDistance: CGFloat = arcRadius + 20
+        let labelX = joint.x + cos(midAngle) * labelDistance
+        let labelY = joint.y + sin(midAngle) * labelDistance
+        
+        let textLayer = CATextLayer()
+        textLayer.string = "\(label)\n\(Int(angle))°"
+        textLayer.foregroundColor = color.cgColor
+        textLayer.backgroundColor = UIColor.black.withAlphaComponent(0.6).cgColor
+        textLayer.fontSize = 14
+        textLayer.alignmentMode = .center
+        textLayer.contentsScale = view.traitCollection.displayScale
+        
+        let textWidth: CGFloat = 80
+        let textHeight: CGFloat = 36
+        textLayer.frame = CGRect(x: labelX - textWidth / 2,
+                                y: labelY - textHeight / 2,
+                                width: textWidth,
+                                height: textHeight)
+        textLayer.cornerRadius = 4
+        
+        overlayLayer.addSublayer(textLayer)
+    }
+    
+    // MARK: - Draw Separation Indicator
+    func drawSeparationIndicator(at center: CGPoint, angle: Double, label: String) {
+        let separationUIColor = settings.separationColor.toUIColor()
+        
+        let textLayer = CATextLayer()
+        textLayer.string = "\(label)\n\(Int(angle))°"
+        textLayer.foregroundColor = separationUIColor.cgColor
+        textLayer.backgroundColor = UIColor.black.withAlphaComponent(0.7).cgColor
+        textLayer.fontSize = 16
+        textLayer.alignmentMode = .center
+        textLayer.contentsScale = view.traitCollection.displayScale
+        
+        let textWidth: CGFloat = 120
+        let textHeight: CGFloat = 40
+        textLayer.frame = CGRect(x: center.x - textWidth / 2,
+                                y: center.y - textHeight / 2,
+                                width: textWidth,
+                                height: textHeight)
+        textLayer.cornerRadius = 6
+        textLayer.borderColor = separationUIColor.cgColor
+        textLayer.borderWidth = 2
+        
+        overlayLayer.addSublayer(textLayer)
+    }
+    
+    // MARK: - Draw Calibration Overlay
+    func drawCalibrationOverlay(bufferSize: CGSize) {
+        let leftPos = CGPoint(
+            x: settings.plateLeftEdge.x * bufferSize.width,
+            y: settings.plateLeftEdge.y * bufferSize.height
+        )
+        let rightPos = CGPoint(
+            x: settings.plateRightEdge.x * bufferSize.width,
+            y: settings.plateRightEdge.y * bufferSize.height
+        )
+        
+        let linePath = UIBezierPath()
+        linePath.move(to: leftPos)
+        linePath.addLine(to: rightPos)
+        
+        let lineLayer = CAShapeLayer()
+        lineLayer.path = linePath.cgPath
+        lineLayer.strokeColor = UIColor.yellow.cgColor
+        lineLayer.lineWidth = 3
+        lineLayer.lineCap = .round
+        overlayLayer.addSublayer(lineLayer)
+        
+        let leftMarkerSize: CGFloat = 12
+        let leftMarkerRect = CGRect(x: leftPos.x - leftMarkerSize / 2, y: leftPos.y - leftMarkerSize / 2,
+                                    width: leftMarkerSize, height: leftMarkerSize)
+        let leftMarkerLayer = CAShapeLayer()
+        leftMarkerLayer.path = UIBezierPath(ovalIn: leftMarkerRect).cgPath
+        leftMarkerLayer.fillColor = UIColor.green.cgColor
+        leftMarkerLayer.strokeColor = UIColor.white.cgColor
+        leftMarkerLayer.lineWidth = 2
+        overlayLayer.addSublayer(leftMarkerLayer)
+        
+        let rightMarkerSize: CGFloat = 12
+        let rightMarkerRect = CGRect(x: rightPos.x - rightMarkerSize / 2, y: rightPos.y - rightMarkerSize / 2,
+                                     width: rightMarkerSize, height: rightMarkerSize)
+        let rightMarkerLayer = CAShapeLayer()
+        rightMarkerLayer.path = UIBezierPath(ovalIn: rightMarkerRect).cgPath
+        rightMarkerLayer.fillColor = UIColor.blue.cgColor
+        rightMarkerLayer.strokeColor = UIColor.white.cgColor
+        rightMarkerLayer.lineWidth = 2
+        overlayLayer.addSublayer(rightMarkerLayer)
+        
+        let midpoint = CGPoint(x: (leftPos.x + rightPos.x) / 2, y: (leftPos.y + rightPos.y) / 2)
+        let widthText = String(format: "%.1f%@", settings.plateWidth, settings.useCentimeters ? "cm" : "\"")
+        
+        let textLayer = CATextLayer()
+        textLayer.string = widthText
+        textLayer.foregroundColor = UIColor.white.cgColor
+        textLayer.backgroundColor = UIColor.yellow.withAlphaComponent(0.8).cgColor
+        textLayer.fontSize = 16
+        textLayer.alignmentMode = .center
+        textLayer.contentsScale = view.traitCollection.displayScale
+        
+        let textWidth: CGFloat = 80
+        let textHeight: CGFloat = 28
+        textLayer.frame = CGRect(x: midpoint.x - textWidth / 2, y: midpoint.y - textHeight / 2,
+                                width: textWidth, height: textHeight)
+        textLayer.cornerRadius = 6
+        overlayLayer.addSublayer(textLayer)
+    }
+    
+    // MARK: - Strike Zone Overlay
+    func drawStrikeZone(bufferSize: CGSize) {
+        let left = CGPoint(x: settings.plateLeftEdge.x * bufferSize.width,
+                          y: settings.plateLeftEdge.y * bufferSize.height)
+        let right = CGPoint(x: settings.plateRightEdge.x * bufferSize.width,
+                           y: settings.plateRightEdge.y * bufferSize.height)
+
+        let plateVec = CGPoint(x: right.x - left.x, y: right.y - left.y)
+        let platePixels = sqrt(plateVec.x * plateVec.x + plateVec.y * plateVec.y)
+        guard platePixels > 1 else { return }
+
+        let plateInches: Double = settings.useCentimeters ? settings.plateWidth / 2.54 : settings.plateWidth
+        let pixelsPerInch = platePixels / CGFloat(plateInches)
+
+        let bottomOffsetPixels = pixelsPerInch * CGFloat(settings.strikeZoneBottomOffset)
+        let zoneHeightPixels   = pixelsPerInch * CGFloat(settings.strikeZoneHeight)
+
+        let bl = CGPoint(x: left.x,  y: left.y  - bottomOffsetPixels)
+        let br = CGPoint(x: right.x, y: right.y - bottomOffsetPixels)
+        let tl = CGPoint(x: left.x,  y: left.y  - bottomOffsetPixels - zoneHeightPixels)
+        let tr = CGPoint(x: right.x, y: right.y - bottomOffsetPixels - zoneHeightPixels)
+
+        let szColor = settings.strikeZoneColor.toUIColor()
+
+        // Filled background
+        let fillPath = UIBezierPath()
+        fillPath.move(to: bl); fillPath.addLine(to: br); fillPath.addLine(to: tr); fillPath.addLine(to: tl); fillPath.close()
+        let fillLayer = CAShapeLayer()
+        fillLayer.path = fillPath.cgPath
+        fillLayer.fillColor = szColor.withAlphaComponent(0.08).cgColor
+        fillLayer.strokeColor = nil
+        overlayLayer.addSublayer(fillLayer)
+
+        // Outline
+        let outlineLayer = CAShapeLayer()
+        outlineLayer.path = fillPath.cgPath
+        outlineLayer.fillColor = nil
+        outlineLayer.strokeColor = szColor.withAlphaComponent(0.7).cgColor
+        outlineLayer.lineWidth = 2.5
+        outlineLayer.lineCap = .round
+        outlineLayer.lineJoin = .round
+        overlayLayer.addSublayer(outlineLayer)
+
+        // Dashed centre line
+        let midLeft  = CGPoint(x: (bl.x + tl.x) / 2, y: (bl.y + tl.y) / 2)
+        let midRight = CGPoint(x: (br.x + tr.x) / 2, y: (br.y + tr.y) / 2)
+        let midPath = UIBezierPath()
+        midPath.move(to: midLeft); midPath.addLine(to: midRight)
+        let midLayer = CAShapeLayer()
+        midLayer.path = midPath.cgPath
+        midLayer.fillColor = nil
+        midLayer.strokeColor = szColor.withAlphaComponent(0.35).cgColor
+        midLayer.lineWidth = 1.0
+        midLayer.lineDashPattern = [6, 4]
+        overlayLayer.addSublayer(midLayer)
+    }
+    
+    // MARK: - Draw ROI Debug Box
+    func drawROI(_ roi: CGRect, bufferSize: CGSize) {
+        let roiRect = convertBoundingBox(roi, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+        
+        let roiPath = UIBezierPath(rect: roiRect)
+        let roiLayer = CAShapeLayer()
+        roiLayer.path = roiPath.cgPath
+        roiLayer.strokeColor = UIColor.yellow.withAlphaComponent(0.8).cgColor
+        roiLayer.fillColor = UIColor.yellow.withAlphaComponent(0.1).cgColor
+        roiLayer.lineWidth = 3
+        roiLayer.lineDashPattern = [10, 5]
+        overlayLayer.addSublayer(roiLayer)
+        
+        let label = CATextLayer()
+        label.string = "ROI (missed: \(framesWithoutDetection))"
+        label.foregroundColor = UIColor.white.cgColor
+        label.backgroundColor = UIColor.yellow.withAlphaComponent(0.8).cgColor
+        label.fontSize = 14
+        label.contentsScale = view.traitCollection.displayScale
+        label.alignmentMode = .center
+        label.frame = CGRect(x: roiRect.minX, y: roiRect.minY - 22, width: 140, height: 20)
+        overlayLayer.addSublayer(label)
+    }
+}
