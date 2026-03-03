@@ -1,0 +1,410 @@
+//
+//  CalibrationView.swift
+//  Baseball Tracker
+//
+//  Created by Cameron Millar on 19/02/2026.
+//
+
+
+//
+//  CalibrationView.swift
+//  Baseball Tracker
+//
+//  Home plate calibration UI: marker placement, zoom-aware scaling,
+//  and live camera preview for calibration.
+//
+
+import SwiftUI
+import AVFoundation
+
+// MARK: - Calibration View
+struct CalibrationView: View {
+    @ObservedObject var settings: CameraSettings
+    @Environment(\.dismiss) var dismiss
+    var minimumZoom: CGFloat = 1.0
+    var onDismiss: (() -> Void)?
+    
+    @State private var leftEdgePosition: CGPoint = .zero
+    @State private var rightEdgePosition: CGPoint = .zero
+    @State private var calibrationZoom: CGFloat = 1.0
+    @State private var leftEdgeZoom: CGFloat = 1.0
+    @State private var rightEdgeZoom: CGFloat = 1.0
+    @State private var plateWidthText: String = "17"
+    @State private var hasSetLeftEdge = false
+    @State private var hasSetRightEdge = false
+    @State private var screenSize: CGSize = .zero
+    @State private var useCentimeters: Bool = false
+    @State private var zoomFactor: CGFloat = 1.0
+    
+    var body: some View {
+        GeometryReader { geometry in
+            calibrationContent
+                .onAppear {
+                    screenSize = geometry.size
+                    loadExistingCalibration()
+                }
+        }
+    }
+    
+    private var calibrationContent: some View {
+        ZStack {
+            CalibrationCameraPreview(zoomFactor: $zoomFactor, minimumZoom: minimumZoom)
+                .ignoresSafeArea()
+            
+            VStack {
+                VStack(spacing: 8) {
+                    Text("Calibrate Home Plate")
+                        .font(.largeTitle)
+                        .fontWeight(.bold)
+                        .foregroundColor(.white)
+                    
+                    Text(instructionText)
+                        .font(.headline)
+                        .foregroundColor(.white)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal)
+                }
+                .padding()
+                .background(Color.black.opacity(0.6))
+                
+                Spacer()
+                
+                HStack {
+                    Text(String(format: "%.1fx", zoomFactor))
+                        .font(.subheadline)
+                        .fontWeight(.semibold)
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(Color.black.opacity(0.6))
+                        .cornerRadius(8)
+                    Spacer()
+                }
+                .padding(.leading, 16)
+                
+                Spacer()
+                
+                // Plate width input
+                VStack(spacing: 12) {
+                    Text("Home Plate Width")
+                        .font(.headline)
+                        .foregroundColor(.white)
+                    
+                    HStack(spacing: 16) {
+                        if useCentimeters {
+                            Button { plateWidthText = "43.2" } label: {
+                                Text("Baseball (43.2cm)")
+                                    .font(.subheadline).foregroundColor(.white)
+                                    .padding(.horizontal, 12).padding(.vertical, 8)
+                                    .background(plateWidthText == "43.2" ? Color.blue : Color.gray.opacity(0.5))
+                                    .cornerRadius(8)
+                            }
+                            Button { plateWidthText = "30.5" } label: {
+                                Text("Softball (30.5cm)")
+                                    .font(.subheadline).foregroundColor(.white)
+                                    .padding(.horizontal, 12).padding(.vertical, 8)
+                                    .background(plateWidthText == "30.5" ? Color.blue : Color.gray.opacity(0.5))
+                                    .cornerRadius(8)
+                            }
+                        } else {
+                            Button { plateWidthText = "17" } label: {
+                                Text("Baseball (17\")")
+                                    .font(.subheadline).foregroundColor(.white)
+                                    .padding(.horizontal, 12).padding(.vertical, 8)
+                                    .background(plateWidthText == "17" ? Color.blue : Color.gray.opacity(0.5))
+                                    .cornerRadius(8)
+                            }
+                            Button { plateWidthText = "12" } label: {
+                                Text("Softball (12\")")
+                                    .font(.subheadline).foregroundColor(.white)
+                                    .padding(.horizontal, 12).padding(.vertical, 8)
+                                    .background(plateWidthText == "12" ? Color.blue : Color.gray.opacity(0.5))
+                                    .cornerRadius(8)
+                            }
+                        }
+                    }
+                    
+                    HStack {
+                        TextField("Width", text: $plateWidthText)
+                            .textFieldStyle(.roundedBorder)
+                            .keyboardType(.decimalPad)
+                            .frame(width: 100)
+                        Text(useCentimeters ? "cm" : "inches")
+                            .foregroundColor(.white)
+                    }
+                }
+                .padding()
+                .background(Color.black.opacity(0.6))
+                .cornerRadius(12)
+                .padding()
+                
+                // Action buttons
+                VStack(spacing: 12) {
+                    HStack(spacing: 12) {
+                        Button { dismiss() } label: {
+                            Text("Cancel").font(.headline).foregroundColor(.white)
+                                .frame(maxWidth: .infinity).padding()
+                                .background(Color.red.opacity(0.7)).cornerRadius(12)
+                        }
+                        Button { clearCalibration() } label: {
+                            Text("Clear").font(.headline).foregroundColor(.white)
+                                .frame(maxWidth: .infinity).padding()
+                                .background(Color.orange.opacity(0.7)).cornerRadius(12)
+                        }
+                    }
+                    Button { saveCalibration() } label: {
+                        Text("Save").font(.headline).foregroundColor(.white)
+                            .frame(maxWidth: .infinity).padding()
+                            .background(canSave ? Color.green : Color.gray.opacity(0.5)).cornerRadius(12)
+                    }
+                    .disabled(!canSave)
+                }
+                .padding()
+            }
+            
+            // Edge Markers
+            if hasSetLeftEdge {
+                CalibrationMarker(label: "Left Edge", color: .green)
+                    .position(scaledPosition(leftEdgePosition, recordedAt: leftEdgeZoom))
+            }
+            if hasSetRightEdge {
+                CalibrationMarker(label: "Right Edge", color: .blue)
+                    .position(scaledPosition(rightEdgePosition, recordedAt: rightEdgeZoom))
+            }
+            
+            // Plate width line
+            if hasSetLeftEdge && hasSetRightEdge {
+                let scaledLeft = scaledPosition(leftEdgePosition, recordedAt: leftEdgeZoom)
+                let scaledRight = scaledPosition(rightEdgePosition, recordedAt: rightEdgeZoom)
+                
+                Path { path in
+                    path.move(to: scaledLeft)
+                    path.addLine(to: scaledRight)
+                }
+                .stroke(Color.yellow, lineWidth: 4)
+                
+                let midpoint = CGPoint(x: (scaledLeft.x + scaledRight.x) / 2,
+                                      y: (scaledLeft.y + scaledRight.y) / 2)
+                Text("\(plateWidthText)\(useCentimeters ? "cm" : "\"")")
+                    .font(.headline).fontWeight(.bold).foregroundColor(.white)
+                    .padding(8).background(Color.yellow.opacity(0.8)).cornerRadius(6)
+                    .position(midpoint)
+            }
+        }
+        .contentShape(Rectangle())
+        .gesture(
+            DragGesture(minimumDistance: 0)
+                .onEnded { value in handleTap(at: value.location) }
+        )
+        .simultaneousGesture(
+            MagnificationGesture()
+                .onChanged { scale in
+                    let newZoom = calibrationZoom * scale
+                    zoomFactor = min(max(newZoom, minimumZoom), 10.0)
+                }
+                .onEnded { scale in
+                    calibrationZoom = max(zoomFactor, minimumZoom)
+                }
+        )
+    }
+    
+    private func scaledPosition(_ position: CGPoint, recordedAt markerZoom: CGFloat) -> CGPoint {
+        let center = CGPoint(x: screenSize.width / 2, y: screenSize.height / 2)
+        let scale = zoomFactor / markerZoom
+        return CGPoint(x: center.x + (position.x - center.x) * scale,
+                      y: center.y + (position.y - center.y) * scale)
+    }
+    
+    private func loadExistingCalibration() {
+        useCentimeters = settings.useCentimeters
+        if settings.isCalibrated {
+            hasSetLeftEdge = true
+            hasSetRightEdge = true
+            calibrationZoom = minimumZoom
+            leftEdgeZoom = minimumZoom
+            rightEdgeZoom = minimumZoom
+            zoomFactor = minimumZoom
+            leftEdgePosition = CGPoint(x: settings.plateLeftEdge.x * screenSize.width,
+                                      y: settings.plateLeftEdge.y * screenSize.height)
+            rightEdgePosition = CGPoint(x: settings.plateRightEdge.x * screenSize.width,
+                                       y: settings.plateRightEdge.y * screenSize.height)
+            plateWidthText = String(format: "%.1f", settings.plateWidth)
+        } else {
+            calibrationZoom = minimumZoom
+            leftEdgeZoom = minimumZoom
+            rightEdgeZoom = minimumZoom
+            zoomFactor = minimumZoom
+            plateWidthText = useCentimeters ? "43.2" : "17"
+        }
+    }
+    
+    private var instructionText: String {
+        if !hasSetLeftEdge {
+            return "Pinch to zoom in for precision, then tap the LEFT edge of home plate"
+        } else if !hasSetRightEdge {
+            return "Now tap the RIGHT edge of home plate"
+        } else {
+            return "Markers will stay locked to your points. Adjust width if needed, then tap Save"
+        }
+    }
+    
+    private var canSave: Bool {
+        hasSetLeftEdge && hasSetRightEdge && Double(plateWidthText) != nil && Double(plateWidthText)! > 0
+    }
+    
+    private func handleTap(at position: CGPoint) {
+        if !hasSetLeftEdge {
+            leftEdgePosition = position; leftEdgeZoom = zoomFactor; hasSetLeftEdge = true
+        } else if !hasSetRightEdge {
+            rightEdgePosition = position; rightEdgeZoom = zoomFactor; hasSetRightEdge = true
+        } else {
+            hasSetLeftEdge = false; hasSetRightEdge = false
+            calibrationZoom = minimumZoom; zoomFactor = minimumZoom
+        }
+    }
+    
+    private func clearCalibration() {
+        hasSetLeftEdge = false; hasSetRightEdge = false
+        leftEdgePosition = .zero; rightEdgePosition = .zero
+        calibrationZoom = minimumZoom; leftEdgeZoom = minimumZoom; rightEdgeZoom = minimumZoom
+        zoomFactor = minimumZoom
+        settings.isCalibrated = false; settings.plateLeftEdge = .zero; settings.plateRightEdge = .zero
+        plateWidthText = useCentimeters ? "43.2" : "17"
+        onDismiss?()
+    }
+    
+    private func saveCalibration() {
+        guard let width = Double(plateWidthText), width > 0 else { return }
+        
+        let center = CGPoint(x: screenSize.width / 2, y: screenSize.height / 2)
+        let leftAtMinZoom = CGPoint(
+            x: center.x + (leftEdgePosition.x - center.x) / leftEdgeZoom * minimumZoom,
+            y: center.y + (leftEdgePosition.y - center.y) / leftEdgeZoom * minimumZoom
+        )
+        let rightAtMinZoom = CGPoint(
+            x: center.x + (rightEdgePosition.x - center.x) / rightEdgeZoom * minimumZoom,
+            y: center.y + (rightEdgePosition.y - center.y) / rightEdgeZoom * minimumZoom
+        )
+        
+        settings.plateLeftEdge = CGPoint(x: leftAtMinZoom.x / screenSize.width, y: leftAtMinZoom.y / screenSize.height)
+        settings.plateRightEdge = CGPoint(x: rightAtMinZoom.x / screenSize.width, y: rightAtMinZoom.y / screenSize.height)
+        settings.plateWidth = width
+        settings.useCentimeters = useCentimeters
+        settings.isCalibrated = true
+        
+        onDismiss?()
+        dismiss()
+    }
+}
+
+// MARK: - Calibration Marker
+struct CalibrationMarker: View {
+    let label: String
+    let color: Color
+    
+    var body: some View {
+        VStack(spacing: 4) {
+            Circle()
+                .fill(color)
+                .frame(width: 20, height: 20)
+                .overlay(Circle().stroke(Color.white, lineWidth: 2))
+            
+            Text(label)
+                .font(.caption).fontWeight(.bold).foregroundColor(.white)
+                .padding(.horizontal, 8).padding(.vertical, 4)
+                .background(color.opacity(0.8)).cornerRadius(6)
+        }
+    }
+}
+
+// MARK: - Calibration Camera Preview
+struct CalibrationCameraPreview: UIViewControllerRepresentable {
+    @Binding var zoomFactor: CGFloat
+    var minimumZoom: CGFloat = 1.0
+    
+    func makeUIViewController(context: Context) -> CalibrationCameraViewController {
+        let vc = CalibrationCameraViewController()
+        vc.zoomFactor = zoomFactor
+        vc.minimumZoom = minimumZoom
+        return vc
+    }
+    
+    func updateUIViewController(_ uiViewController: CalibrationCameraViewController, context: Context) {
+        uiViewController.updateZoom(to: zoomFactor)
+    }
+}
+
+class CalibrationCameraViewController: UIViewController {
+    private let captureSession = AVCaptureSession()
+    private let sessionQueue = DispatchQueue(label: "calibration.camera.queue")
+    private var previewLayer: AVCaptureVideoPreviewLayer!
+    private var videoDeviceInput: AVCaptureDeviceInput?
+    
+    var zoomFactor: CGFloat = 1.0
+    var minimumZoom: CGFloat = 1.0
+    
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .black
+        setupCamera()
+    }
+    
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        previewLayer?.frame = view.bounds
+    }
+    
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        sessionQueue.async { [weak self] in self?.captureSession.startRunning() }
+    }
+    
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        sessionQueue.async { [weak self] in self?.captureSession.stopRunning() }
+    }
+    
+    private func setupCamera() {
+        sessionQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.captureSession.beginConfiguration()
+            self.captureSession.sessionPreset = .high
+            
+            guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
+                  let input = try? AVCaptureDeviceInput(device: device) else {
+                self.captureSession.commitConfiguration()
+                return
+            }
+            
+            self.videoDeviceInput = input
+            if self.captureSession.canAddInput(input) { self.captureSession.addInput(input) }
+            self.captureSession.commitConfiguration()
+            
+            DispatchQueue.main.async {
+                let preview = AVCaptureVideoPreviewLayer(session: self.captureSession)
+                preview.videoGravity = .resizeAspectFill
+                preview.frame = self.view.bounds
+                self.view.layer.insertSublayer(preview, at: 0)
+                self.previewLayer = preview
+            }
+            
+            self.updateZoom(to: self.minimumZoom)
+        }
+    }
+    
+    func updateZoom(to factor: CGFloat) {
+        guard let device = videoDeviceInput?.device else { return }
+        sessionQueue.async {
+            do {
+                try device.lockForConfiguration()
+                let maxZoom = min(device.activeFormat.videoMaxZoomFactor, 10.0)
+                let clampedFactor = max(self.minimumZoom, min(factor, maxZoom))
+                device.videoZoomFactor = clampedFactor
+                device.unlockForConfiguration()
+                print("[Calibration Zoom] Set zoom to \(String(format: "%.1f", clampedFactor))x (min: \(String(format: "%.1f", self.minimumZoom))x)")
+            } catch {
+                print("[Calibration Zoom] Error setting zoom: \(error)")
+            }
+        }
+    }
+}
