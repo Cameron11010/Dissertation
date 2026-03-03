@@ -13,6 +13,7 @@ struct ContentView: View {
     @State private var currentVideoURL: URL?
     @State private var isRecordingLive = false
     @State private var pickedVideo: PickedVideo?
+    @State private var processingVideo: PickedVideo?
     @StateObject private var cameraSettings = CameraSettings()
     @State private var showingSettings = false
 
@@ -125,15 +126,35 @@ struct ContentView: View {
             .ignoresSafeArea()
         }
         .fullScreenCover(item: $pickedVideo) { video in
+            VideoPreviewView(
+                videoURL: video.url,
+                phAsset: video.phAsset,
+                settings: cameraSettings,
+                onProcess: {
+                    let v = video
+                    pickedVideo = nil
+                    // Small delay ensures the dismiss completes before presenting the next cover
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                        processingVideo = v
+                    }
+                },
+                onCancel: {
+                    pickedVideo = nil
+                }
+            )
+            .ignoresSafeArea()
+        }
+        .fullScreenCover(item: $processingVideo) { video in
             CameraView(
                 onVideoSaved: { identifier in
                     Task { @MainActor in
                         lastVideoIdentifier = identifier
-                        pickedVideo = nil
+                        processingVideo = nil
                         print("✅ Processed video saved. Returning to home with identifier: \(identifier)")
                     }
                 },
                 videoURL: video.url,
+                phAsset: video.phAsset,
                 isRecordingLive: .constant(false),
                 settings: cameraSettings
             )
@@ -204,12 +225,30 @@ struct ContentView: View {
                 return
             }
 
+            // Fetch the PHAsset using the picker item's identifier.
+            // This is CRITICAL for slo-mo videos: the picker delivers a composed
+            // 30fps file, but with the PHAsset we can fetch the original 240fps
+            // capture via PHAssetResourceManager.
+            var asset: PHAsset?
+            if let identifier = item.itemIdentifier {
+                let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil)
+                asset = fetchResult.firstObject
+                if let asset = asset {
+                    let isSloMo = asset.mediaSubtypes.contains(.videoHighFrameRate)
+                    print("loadSelectedVideo: fetched PHAsset (id=\(identifier), sloMo=\(isSloMo), duration=\(String(format: "%.2f", asset.duration))s)")
+                } else {
+                    print("loadSelectedVideo: ⚠️ could not fetch PHAsset for identifier: \(identifier)")
+                }
+            } else {
+                print("loadSelectedVideo: ⚠️ no itemIdentifier on PhotosPickerItem — PHAsset unavailable")
+            }
+
             await MainActor.run {
                 currentVideoURL = resolvedURL
-                pickedVideo = PickedVideo(url: resolvedURL)
+                pickedVideo = PickedVideo(url: resolvedURL, phAsset: asset)
                 selectedItem = nil
                 lastVideoIdentifier = nil
-                print("loadSelectedVideo: presenting CameraView directly with file URL -> \(resolvedURL)")
+                print("loadSelectedVideo: presenting CameraView with file URL -> \(resolvedURL), PHAsset: \(asset != nil ? "✅" : "❌")")
             }
 
         } catch {
@@ -252,6 +291,7 @@ struct ContentView: View {
 struct PickedVideo: Identifiable {
     let id = UUID()
     let url: URL
+    let phAsset: PHAsset?
 }
 
 struct PhotosVideoPlayer: View {
