@@ -70,40 +70,22 @@ extension CameraViewController {
                 return passed
             }.sorted { $0.confidence > $1.confidence }
             
-            // Update ROI based on detection (only if ROI is enabled)
-            if self.settings.enableROI {
+            // Update ROI based on detection — only for video-file processing, not live camera
+            if self.videoURL != nil && self.settings.enableROI {
                 if let bestDetection = baseballDetections.first {
                     self.updateROI(from: bestDetection.boundingBox)
                 } else {
                     self.expandROI()
                 }
             }
-            
-            DispatchQueue.main.async {
-                self.overlayLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
-                
-                if self.settings.ballDetectionEnabled, let bestDetection = baseballDetections.first {
-                    self.drawBoundingBox(bestDetection.boundingBox,
-                                         bufferSize: self.view.bounds.size,
-                                         confidence: bestDetection.confidence,
-                                         mirrored: self.mirrored,
-                                         contentFlippedVertically: self.contentFlippedVertically)
-                }
-                
-                if let poseObs = self.lastPoseObservation, self.settings.poseEstimationEnabled {
-                    self.drawPoseSkeleton(poseObs, bufferSize: self.view.bounds.size)
-                }
-                
-                if self.settings.isCalibrated {
-                    self.drawCalibrationOverlay(bufferSize: self.view.bounds.size)
-                }
-                
-                if self.settings.isCalibrated && self.settings.showStrikeZone {
-                    self.drawStrikeZone(bufferSize: self.view.bounds.size)
-                }
-                
-                if self.settings.showROI, let roi = self.currentROI, self.settings.enableROI {
-                    self.drawROI(roi, bufferSize: self.view.bounds.size)
+
+            // For video-file processing the CoreML callback drives the overlay update.
+            // For live camera, captureOutput handles the overlay update explicitly after
+            // handler.perform() so we skip the redundant dispatch here.
+            if self.videoURL != nil {
+                let bestDetection = baseballDetections.first
+                DispatchQueue.main.async {
+                    self.updateLiveOverlay(ballDetection: bestDetection)
                 }
             }
         }
@@ -111,8 +93,45 @@ extension CameraViewController {
         self.requests = [request]
         
         setupPoseEstimation()
+        updatePoseROI()
     }
     
+    // MARK: - Shared Overlay Update
+    /// Clears and redraws all live overlay elements. Must be called on the main thread.
+    func updateLiveOverlay(ballDetection: VNRecognizedObjectObservation? = nil) {
+        overlayLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+        let bufferSize = view.bounds.size
+
+        if settings.ballDetectionEnabled, let detection = ballDetection {
+            drawBoundingBox(detection.boundingBox,
+                            bufferSize: bufferSize,
+                            confidence: detection.confidence,
+                            mirrored: mirrored,
+                            contentFlippedVertically: contentFlippedVertically)
+        }
+
+        if let poseObs = lastPoseObservation, settings.poseEstimationEnabled {
+            drawPoseSkeleton(poseObs, bufferSize: bufferSize)
+        }
+
+        if checkSwingDetected && settings.isCalibrated {
+            drawCheckSwingIndicator(bufferSize: bufferSize)
+        }
+
+        if settings.isCalibrated {
+            drawCalibrationOverlay(bufferSize: bufferSize)
+        }
+
+        if settings.isCalibrated && settings.showStrikeZone {
+            drawStrikeZone(bufferSize: bufferSize)
+        }
+
+        // Only show ROI box in video-file mode (ROI is disabled for live camera)
+        if videoURL != nil && settings.showROI, let roi = currentROI, settings.enableROI {
+            drawROI(roi, bufferSize: bufferSize)
+        }
+    }
+
     func setupPoseEstimation() {
         poseRequest = VNDetectHumanBodyPoseRequest { [weak self] request, error in
             guard let self = self else { return }
@@ -126,6 +145,11 @@ extension CameraViewController {
                   let observation = observations.first else { return }
             
             self.lastPoseObservation = observation
+
+            // Check swing detection — runs on every pose update during recording
+            if self.isRecording {
+                self.evaluateCheckSwing(observation)
+            }
             
             if let lastFrameTime = self.lastFrameTime {
                 self.poseHistory.append((timestamp: lastFrameTime, observation: observation))
@@ -134,12 +158,109 @@ extension CameraViewController {
                 self.poseHistory.removeAll { CMTimeCompare($0.timestamp, cutoffTime) < 0 }
             }
             
-            if !self.settings.ballDetectionEnabled && self.settings.poseEstimationEnabled {
+            // When only pose is enabled (no ball detection) and processing a video file,
+            // trigger the overlay redraw here. For live camera the overlay is updated
+            // explicitly after handler.perform() in captureOutput.
+            if !self.settings.ballDetectionEnabled && self.settings.poseEstimationEnabled && self.videoURL != nil {
                 DispatchQueue.main.async {
-                    self.overlayLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
-                    self.drawPoseSkeleton(observation, bufferSize: self.view.bounds.size)
+                    self.updateLiveOverlay()
                 }
             }
+        }
+    }
+
+    // MARK: - Batter ROI
+
+    /// Recalculates and applies the pose request's regionOfInterest so it only covers
+    /// the batter's box on the correct side of the plate, excluding the catcher/umpire.
+    ///
+    /// Vision coordinate system: origin at bottom-left, Y increases upward.
+    ///
+    /// Strategy (with calibration):
+    ///   - The right/left plate corner points define the plate width in normalised image space.
+    ///   - A right-handed batter stands in the LEFT batter's box (from catcher's POV),
+    ///     which is to the RIGHT in the camera image when shooting from behind the plate.
+    ///   - We extend outward from the plate edge by ~1× plate width to cover the batter's box,
+    ///     and use the full vertical range to cover the standing batter.
+    ///
+    /// Without calibration, falls back to the left or right half of the frame.
+    func updatePoseROI() {
+        guard let poseRequest = poseRequest else { return }
+
+        guard let batter = activeBatter else {
+            if settings.isCalibrated {
+                // Calibrated but no batter selected: suppress pose entirely.
+                // The catcher/umpire is behind the plate and shouldn't be tracked.
+                poseRequest.regionOfInterest = CGRect(x: 0, y: 0, width: 0.001, height: 0.001)
+                print("[Pose ROI] Calibrated, no active batter — pose suppressed")
+            } else {
+                // No calibration and no batter: search full frame
+                poseRequest.regionOfInterest = CGRect(x: 0, y: 0, width: 1, height: 1)
+                print("[Pose ROI] No calibration, no active batter — full frame")
+            }
+            return
+        }
+
+        // With 5-point calibration we can place the ROI precisely
+        if settings.isCalibrated,
+           settings.platePoints.count == 5,
+           settings.platePoints[HomePlatePoint.right.rawValue] != .zero,
+           settings.platePoints[HomePlatePoint.left.rawValue]  != .zero {
+
+            // These are normalised image coords (0-1, origin top-left in UIKit).
+            // We need to flip Y for Vision (origin bottom-left).
+            let rightPt = settings.platePoints[HomePlatePoint.right.rawValue]
+            let leftPt  = settings.platePoints[HomePlatePoint.left.rawValue]
+
+            // Plate width in normalised image X units
+            let plateNormWidth = abs(rightPt.x - leftPt.x)
+
+            // The batter's box is 4 ft wide × 6 ft long. The plate is 17" = 1.417 ft wide.
+            // Box width ≈ 2.8× plate width; use 1.5× as conservative ROI extension.
+            let boxExtent = plateNormWidth * 1.5
+
+            // RHB stands to the right of the plate in the camera (left batter's box in field terms).
+            // LHB stands to the left of the plate in the camera (right batter's box in field terms).
+            // Switch = treat as RHB for ROI purposes.
+            let isRHB = (batter.handedness == .right || batter.handedness == .both)
+
+            let roiMinX: CGFloat
+            let roiMaxX: CGFloat
+
+            if isRHB {
+                // RHB: batter stands to the right of right plate corner (higher X)
+                roiMinX = max(0, rightPt.x - plateNormWidth * 0.2)
+                roiMaxX = min(1, rightPt.x + boxExtent)
+            } else {
+                // LHB: batter stands to the left of left plate corner (lower X)
+                roiMinX = max(0, leftPt.x - boxExtent)
+                roiMaxX = min(1, leftPt.x + plateNormWidth * 0.2)
+            }
+
+            // Vertical: cover the full height of the frame (batter is standing)
+            // Vision Y is flipped: top of image = Y=0 in UIKit = Y=1 in Vision
+            let roiVisionMinY: CGFloat = 0.0
+            let roiVisionMaxY: CGFloat = 1.0
+
+            let roi = CGRect(x: roiMinX,
+                             y: roiVisionMinY,
+                             width: roiMaxX - roiMinX,
+                             height: roiVisionMaxY - roiVisionMinY)
+            poseRequest.regionOfInterest = roi
+            print(String(format: "[Pose ROI] %@ batter box: x=%.2f–%.2f",
+                         isRHB ? "RHB" : "LHB", roiMinX, roiMaxX))
+
+        } else {
+            // No calibration — split frame in half horizontally.
+            // Camera is behind the plate looking toward the pitcher, so:
+            //   RHB batter's box is the RIGHT half of the image.
+            //   LHB batter's box is the LEFT half of the image.
+            let isRHB = (batter.handedness == .right || batter.handedness == .both)
+            let roi: CGRect = isRHB
+                ? CGRect(x: 0.5, y: 0, width: 0.5, height: 1.0)   // right half
+                : CGRect(x: 0.0, y: 0, width: 0.5, height: 1.0)   // left half
+            poseRequest.regionOfInterest = roi
+            print("[Pose ROI] No calibration — \(isRHB ? "RHB" : "LHB") half-frame fallback")
         }
     }
     
