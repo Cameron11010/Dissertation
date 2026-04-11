@@ -2,7 +2,17 @@
 //  CameraViewController+Recording.swift
 //  Baseball Tracker
 //
-//  Start/stop custom recording, asset writer management, and save-to-photos.
+//  Start / stop H.264 live recording via AVAssetWriter.
+//
+//  All writer objects (assetWriter, assetWriterInput, pixelBufferAdaptor) are
+//  created on the main thread before isRecording is set, so captureOutput always
+//  sees a fully-initialised writer.
+//
+//  isRecording is set to true/false DIRECTLY (synchronously) on the main thread,
+//  NOT via videoQueue.async. This ensures captureOutput (on videoQueue) will
+//  see isRecording=true on its very next invocation after startCustomRecording returns.
+//  Using videoQueue.async would allow a rapid start→stop to queue both flag flips
+//  back-to-back, so captureOutput never runs with isRecording=true in between.
 //
 
 import UIKit
@@ -10,138 +20,161 @@ import AVFoundation
 import Photos
 
 extension CameraViewController {
-    
+
+    // MARK: - Start
+
     func startCustomRecording() {
         guard !isRecording else { return }
-        
-        let orientation = UIDevice.current.orientation
-        let isPortrait = orientation == .portrait || orientation == .portraitUpsideDown
-        let baseWidth = Int(self.activeDimensions.width)
-        let baseHeight = Int(self.activeDimensions.height)
-        let videoWidth = isPortrait ? min(baseWidth, baseHeight) : max(baseWidth, baseHeight)
-        let videoHeight = isPortrait ? max(baseWidth, baseHeight) : min(baseWidth, baseHeight)
-        let videoTransform = CGAffineTransform.identity
-        
-        let outputFileName = UUID().uuidString
-        let outputFilePath = (NSTemporaryDirectory() as NSString).appendingPathComponent(outputFileName + ".mov")
-        let outputURL = URL(fileURLWithPath: outputFilePath)
-        
-        do {
-            assetWriter = try AVAssetWriter(outputURL: outputURL, fileType: .mov)
-        } catch {
-            print("Failed to create AVAssetWriter: \(error)")
+
+        // Camera buffers come out portrait-rotated (connection sets 90° rotation),
+        // so the delivered pixel buffers are already portrait even though
+        // activeDimensions reports the native landscape sensor size (e.g. 1920×1080).
+        // We must use the connection's actual output dimensions, not activeDimensions.
+        // The simplest safe approach: always write at the buffer's natural portrait size.
+        let videoWidth  = Int(min(activeDimensions.width, activeDimensions.height))
+        let videoHeight = Int(max(activeDimensions.width, activeDimensions.height))
+
+        let outputURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent(UUID().uuidString + ".mov")
+
+        guard let writer = try? AVAssetWriter(outputURL: outputURL, fileType: .mov) else {
+            print("[Recording] Failed to create AVAssetWriter")
             return
         }
-        
-        print("[Recording] Using ProRes for \(videoWidth)x\(videoHeight) @ \(self.activeFrameRate) fps")
-        
+
         let videoSettings: [String: Any] = [
-            AVVideoCodecKey: AVVideoCodecType.proRes422Proxy,
-            AVVideoWidthKey: videoWidth,
-            AVVideoHeightKey: videoHeight
+            AVVideoCodecKey:  AVVideoCodecType.h264,
+            AVVideoWidthKey:  videoWidth,
+            AVVideoHeightKey: videoHeight,
+            AVVideoCompressionPropertiesKey: [
+                AVVideoAverageBitRateKey:          25_000_000,
+                AVVideoExpectedSourceFrameRateKey: Int(activeFrameRate),
+                AVVideoProfileLevelKey:            AVVideoProfileLevelH264HighAutoLevel,
+                AVVideoAllowFrameReorderingKey:    false
+            ] as [String: Any]
         ]
-        
-        assetWriterInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
-        assetWriterInput?.expectsMediaDataInRealTime = true
-        
-        let mediaTimeScale = CMTimeScale(max(600, Int32(self.activeFrameRate * 10)))
-        assetWriter?.movieTimeScale = mediaTimeScale
-        assetWriterInput?.mediaTimeScale = mediaTimeScale
-        
-        assetWriterInput?.performsMultiPassEncodingIfSupported = false
-        assetWriterInput?.transform = videoTransform
-        
-        guard let assetWriter = assetWriter,
-              let assetWriterInput = assetWriterInput else {
-            print("Asset writer or input not available")
+
+        let writerInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+        writerInput.expectsMediaDataInRealTime = true
+
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: writerInput,
+            sourcePixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+                kCVPixelBufferWidthKey  as String: videoWidth,
+                kCVPixelBufferHeightKey as String: videoHeight
+            ]
+        )
+
+        guard writer.canAdd(writerInput) else {
+            print("[Recording] Cannot add writer input")
             return
         }
-        
-        if assetWriter.canAdd(assetWriterInput) {
-            assetWriter.add(assetWriterInput)
-        } else {
-            print("Cannot add asset writer input")
-            return
-        }
-        
-        let sourcePixelBufferAttributes: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
-            kCVPixelBufferWidthKey as String: videoWidth,
-            kCVPixelBufferHeightKey as String: videoHeight,
-            kCVPixelBufferIOSurfacePropertiesKey as String: [:]
-        ]
-        
-        pixelBufferAdaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: assetWriterInput,
-                                                                  sourcePixelBufferAttributes: sourcePixelBufferAttributes)
-        
+        writer.add(writerInput)
+
+        // Store all writer objects before flipping isRecording.
+        assetWriter        = writer
+        assetWriterInput   = writerInput
+        pixelBufferAdaptor = adaptor
         recordingStartTime = nil
-        
-        self.detectionMarkers.removeAll()
-        self.poseHistory.removeAll()
-        self.fusedFrameData.removeAll()
-        self.lastPoseObservation = nil
-        self.videoRotationDegrees = 0
-        
-        self.currentROI = nil
-        self.framesWithoutDetection = 0
-        
-        self.lastFrameTime = nil
-        self.frameCount = 0
-        
-        isRecording = true
+        lastFrameTime      = nil
+        frameCount         = 0
+
+        // Reset tracking data.
+        detectionMarkers.removeAll()
+        skeletonFrames.removeAll()
+        poseHistory.removeAll()
+        fusedFrameData.removeAll()
+        lastPoseObservation           = nil
+        videoRotationDegrees          = 0
+        ballEverDetectedThisRecording = false
+        consecutiveFramesWithoutBall  = 0
+        currentROI                    = nil
+        framesWithoutDetection        = 0
+
+        // Set isRecording on videoQueue synchronously (blocking main thread until done).
+        // This guarantees the flag is visible to captureOutput before this method returns,
+        // eliminating the data race between the main-thread write and videoQueue read.
+        // Using sync (not async) also prevents a rapid start→stop from queueing both
+        // flag flips back-to-back with no captureOutput call in between.
+        videoQueue.sync { self.isRecording = true }
         updateRecordButton(isRecording: true)
         onRecordingStateChanged?(true)
-        
-        print("[Recording] Started recording at \(self.activeFrameRate) fps using ProRes 422 Proxy")
+
+        print("[Recording] Starting \(videoWidth)×\(videoHeight) @ \(activeFrameRate) fps H.264 25 Mbps — isRecording=true")
     }
-    
+
+    // MARK: - Stop
+
     func stopCustomRecording() {
-        guard isRecording, let assetWriter = assetWriter, let assetWriterInput = assetWriterInput else { return }
-        
-        isRecording = false
+        guard isRecording else { return }
+
+        // Set isRecording=false on videoQueue synchronously so captureOutput stops
+        // appending frames. By blocking until the sync completes, we ensure no new
+        // frames are being written before we proceed to finalise the writer.
+        videoQueue.sync { self.isRecording = false }
         updateRecordButton(isRecording: false)
         onRecordingStateChanged?(false)
-        
-        if let startTime = recordingStartTime, let endTime = lastFrameTime {
-            let duration = CMTimeGetSeconds(CMTimeSubtract(endTime, startTime))
-            let avgFPS = Double(frameCount) / duration
-            print("[Recording] Stopped. Recorded \(frameCount) frames in \(String(format: "%.2f", duration))s = \(String(format: "%.1f", avgFPS)) fps average")
-        }
-        
-        assetWriterInput.markAsFinished()
-        assetWriter.finishWriting { [weak self] in
+
+        // Finalise the writer on videoQueue. By the time this block runs, all
+        // in-flight captureOutput calls have completed (videoQueue is serial and
+        // isRecording=false has already been set), so recordingStartTime reflects
+        // its final value and no new frames will be appended.
+        videoQueue.async { [weak self] in
             guard let self = self else { return }
-            let rawVideoURL = assetWriter.outputURL
-            
-            print("[Recording] Raw video saved to: \(rawVideoURL.path)")
-            print("[Recording] Starting annotation post-processing...")
-            
-            self.saveBiomechanicalDataToFile()
-            
-            DispatchQueue.main.async {
-                self.showProcessingOverlay(message: "Adding annotations to video...")
+
+            let writer    = self.assetWriter
+            let input     = self.assetWriterInput
+            let startTime = self.recordingStartTime
+
+            guard let writer, let input else {
+                print("[Recording] No writer to finalise")
+                return
             }
-            
-            Task {
-                await self.postProcessVideoWithAnnotations(rawVideoURL: rawVideoURL)
+
+            guard startTime != nil else {
+                print("[Recording] No frames were captured — discarding")
+                self.assetWriter        = nil
+                self.assetWriterInput   = nil
+                self.pixelBufferAdaptor = nil
+                return
             }
-            
-            self.assetWriter = nil
-            self.assetWriterInput = nil
-            self.pixelBufferAdaptor = nil
-            self.recordingStartTime = nil
+
+            input.markAsFinished()
+            writer.finishWriting { [weak self] in
+                guard let self = self else { return }
+                let url = writer.outputURL
+                print("[Recording] Finished writing: \(url.lastPathComponent)  status=\(writer.status.rawValue)")
+                self.saveBiomechanicalDataToFile()
+
+                // Clear writer objects only after the file is complete.
+                self.assetWriter        = nil
+                self.assetWriterInput   = nil
+                self.pixelBufferAdaptor = nil
+                self.recordingStartTime = nil
+
+                DispatchQueue.main.async {
+                    self.showProcessingOverlay(message: "Adding annotations to video…")
+                }
+                Task {
+                    await self.postProcessVideoWithAnnotations(rawVideoURL: url)
+                }
+            }
         }
     }
-    
+
+    // MARK: - Save to Photos
+
     func saveToPhotosThenAlert(outputURL: URL) {
         Task { @MainActor in
             await withCheckedContinuation { continuation in
                 self.ensurePhotoLibraryPermission { granted in
                     Task { @MainActor in
                         guard granted else {
-                            let alert = UIAlertController(title: "Photos Access Denied",
-                                                          message: "Annotated video exported to a temporary file, but app does not have permission to save to Photos. Please enable Photos access in Settings.",
-                                                          preferredStyle: .alert)
+                            let alert = UIAlertController(
+                                title: "Photos Access Denied",
+                                message: "Video exported but cannot save to Photos. Enable access in Settings.",
+                                preferredStyle: .alert)
                             alert.addAction(UIAlertAction(title: "OK", style: .default))
                             self.dismissToRootAndPresentAlert(alert)
                             continuation.resume()
@@ -149,23 +182,21 @@ extension CameraViewController {
                         }
                         var localIdentifier: String?
                         PHPhotoLibrary.shared().performChanges({
-                            if let placeholder = PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: outputURL)?.placeholderForCreatedAsset {
-                                localIdentifier = placeholder.localIdentifier
+                            if let ph = PHAssetChangeRequest
+                                .creationRequestForAssetFromVideo(atFileURL: outputURL)?
+                                .placeholderForCreatedAsset {
+                                localIdentifier = ph.localIdentifier
                             }
-                        }) { success, error in
+                        }) { success, _ in
                             Task { @MainActor in
                                 if success, let id = localIdentifier {
                                     self.onVideoSaved?(id)
-                                    let alert = UIAlertController(title: "Success",
-                                                                  message: "Annotated video saved to Photos.",
-                                                                  preferredStyle: .alert)
+                                    let alert = UIAlertController(title: "Saved", message: "Annotated video saved to Photos.", preferredStyle: .alert)
                                     alert.addAction(UIAlertAction(title: "OK", style: .default))
                                     self.dismissToRootAndPresentAlert(alert)
                                 } else {
                                     self.onVideoSaved?("")
-                                    let alert = UIAlertController(title: "Save Failed",
-                                                                  message: "Could not save video to Photos. Please check permissions or available space.",
-                                                                  preferredStyle: .alert)
+                                    let alert = UIAlertController(title: "Save Failed", message: "Could not save video. Check permissions and storage.", preferredStyle: .alert)
                                     alert.addAction(UIAlertAction(title: "OK", style: .default))
                                     self.dismissToRootAndPresentAlert(alert)
                                 }
