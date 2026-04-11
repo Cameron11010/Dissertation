@@ -1,0 +1,230 @@
+//
+//  TrailSyncEngine.swift
+//  Baseball Tracker
+//
+//  Post-pitch trail synchronisation and triangulation.
+//
+//  After each pitch both devices broadcast their Kalman-smoothed ball trail
+//  (TimedPosition arrays from MultipeerSession).  This engine:
+//
+//  1. Cross-correlates the speed profiles of the two trails to find the
+//     temporal offset that best aligns them (refining the coarse clock-ping estimate).
+//
+//  2. Resamples both trails onto a common time grid at the negotiated frame rate.
+//
+//  3. For each common time step, triangulates the 3-D ball position from
+//     the two image-space detections using the homography matrices of each camera.
+//     (This is a ground-plane approximation; full epipolar triangulation can
+//      replace it once per-camera pose estimation is added.)
+//
+//  All timestamps are in seconds (device-local CMClock values).
+//
+
+import Foundation
+import CoreGraphics
+
+// MARK: - Sync Result
+struct SyncResult {
+    /// Best estimated clock offset: peer2.time = peer1.time + offset
+    let refinedOffsetSeconds: Double
+    /// Correlation quality in [0, 1] (1 = perfect match)
+    let correlationQuality: Double
+    /// Triangulated positions on the common timeline
+    let triangulated: [TriangulatedPosition]
+}
+
+// MARK: - TrailSyncEngine
+struct TrailSyncEngine {
+
+    // MARK: - Public Entry Point
+    /// Align two trails and triangulate.
+    /// - Parameters:
+    ///   - local:  The trail from this device (local timestamps).
+    ///   - remote: The trail received from the peer (peer-local timestamps).
+    ///   - coarseOffset: Clock offset from MultipeerSession (peer - local, seconds).
+    ///   - localH:  Homography for this device.
+    ///   - remoteH: Homography for the peer device.
+    ///   - frameRate: Negotiated common frame rate (Hz).
+    static func sync(local: TrailBroadcastPayload,
+                     remote: TrailBroadcastPayload,
+                     coarseOffset: Double,
+                     localH: HomographyHelper,
+                     remoteH: HomographyHelper,
+                     frameRate: Double) -> SyncResult {
+
+        // Step 1: Shift remote timestamps by coarse clock offset so both are in local-device time
+        let remoteShifted = remote.positions.map { pos in
+            TimedPosition(deviceTimestamp: pos.deviceTimestamp - coarseOffset,
+                          x: pos.x, y: pos.y,
+                          isInterpolated: pos.isInterpolated)
+        }
+
+        // Step 2: Compute speed profiles for cross-correlation
+        let localSpeeds  = speedProfile(from: local.positions)
+        let remoteSpeeds = speedProfile(from: remoteShifted)
+
+        // Step 3: Cross-correlate to find fine offset
+        let frameDuration = 1.0 / max(frameRate, 30)
+        let (fineOffsetFrames, quality) = crossCorrelate(localSpeeds, remoteSpeeds)
+        let fineOffsetSeconds = Double(fineOffsetFrames) * frameDuration
+
+        let totalOffset = coarseOffset + fineOffsetSeconds
+
+        print(String(format: "[TrailSync] Coarse offset: %.1f ms, fine: %.1f ms, total: %.1f ms, quality: %.2f",
+                     coarseOffset * 1000, fineOffsetSeconds * 1000, totalOffset * 1000, quality))
+
+        // Step 4: Resample onto common time grid
+        let remoteFinal = remote.positions.map { pos in
+            TimedPosition(deviceTimestamp: pos.deviceTimestamp - totalOffset,
+                          x: pos.x, y: pos.y,
+                          isInterpolated: pos.isInterpolated)
+        }
+
+        let (localGrid, remoteGrid) = resampleToCommonGrid(local: local.positions,
+                                                            remote: remoteFinal,
+                                                            frameRate: frameRate)
+
+        // Step 5: Triangulate
+        let triangulated = triangulate(localGrid: localGrid, remoteGrid: remoteGrid,
+                                       localH: localH, remoteH: remoteH)
+
+        return SyncResult(refinedOffsetSeconds: totalOffset,
+                          correlationQuality: quality,
+                          triangulated: triangulated)
+    }
+
+    // MARK: - Speed Profile
+    /// Compute magnitude of velocity between consecutive detections.
+    private static func speedProfile(from positions: [TimedPosition]) -> [Double] {
+        guard positions.count >= 2 else { return [] }
+        var speeds: [Double] = []
+        for i in 1..<positions.count {
+            let dt = positions[i].deviceTimestamp - positions[i-1].deviceTimestamp
+            guard dt > 0 else { speeds.append(0); continue }
+            let dx = positions[i].x - positions[i-1].x
+            let dy = positions[i].y - positions[i-1].y
+            speeds.append(hypot(dx, dy) / dt)
+        }
+        return speeds
+    }
+
+    // MARK: - Cross-Correlation
+    /// Returns (lag in samples, normalised quality 0-1).
+    /// Positive lag means the remote trail is delayed relative to local.
+    private static func crossCorrelate(_ a: [Double], _ b: [Double]) -> (Int, Double) {
+        guard !a.isEmpty, !b.isEmpty else { return (0, 0) }
+
+        let maxLag = min(a.count, b.count) / 2
+        var bestLag = 0
+        var bestCorr = -Double.infinity
+
+        let aMean = a.reduce(0, +) / Double(a.count)
+        let bMean = b.reduce(0, +) / Double(b.count)
+        let aNorm = a.map { $0 - aMean }
+        let bNorm = b.map { $0 - bMean }
+
+        let aVar = aNorm.reduce(0) { $0 + $1*$1 }
+        let bVar = bNorm.reduce(0) { $0 + $1*$1 }
+        let denom = (aVar * bVar).squareRoot()
+
+        for lag in -maxLag...maxLag {
+            var sum = 0.0
+            var count = 0
+            for i in 0..<a.count {
+                let j = i + lag
+                if j >= 0 && j < b.count {
+                    sum += aNorm[i] * bNorm[j]
+                    count += 1
+                }
+            }
+            let corr = count > 0 ? sum / Double(count) : 0
+            if corr > bestCorr {
+                bestCorr = corr
+                bestLag = lag
+            }
+        }
+
+        let quality = denom > 0 ? min(1.0, max(0.0, bestCorr / (denom / Double(max(a.count, b.count))))) : 0
+        return (bestLag, quality)
+    }
+
+    // MARK: - Resample to Common Grid
+    /// Interpolates both trails onto a shared uniform time grid.
+    private static func resampleToCommonGrid(local: [TimedPosition],
+                                              remote: [TimedPosition],
+                                              frameRate: Double) -> ([TimedPosition], [TimedPosition]) {
+        guard let localStart  = local.first?.deviceTimestamp,
+              let localEnd    = local.last?.deviceTimestamp,
+              let remoteStart = remote.first?.deviceTimestamp,
+              let remoteEnd   = remote.last?.deviceTimestamp else {
+            return (local, remote)
+        }
+
+        let gridStart = max(localStart, remoteStart)
+        let gridEnd   = min(localEnd, remoteEnd)
+        guard gridEnd > gridStart else { return ([], []) }
+
+        let dt = 1.0 / frameRate
+        var t = gridStart
+        var localOut: [TimedPosition] = []
+        var remoteOut: [TimedPosition] = []
+
+        while t <= gridEnd + dt * 0.5 {
+            if let lp = interpolate(at: t, in: local),
+               let rp = interpolate(at: t, in: remote) {
+                localOut.append(lp)
+                remoteOut.append(rp)
+            }
+            t += dt
+        }
+
+        return (localOut, remoteOut)
+    }
+
+    /// Linear interpolation of position at a given timestamp.
+    private static func interpolate(at t: Double, in positions: [TimedPosition]) -> TimedPosition? {
+        guard positions.count >= 2 else { return positions.first }
+        guard t >= positions.first!.deviceTimestamp,
+              t <= positions.last!.deviceTimestamp else { return nil }
+
+        // Binary search for the bracket
+        var lo = 0
+        var hi = positions.count - 1
+        while lo + 1 < hi {
+            let mid = (lo + hi) / 2
+            if positions[mid].deviceTimestamp <= t { lo = mid } else { hi = mid }
+        }
+
+        let p0 = positions[lo]
+        let p1 = positions[hi]
+        let dt = p1.deviceTimestamp - p0.deviceTimestamp
+        let alpha = dt > 0 ? (t - p0.deviceTimestamp) / dt : 0
+
+        return TimedPosition(deviceTimestamp: t,
+                             x: p0.x + alpha * (p1.x - p0.x),
+                             y: p0.y + alpha * (p1.y - p0.y),
+                             isInterpolated: true)
+    }
+
+    // MARK: - Ground-Plane Triangulation
+    /// For each time step, convert both image positions to world coords and average them.
+    /// This is a ground-plane approximation (Z = 0).  The two world estimates should
+    /// agree well for balls near the plate; divergence indicates camera calibration error.
+    private static func triangulate(localGrid: [TimedPosition],
+                                    remoteGrid: [TimedPosition],
+                                    localH: HomographyHelper,
+                                    remoteH: HomographyHelper) -> [TriangulatedPosition] {
+        guard localGrid.count == remoteGrid.count else { return [] }
+
+        return zip(localGrid, remoteGrid).map { (lp, rp) in
+            let localWorld  = localH.imageToWorld(CGPoint(x: lp.x, y: lp.y))
+            let remoteWorld = remoteH.imageToWorld(CGPoint(x: rp.x, y: rp.y))
+
+            // Simple average; a weighted average based on detection confidence would be better.
+            let wx = (localWorld.x + remoteWorld.x) / 2
+            let wy = (localWorld.y + remoteWorld.y) / 2
+
+            return TriangulatedPosition(timestamp: lp.deviceTimestamp, worldX: wx, worldY: wy)
+        }
+    }
+}
