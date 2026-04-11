@@ -8,6 +8,10 @@ import Photos
 
 struct CameraView: UIViewControllerRepresentable {
     var onVideoSaved: ((String) -> Void)? = nil
+    /// Called after export completes with the detected ball positions and skeleton frames.
+    var onProcessingComplete: (([TimestampedMarker], [SkeletonFrame]) -> Void)? = nil
+    /// Called with the local file URL of the annotated video immediately after export.
+    var onAnnotatedVideoURL: ((URL) -> Void)? = nil
     var videoURL: URL? = nil
     /// The PHAsset corresponding to the selected video. Required for
     /// recovering original high-speed frames from slow-motion videos,
@@ -15,14 +19,23 @@ struct CameraView: UIViewControllerRepresentable {
     var phAsset: PHAsset? = nil
     @Binding var isRecordingLive: Bool
     @ObservedObject var settings: CameraSettings
+    /// Optional peer session — when provided, enables multi-device trail sync and 3D view.
+    var peerSession: MultipeerSession? = nil
+    /// The active batter from the lineup. When set, pose estimation is restricted
+    /// to the appropriate batter's box to exclude the catcher/umpire behind the plate.
+    var activeBatter: Player? = nil
     @Environment(\.presentationMode) var presentationMode
 
     func makeUIViewController(context: Context) -> CameraViewController {
         let vc = CameraViewController()
         vc.onVideoSaved = onVideoSaved
+        vc.onProcessingComplete = onProcessingComplete
+        vc.onAnnotatedVideoURL = onAnnotatedVideoURL
         vc.videoURL = videoURL
         vc.phAsset = phAsset
         vc.settings = settings
+        vc.peerSession = peerSession
+        vc.activeBatter = activeBatter
         vc.onRecordingStateChanged = { value in
             DispatchQueue.main.async { self.isRecordingLive = value }
         }
@@ -31,5 +44,6 @@ struct CameraView: UIViewControllerRepresentable {
 
     func updateUIViewController(_ uiViewController: CameraViewController, context: Context) {
         uiViewController.settings = settings
+        uiViewController.activeBatter = activeBatter
     }
 }
