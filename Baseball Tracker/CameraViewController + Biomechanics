@@ -142,6 +142,132 @@ extension CameraViewController {
         return csv
     }
     
+    // MARK: - Check Swing Detection
+
+    /// Evaluates a single pose frame for check-swing criteria.
+    ///
+    /// A check swing is flagged when ANY of the following conditions are met:
+    ///   1. **Bat angle ≥ 45°** — the vector from trail wrist to lead wrist makes an angle of
+    ///      at least 45° toward the pitcher (i.e. the hands have committed forward far enough
+    ///      that the bat head has passed the front of the plate).
+    ///   2. **Wrist roll** — the trail wrist's X position overtakes the lead wrist's X position
+    ///      in two or more consecutive frames, indicating the batter has rolled their wrists
+    ///      through the contact zone.
+    ///   3. **Bat crosses body** — the lead wrist passes the body midline (mid-hip X) toward
+    ///      the pitcher side, meaning the bat barrel has crossed in front of the batter's body.
+    ///
+    /// All coordinates are in Vision normalised space (0-1, origin bottom-left).
+    /// The caller is responsible for clearing `checkSwingDetected` between pitches.
+    func evaluateCheckSwing(_ obs: VNHumanBodyPoseObservation) {
+        guard !checkSwingDetected else { return }   // already flagged this pitch
+        guard settings.isCalibrated else { return } // strike zone must be calibrated
+        guard let pts = try? obs.recognizedPoints(.all) else { return }
+
+        let conf = settings.poseConfidenceThreshold
+        let batter = activeBatter
+
+        // Determine which wrist is the "lead" (top hand, closest to barrel) and "trail" (bottom hand).
+        //
+        // Cameras are placed on the foul lines (1st base or 3rd base side), so the batter
+        // is seen side-on. The lead hand is the top hand on the bat:
+        //   RHB: left hand is on top (lead)
+        //   LHB: right hand is on top (lead)
+        //
+        // We confirm the camera's orientation using the plate calibration:
+        //   platePoints[right corner] world X = +8.5" (toward first base)
+        //   platePoints[left corner]  world X = -8.5"
+        // If right corner image X > left corner image X, first base is on the image right
+        // → 3rd base camera. Otherwise 1st base camera.
+        // In both foul-line cases the lead/trail assignment is the same (opposite to handedness),
+        // but if calibration is unavailable we fall back to that same assumption.
+        let isRHB = (batter?.handedness ?? .right) != .left
+
+        // Verify orientation from calibration if available (sanity check only — assignment
+        // is the same from either foul line for a side-on view).
+        if settings.isCalibrated, settings.platePoints.count == 5 {
+            let rightCornerImageX = settings.platePoints[HomePlatePoint.right.rawValue].x
+            let leftCornerImageX  = settings.platePoints[HomePlatePoint.left.rawValue].x
+            let firstBaseOnRight  = rightCornerImageX > leftCornerImageX
+            // Log so we can verify the camera side during development
+            print("[CheckSwing] Camera side: \(firstBaseOnRight ? "3rd base" : "1st base") foul line")
+        }
+
+        guard let rwPt = pts[.rightWrist], let lwPt = pts[.leftWrist],
+              rwPt.confidence > conf, lwPt.confidence > conf else { return }
+
+        // Lead wrist = top hand = opposite side to handedness
+        // RHB: left wrist leads. LHB: right wrist leads.
+        let leadWrist  = isRHB ? lwPt.location : rwPt.location
+        let trailWrist = isRHB ? rwPt.location : lwPt.location
+
+        // ── Criterion 1: Bat angle ≥ 45° ──────────────────────────────────────────
+        // The bat vector runs from trail wrist to lead wrist.
+        // "Forward" in the image means increasing X (toward first base from catcher's view).
+        // Angle is measured from vertical (Y axis). 45° means the hands have gone
+        // far enough that the bat's path is nearly horizontal — a committed swing plane.
+        let batDx = leadWrist.x - trailWrist.x
+        let batDy = leadWrist.y - trailWrist.y
+        let batAngleDeg = atan2(abs(batDx), max(abs(batDy), 0.001)) * 180.0 / .pi
+
+        if batAngleDeg >= 45.0 {
+            checkSwingDetected = true
+            print(String(format: "[CheckSwing] ✅ Bat angle %.1f° ≥ 45° — check swing", batAngleDeg))
+            return
+        }
+
+        // ── Criterion 2: Wrist roll ────────────────────────────────────────────────
+        // Trail wrist X overtaking lead wrist X means the hands have rolled through
+        // the hitting zone. Track last 3 frames; flag when it happens twice in a row.
+        wristXHistory.append((leadWrist: leadWrist.x, trailWrist: trailWrist.x))
+        if wristXHistory.count > 5 { wristXHistory.removeFirst() }
+
+        if wristXHistory.count >= 2 {
+            // Count consecutive frames where trail X ≥ lead X (wrists have crossed).
+            // From a foul line camera both wrists are at similar depth, so their X positions
+            // crossing is a reasonable proxy for wrist roll regardless of which side the
+            // camera is on — the trail wrist overtakes the lead wrist horizontally as the
+            // batter rolls through contact.
+            // RHB: lead = left wrist. Normally trail(right) X is behind lead(left) X toward
+            //      the pitcher. Roll = trail X overtakes lead X.
+            // LHB: lead = right wrist. Mirror image — same crossing condition applies.
+            var rolledCount = 0
+            for sample in wristXHistory.suffix(3) {
+                if isRHB {
+                    // RHB: normally trail(right) X < lead(left) X. Roll = trail overtakes lead.
+                    if sample.trailWrist >= sample.leadWrist { rolledCount += 1 }
+                } else {
+                    // LHB: normally trail(left) X > lead(right) X. Roll = trail goes below lead.
+                    if sample.trailWrist <= sample.leadWrist { rolledCount += 1 }
+                }
+            }
+            if rolledCount >= 2 {
+                checkSwingDetected = true
+                print("[CheckSwing] ✅ Wrist roll detected (\(rolledCount) consecutive frames) — check swing")
+                return
+            }
+        }
+
+        // ── Criterion 3: Bat crosses front of body ────────────────────────────────
+        // The lead wrist passes the body midline (average hip X) toward the pitcher,
+        // meaning the bat barrel has swung past in front of the batter.
+        if let rhPt = pts[.rightHip], let lhPt = pts[.leftHip],
+           rhPt.confidence > conf, lhPt.confidence > conf {
+            let hipMidX = (rhPt.location.x + lhPt.location.x) / 2.0
+            // RHB: lead wrist (right) crossing below hip midline means it passed in front.
+            // LHB: lead wrist (left) crossing above hip midline means it passed in front.
+            let crossed = isRHB
+                ? leadWrist.x < hipMidX - 0.03   // right wrist past center toward left
+                : leadWrist.x > hipMidX + 0.03   // left wrist past center toward right
+
+            if crossed {
+                checkSwingDetected = true
+                print(String(format: "[CheckSwing] ✅ Bat crossed front of body (leadX=%.2f hipMidX=%.2f) — check swing",
+                             leadWrist.x, hipMidX))
+                return
+            }
+        }
+    }
+
     func saveBiomechanicalDataToFile() {
         let csv = exportBiomechanicalData()
         let fileName = "biomechanics_\(UUID().uuidString).csv"
@@ -154,5 +280,36 @@ extension CameraViewController {
         } catch {
             print("[Biomechanics] Error saving CSV: \(error)")
         }
+    }
+
+    // MARK: - Skeleton Frame Builder
+
+    /// Convert a VNHumanBodyPoseObservation into a SkeletonFrame using normalised Vision coordinates.
+    /// Points with confidence below the threshold are stored as nil.
+    func makeSkeletonFrame(from obs: VNHumanBodyPoseObservation, timestamp: Double) -> SkeletonFrame {
+        let threshold = settings.poseConfidenceThreshold
+        guard let pts = try? obs.recognizedPoints(.all) else {
+            return SkeletonFrame(timestamp: timestamp, joints: SkeletonJoints())
+        }
+        func pt(_ name: VNHumanBodyPoseObservation.JointName) -> CGPoint? {
+            guard let p = pts[name], p.confidence > threshold else { return nil }
+            return p.location
+        }
+        let joints = SkeletonJoints(
+            neck:           pt(.neck),
+            leftShoulder:   pt(.leftShoulder),
+            rightShoulder:  pt(.rightShoulder),
+            leftElbow:      pt(.leftElbow),
+            rightElbow:     pt(.rightElbow),
+            leftWrist:      pt(.leftWrist),
+            rightWrist:     pt(.rightWrist),
+            leftHip:        pt(.leftHip),
+            rightHip:       pt(.rightHip),
+            leftKnee:       pt(.leftKnee),
+            rightKnee:      pt(.rightKnee),
+            leftAnkle:      pt(.leftAnkle),
+            rightAnkle:     pt(.rightAnkle)
+        )
+        return SkeletonFrame(timestamp: timestamp, joints: joints)
     }
 }
