@@ -1,0 +1,1190 @@
+//
+//  PitchVisualization3DView.swift
+//  Baseball Tracker
+//
+//  3D SceneKit pitch visualisation.
+//
+//  Coordinate system (matches HomographyHelper / CameraSettings):
+//    +X  right (toward first base)
+//    +Y  depth (toward pitcher)   — 0 at home plate front tip, ~612" at rubber
+//    +Z  up
+//  All units: inches.
+//
+//  Scene pivot = centre of the strike zone face, so the camera always
+//  orbits around the middle of the strike zone.
+//
+//  Camera modes:
+//    • lockedToCamera = true  — camera is placed at the estimated real-world filming
+//      position (derived from the 5 calibration plate points + zoom level). Gestures:
+//      pinch = zoom (orthographic scale), pan = scroll view.
+//    • lockedToCamera = false — free horizontal orbit + pinch-to-zoom.
+
+import SwiftUI
+import SceneKit
+
+// MARK: - Internal model
+
+struct Point3D {
+    var x: Float   // lateral
+    var y: Float   // depth toward pitcher
+    var z: Float   // height above ground
+}
+
+// MARK: - Estimated camera world position
+
+/// Derived from the 5 home plate calibration image points + zoom level.
+struct EstimatedCameraPosition {
+    var worldX: Float       // lateral offset from plate centre
+    var worldY: Float       // distance behind catcher end (negative = behind plate)
+    var worldZ: Float       // height above ground
+    var azimuth: Float      // radians — angle around the plate, π = straight behind plate
+    var fieldOfView: Float  // degrees — zoom-adjusted FOV
+}
+
+// MARK: - SwiftUI entry point (full-screen, used only from PitchVisualization3DView)
+
+struct PitchVisualization3DView: View {
+    let detectionMarkers: [TimestampedMarker]
+    let settings: CameraSettings
+    var skeletonFrames: [SkeletonFrame] = []
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var timelineValue: Double = .infinity
+    @State private var isPlaying: Bool = false
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            Color.black.ignoresSafeArea()
+
+            VStack(spacing: 0) {
+                PitchSceneView(detectionMarkers: detectionMarkers,
+                               settings: settings,
+                               lockedToCamera: true,
+                               skeletonFrames: skeletonFrames,
+                               currentTime: timelineValue)
+                    .ignoresSafeArea()
+
+                // Timeline slider
+                if !detectionMarkers.isEmpty,
+                   let firstT = detectionMarkers.first?.timestamp,
+                   let lastT  = detectionMarkers.last?.timestamp,
+                   lastT > firstT {
+                    TimelineSliderView(
+                        value: $timelineValue,
+                        range: firstT...lastT,
+                        isPlaying: $isPlaying
+                    )
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+                }
+            }
+
+            Button { dismiss() } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 30))
+                    .foregroundStyle(.white, Color.white.opacity(0.25))
+                    .padding(20)
+            }
+            .padding(.top, 44)
+
+            VStack(alignment: .leading, spacing: 6) {
+                LegendRow(color: .yellow, label: "Release end")
+                LegendRow(color: .red,   label: "Plate end")
+                LegendRow(color: Color(white: 0.85), label: "Home plate")
+                LegendRow(color: Color.white.opacity(0.45), label: "Strike zone")
+            }
+            .padding(12)
+            .background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 10))
+            .padding(.leading, 16)
+            .padding(.bottom, 40)
+            .frame(maxHeight: .infinity, alignment: .bottom)
+        }
+        .navigationBarHidden(true)
+    }
+}
+
+private struct LegendRow: View {
+    let color: Color; let label: String
+    var body: some View {
+        HStack(spacing: 6) {
+            Circle().fill(color).frame(width: 10, height: 10)
+            Text(label).font(.caption2).foregroundColor(.white)
+        }
+    }
+}
+
+// MARK: - SCNView wrapper
+
+struct PitchSceneView: UIViewRepresentable {
+    let detectionMarkers: [TimestampedMarker]
+    let settings: CameraSettings
+    /// When true the camera is fixed at the estimated filming position.
+    /// Pinch = zoom (orthographic scale), pan = scroll. When false: free horizontal orbit + pinch-zoom.
+    let lockedToCamera: Bool
+    /// Optional trail from the remote peer device, rendered in cyan in free-orbit mode.
+    var remoteDetectionMarkers: [TimestampedMarker] = []
+    /// Skeleton frames captured during video processing or live recording.
+    var skeletonFrames: [SkeletonFrame] = []
+    /// Current scrub time. `.infinity` = show everything.
+    var currentTime: Double = .infinity
+
+    func makeUIView(context: Context) -> SCNView {
+        let scnView = SCNView()
+        scnView.backgroundColor = UIColor(red: 0.05, green: 0.07, blue: 0.12, alpha: 1)
+        scnView.allowsCameraControl = false
+        scnView.autoenablesDefaultLighting = false
+        scnView.antialiasingMode = .multisampling4X
+
+        let (scene, cameraNode) = buildScene(coordinator: context.coordinator)
+        scnView.scene = scene
+
+        context.coordinator.cameraNode = cameraNode
+        context.coordinator.scnView   = scnView
+        context.coordinator.locked    = lockedToCamera
+        context.coordinator.configure(videoAR: videoAR)
+
+        if lockedToCamera {
+            // Locked mode: pinch-to-zoom + pan-to-scroll
+            context.coordinator.lockedOrthoScale = Double(videoAR / 2)
+
+            let pan = UIPanGestureRecognizer(target: context.coordinator,
+                                             action: #selector(Coordinator.handleLockedPan(_:)))
+            scnView.addGestureRecognizer(pan)
+
+            let pinch = UIPinchGestureRecognizer(target: context.coordinator,
+                                                  action: #selector(Coordinator.handleLockedPinch(_:)))
+            scnView.addGestureRecognizer(pinch)
+        } else {
+            // Free orbit: start on pitcher's side (azimuth=0 → y=+dist).
+            context.coordinator.azimuth   = 0
+            context.coordinator.distance  = 150
+            context.coordinator.elevation = cameraNode.position.z
+            context.coordinator.updateCamera(cameraNode)
+
+            let pan = UIPanGestureRecognizer(target: context.coordinator,
+                                             action: #selector(Coordinator.handlePan(_:)))
+            scnView.addGestureRecognizer(pan)
+
+            let pinch = UIPinchGestureRecognizer(target: context.coordinator,
+                                                  action: #selector(Coordinator.handlePinch(_:)))
+            scnView.addGestureRecognizer(pinch)
+        }
+
+        return scnView
+    }
+
+    func updateUIView(_ uiView: SCNView, context: Context) {
+        guard let camera = context.coordinator.cameraNode?.camera else { return }
+
+        if lockedToCamera {
+            // Apply current orthographic scale (may have been changed by pinch)
+            camera.orthographicScale = context.coordinator.lockedOrthoScale
+        }
+
+        // --- Ball dot visibility based on currentTime ---
+        for entry in context.coordinator.ballDotNodes {
+            let hidden = !currentTime.isInfinite && entry.timestamp > currentTime
+            entry.dot.isHidden  = hidden
+            entry.line?.isHidden = hidden
+        }
+        for entry in context.coordinator.remoteBallDotNodes {
+            let hidden = !currentTime.isInfinite && entry.timestamp > currentTime
+            entry.dot.isHidden  = hidden
+            entry.line?.isHidden = hidden
+        }
+
+        // Move glow node to the last visible dot
+        if let glowNode = context.coordinator.glowNode {
+            let visible = context.coordinator.ballDotNodes.filter {
+                currentTime.isInfinite || $0.timestamp <= currentTime
+            }
+            if let last = visible.last {
+                glowNode.position = last.dot.position
+                glowNode.isHidden = false
+            } else {
+                glowNode.isHidden = true
+            }
+        }
+        if let remoteGlow = context.coordinator.remoteGlowNode {
+            let visible = context.coordinator.remoteBallDotNodes.filter {
+                currentTime.isInfinite || $0.timestamp <= currentTime
+            }
+            if let last = visible.last {
+                remoteGlow.position = last.dot.position
+                remoteGlow.isHidden = false
+            } else {
+                remoteGlow.isHidden = true
+            }
+        }
+
+        // --- Skeleton rig: position to nearest frame ---
+        updateSkeletonRig(coordinator: context.coordinator)
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    // MARK: - Coordinator
+
+    class Coordinator: NSObject {
+        weak var cameraNode: SCNNode?
+        weak var scnView: SCNView?
+        var locked: Bool = false
+
+        // Free-orbit state
+        var azimuth: Float = 0
+        var distance: Float = 150
+        var elevation: Float = 36
+        private var lastPanX: CGFloat = 0
+
+        // Locked-mode state
+        var lockedOrthoScale: Double = 1.0
+        var lockedPanOffsetX: Float = 0
+        var lockedPanOffsetZ: Float = 0
+        private var lockedPanStart: CGPoint = .zero
+        // videoAR stored here so gesture handlers can reference it without going through PitchSceneView
+        var videoAR: Float = 16.0 / 9.0
+
+        // Ball dot nodes (built once in makeUIView, toggled in updateUIView)
+        struct DotEntry {
+            let timestamp: Double
+            let dot: SCNNode
+            let line: SCNNode?   // connecting line to next dot (nil for last)
+        }
+        var ballDotNodes:       [DotEntry] = []
+        var remoteBallDotNodes: [DotEntry] = []
+        var glowNode:       SCNNode? = nil
+        var remoteGlowNode: SCNNode? = nil
+
+        // Skeleton rig: one set of nodes, repositioned per-frame
+        var skeletonJointNodes: [String: SCNNode] = [:]   // key = joint name
+        var skeletonBoneNodes:  [String: SCNNode] = [:]   // key = "start-end"
+
+        // MARK: Free-orbit gestures
+
+        @objc func handlePan(_ gr: UIPanGestureRecognizer) {
+            guard !locked, let cam = cameraNode else { return }
+            let loc = gr.location(in: gr.view)
+            if gr.state == .began { lastPanX = loc.x; return }
+            let dx = Float(loc.x - lastPanX)
+            lastPanX = loc.x
+            azimuth += dx * (.pi / 180) * 0.4
+            updateCamera(cam)
+        }
+
+        @objc func handlePinch(_ gr: UIPinchGestureRecognizer) {
+            guard !locked, let cam = cameraNode else { return }
+            if gr.state == .began || gr.state == .changed {
+                distance = max(50, min(600, distance / Float(gr.scale)))
+                gr.scale = 1
+                updateCamera(cam)
+            }
+        }
+
+        func updateCamera(_ cam: SCNNode) {
+            let x = distance * sin(azimuth)
+            let y = distance * cos(azimuth)
+            cam.position = SCNVector3(x, y, elevation)
+            cam.simdLook(at: .zero,
+                         up: simd_float3(0, 0, 1),
+                         localFront: simd_float3(0, 0, -1))
+        }
+
+        // MARK: Locked-mode gestures
+
+        @objc func handleLockedPan(_ gr: UIPanGestureRecognizer) {
+            guard locked, let cam = cameraNode else { return }
+            let loc = gr.location(in: gr.view)
+            if gr.state == .began {
+                lockedPanStart = loc
+                return
+            }
+            guard let view = gr.view else { return }
+            // Map pan delta in view pixels to scene units.
+            // The orthographic scale controls half the visible height in scene units.
+            // View height in scene units = 2 * orthoScale.
+            let viewH = Float(view.bounds.height)
+            guard viewH > 0 else { return }
+            let sceneUnitsPerPixel = Float(lockedOrthoScale * 2) / viewH
+            let dxPx = Float(loc.x - lockedPanStart.x)
+            let dyPx = Float(loc.y - lockedPanStart.y)
+            lockedPanStart = loc
+            // In the image-space scene X increases rightward and Z increases upward.
+            // Panning right in screen space should move the scene right (camera moves left).
+            let newX = cam.position.x - dxPx * sceneUnitsPerPixel
+            // Panning up in screen space (negative dyPx) should show higher in scene (camera moves up).
+            let newZ = cam.position.z + dyPx * sceneUnitsPerPixel
+            cam.position.x = newX
+            cam.position.z = newZ
+            // Keep the look-at target updated so the camera still points forward
+            let target = simd_float3(newX, 0, newZ)
+            cam.simdLook(at: target,
+                         up: simd_float3(0, 0, 1),
+                         localFront: simd_float3(0, 0, -1))
+        }
+
+        @objc func handleLockedPinch(_ gr: UIPinchGestureRecognizer) {
+            guard locked, let cam = cameraNode else { return }
+            if gr.state == .began || gr.state == .changed {
+                let newScale = lockedOrthoScale / Double(gr.scale)
+                // Clamp: don't zoom out beyond the full frame, don't zoom in beyond 10%
+                lockedOrthoScale = max(0.05, min(Double(videoAR), newScale))
+                cam.camera?.orthographicScale = lockedOrthoScale
+                gr.scale = 1
+            }
+        }
+
+        // Keep videoAR in sync (called from makeUIView)
+        func configure(videoAR: Float) {
+            self.videoAR = videoAR
+        }
+    }
+
+    // MARK: - Scene construction
+
+    private func buildScene(coordinator: Coordinator) -> (SCNScene, SCNNode) {
+        if lockedToCamera {
+            return buildImageSpaceScene(coordinator: coordinator)
+        } else {
+            return buildWorldSpaceScene(coordinator: coordinator)
+        }
+    }
+
+    // MARK: Image-space scene (single camera)
+    //
+    // Coordinate system:
+    //   X = normalised image X (0=left, 1=right)
+    //   Z = normalised image Y flipped × videoAR  (0=bottom, videoAR=top)
+    //       where videoAR = videoHeight/videoWidth = 16/9 for portrait 1080×1920
+    //   Y = 0 (flat, orthographic camera along Y axis)
+    //
+    // Camera:
+    //   orthographicScale = videoAR/2  → visible Z = [0, videoAR], X = [0, 1]
+    //   position = (0.5, -1, videoAR/2), looking +Y with Z-up.
+
+    // Portrait video height / width ratio.  For 1080×1920 = 16/9.
+    private let videoAR: Float = 16.0 / 9.0
+
+    private func buildImageSpaceScene(coordinator: Coordinator) -> (SCNScene, SCNNode) {
+        let scene = SCNScene()
+        let root  = SCNNode()
+        scene.rootNode.addChildNode(root)
+
+        addLighting(to: scene.rootNode)
+
+        // Draw plate and zone in image space (if calibrated)
+        if settings.isCalibrated, settings.platePoints.count == 5 {
+            addImageSpacePlate(to: root)
+            addImageSpaceStrikeZone(to: root)
+        }
+
+        // Ball dots placed directly at their image-space positions
+        let dots = imageSpaceBallDots()
+        buildImageSpaceTrajectoryNodes(dots, to: root, coordinator: coordinator)
+
+        // Skeleton rig in image space
+        buildSkeletonRig(coordinator: coordinator, to: root, worldSpace: false)
+
+        logImageSpaceDebug(dots: dots)
+
+        // Orthographic camera
+        let camera = SCNCamera()
+        camera.usesOrthographicProjection = true
+        camera.orthographicScale = Double(videoAR / 2)
+        camera.zNear = 0.01
+        camera.zFar  = 10
+        let cameraNode = SCNNode()
+        cameraNode.camera = camera
+        let camCentreZ = videoAR / 2
+        cameraNode.position = SCNVector3(0.5, -1, camCentreZ)
+        cameraNode.simdLook(at: simd_float3(0.5, 0, camCentreZ),
+                            up: simd_float3(0, 0, 1),
+                            localFront: simd_float3(0, 0, -1))
+        scene.rootNode.addChildNode(cameraNode)
+
+        coordinator.lockedOrthoScale = Double(videoAR / 2)
+
+        return (scene, cameraNode)
+    }
+
+    // MARK: - Debug logging
+
+    private func logImageSpaceDebug(dots: [(x: Float, z: Float, timestamp: Double)]) {
+        let sep = String(repeating: "─", count: 60)
+        print("\n\(sep)")
+        print("🎯 3D VIEW DEBUG — Image-Space Coordinates")
+        print(sep)
+
+        let pts = settings.platePoints
+        if pts.count == 5 {
+            print("\n📍 HOME PLATE — calibration points (normalised, UIKit Y 0=top)")
+            let names = ["backLeft(0)", "backRight(1)", "right(2)  ", "frontTip(3)", "left(4)   "]
+            for (i, p) in pts.enumerated() {
+                print(String(format: "   %@  imgX=%.4f  imgY(UIKit)=%.4f  →  sceneX=%.4f  sceneZ=%.4f",
+                             names[i], p.x, p.y, p.x, (1.0 - p.y) * Double(videoAR)))
+            }
+        } else {
+            print("\n⚠️  No calibration — plate not drawn")
+        }
+
+        print("\n⚾ BALL DETECTIONS — \(detectionMarkers.count) markers")
+        if detectionMarkers.isEmpty {
+            print("   (none)")
+        } else {
+            for (i, m) in detectionMarkers.enumerated() {
+                let sceneX = Float(m.point.x)
+                let sceneZ = Float(m.point.y) * videoAR
+                print(String(format: "   [%2d] t=%.3fs  visionX=%.4f  visionY=%.4f  →  sceneX=%.4f  sceneZ=%.4f",
+                             i, m.timestamp, m.point.x, m.point.y, sceneX, sceneZ))
+            }
+            if !dots.isEmpty {
+                let last = dots.last!
+                print(String(format: "   Last smoothed dot → sceneX=%.4f  sceneZ=%.4f", last.x, last.z))
+            }
+        }
+        print("\(sep)\n")
+    }
+
+    /// Home plate outline drawn in image space.
+    private func addImageSpacePlate(to root: SCNNode) {
+        let pts = settings.platePoints
+        let corners: [SCNVector3] = pts.map {
+            SCNVector3(Float($0.x), 0, (1.0 - Float($0.y)) * videoAR)
+        }
+        let looped = corners + [corners[0]]
+        let plateColor = UIColor(red: 0.92, green: 0.92, blue: 0.88, alpha: 0.9)
+        for i in 0..<corners.count {
+            addLine(from: looped[i], to: looped[i+1],
+                    color: plateColor, radius: 0.002, to: root)
+        }
+    }
+
+    /// Strike zone drawn in image space (matches live overlay).
+    private func addImageSpaceStrikeZone(to root: SCNNode) {
+        let rightNorm: CGPoint
+        let leftNorm: CGPoint
+        if settings.platePoints.count == 5 &&
+           settings.platePoints[HomePlatePoint.right.rawValue] != .zero &&
+           settings.platePoints[HomePlatePoint.left.rawValue]  != .zero {
+            rightNorm = settings.platePoints[HomePlatePoint.right.rawValue]
+            leftNorm  = settings.platePoints[HomePlatePoint.left.rawValue]
+        } else {
+            rightNorm = settings.plateRightEdge
+            leftNorm  = settings.plateLeftEdge
+        }
+
+        let midVecX = Float(rightNorm.x - leftNorm.x)
+        let midVecY = Float(rightNorm.y - leftNorm.y)
+        let normEdgeWidth = sqrt(midVecX * midVecX + midVecY * midVecY)
+        guard normEdgeWidth > 0.001 else { return }
+
+        let plateInches: Float = {
+            let w = settings.useCentimeters ? settings.plateWidth / 2.54 : settings.plateWidth
+            return Float(w)
+        }()
+        let normPerInch = normEdgeWidth / plateInches
+
+        let szBottom = Float(settings.strikeZoneBottomOffset)
+        let szHeight = Float(settings.strikeZoneHeight)
+
+        let leftX  = Float(leftNorm.x)
+        let leftZ  = (1.0 - Float(leftNorm.y)) * videoAR
+        let rightX = Float(rightNorm.x)
+        let rightZ = (1.0 - Float(rightNorm.y)) * videoAR
+
+        let bottomOffsetZ = normPerInch * szBottom
+        let zoneHeightZ   = normPerInch * szHeight
+
+        let bl = SCNVector3(leftX,  0, leftZ  + bottomOffsetZ)
+        let br = SCNVector3(rightX, 0, rightZ + bottomOffsetZ)
+        let tl = SCNVector3(leftX,  0, leftZ  + bottomOffsetZ + zoneHeightZ)
+        let tr = SCNVector3(rightX, 0, rightZ + bottomOffsetZ + zoneHeightZ)
+
+        let edgeColor = UIColor(white: 1.0, alpha: 0.95)
+        let r: CGFloat = 0.002
+        addLine(from: bl, to: br, color: edgeColor, radius: r, to: root)
+        addLine(from: tl, to: tr, color: edgeColor, radius: r, to: root)
+        addLine(from: bl, to: tl, color: edgeColor, radius: r, to: root)
+        addLine(from: br, to: tr, color: edgeColor, radius: r, to: root)
+        addQuadFill(bl: bl, br: br, tl: tl, tr: tr,
+                    color: UIColor.white.withAlphaComponent(0.08), to: root)
+    }
+
+    /// Ball detections placed at their image-space positions (with timestamps preserved).
+    private func imageSpaceBallDots() -> [(x: Float, z: Float, timestamp: Double)] {
+        guard !detectionMarkers.isEmpty else { return [] }
+        let raw = detectionMarkers.map { (x: Float($0.point.x), z: Float($0.point.y) * videoAR, timestamp: $0.timestamp) }
+        // 3-point moving average to reduce jitter
+        var smoothed = raw
+        for i in 1..<(raw.count - 1) {
+            smoothed[i] = (x: (raw[i-1].x + raw[i].x + raw[i+1].x) / 3,
+                           z: (raw[i-1].z + raw[i].z + raw[i+1].z) / 3,
+                           timestamp: raw[i].timestamp)
+        }
+        return smoothed
+    }
+
+    /// Build all dot + line nodes upfront; store references in the Coordinator for visibility toggling.
+    private func buildImageSpaceTrajectoryNodes(_ dots: [(x: Float, z: Float, timestamp: Double)],
+                                                to root: SCNNode,
+                                                coordinator: Coordinator) {
+        let n = dots.count
+        guard n > 0 else { return }
+
+        var entries: [Coordinator.DotEntry] = []
+        for (i, dot) in dots.enumerated() {
+            let t = n > 1 ? Float(i) / Float(n - 1) : 0.5
+            let col = UIColor(red: 1, green: CGFloat(1 - t), blue: 0, alpha: 1)
+
+            let sphere = SCNSphere(radius: 0.008)
+            let m = SCNMaterial()
+            m.diffuse.contents  = col
+            m.emission.contents = col.withAlphaComponent(0.3)
+            sphere.materials = [m]
+            let sn = SCNNode(geometry: sphere)
+            sn.position = SCNVector3(dot.x, 0, dot.z)
+            root.addChildNode(sn)
+
+            var lineNode: SCNNode? = nil
+            if i < n - 1 {
+                let nextDot = dots[i + 1]
+                lineNode = buildLineNode(from: SCNVector3(dot.x, 0, dot.z),
+                                         to:   SCNVector3(nextDot.x, 0, nextDot.z),
+                                         color: col, radius: 0.003)
+                if let ln = lineNode { root.addChildNode(ln) }
+            }
+            entries.append(Coordinator.DotEntry(timestamp: dot.timestamp, dot: sn, line: lineNode))
+        }
+        coordinator.ballDotNodes = entries
+
+        // Glow on last dot
+        if let last = dots.last {
+            let glow = SCNSphere(radius: 0.014)
+            let gm = SCNMaterial()
+            gm.diffuse.contents  = UIColor.red
+            gm.emission.contents = UIColor.red
+            gm.transparency = 0.35
+            glow.materials = [gm]
+            let gn = SCNNode(geometry: glow)
+            gn.position = SCNVector3(last.x, 0, last.z)
+            root.addChildNode(gn)
+            coordinator.glowNode = gn
+        }
+    }
+
+    // MARK: World-space scene (multi-camera / free-orbit)
+
+    private func buildWorldSpaceScene(coordinator: Coordinator) -> (SCNScene, SCNNode) {
+        let scene = SCNScene()
+
+        let szHeight = Float(settings.strikeZoneHeight)
+        let szBottom = Float(settings.strikeZoneBottomOffset)
+
+        let pivotX: Float = 0
+        let pivotY: Float = 8.5
+        let pivotZ: Float = szBottom + szHeight / 2
+
+        let world = SCNNode()
+        world.position = SCNVector3(-pivotX, -pivotY, -pivotZ)
+        scene.rootNode.addChildNode(world)
+
+        addLighting(to: scene.rootNode)
+        addGround(to: world)
+        addHomePlate(to: world)
+        addStrikeZone(to: world, height: szHeight, bottom: szBottom)
+
+        // In multi-device mode clip any detections that have crossed the front of the plate
+        // (world Y ≤ 0 = catcher side of the front tip). This prevents the catcher catching
+        // the ball from being rendered and causing visual confusion.
+        let pts = convertToWorldSpace(detectionMarkers).filter { $0.point.y > 0 }
+        buildWorldSpaceTrajectoryNodes(pts, to: world, coordinator: coordinator, isRemote: false)
+
+        let remotePts = convertToWorldSpace(remoteDetectionMarkers).filter { $0.point.y > 0 }
+        buildWorldSpaceTrajectoryNodes(remotePts, to: world, coordinator: coordinator, isRemote: true)
+
+        // Skeleton rig in world space
+        buildSkeletonRig(coordinator: coordinator, to: world, worldSpace: true)
+
+        let camera = SCNCamera()
+        camera.zFar  = 3000
+        camera.zNear = 1
+        let cameraNode = SCNNode()
+        cameraNode.camera = camera
+        scene.rootNode.addChildNode(cameraNode)
+
+        let dist: Float = 150
+        let worldElev: Float = 65
+        camera.fieldOfView = 58
+        cameraNode.position = SCNVector3(0, dist, worldElev - pivotZ)
+
+        return (scene, cameraNode)
+    }
+
+    /// Build world-space trajectory nodes upfront (all timestamps preserved).
+    private func buildWorldSpaceTrajectoryNodes(_ pts: [(point: Point3D, timestamp: Double)],
+                                                to root: SCNNode,
+                                                coordinator: Coordinator,
+                                                isRemote: Bool) {
+        let n = pts.count
+        guard n > 0 else { return }
+
+        var entries: [Coordinator.DotEntry] = []
+        for (i, entry) in pts.enumerated() {
+            let pt = entry.point
+            let t = n > 1 ? Float(i) / Float(n - 1) : 0.5
+
+            let col: UIColor
+            if isRemote {
+                col = UIColor(red: CGFloat(t), green: 1.0, blue: 1.0, alpha: 1)
+            } else {
+                col = UIColor(red: 1, green: CGFloat(1 - t), blue: 0, alpha: 1)
+            }
+
+            let sphere = SCNSphere(radius: 2.0)
+            let m = SCNMaterial()
+            m.diffuse.contents  = col
+            m.emission.contents = col.withAlphaComponent(0.25)
+            sphere.materials = [m]
+            let sn = SCNNode(geometry: sphere)
+            sn.position = v3(pt)
+            root.addChildNode(sn)
+
+            var lineNode: SCNNode? = nil
+            if i < n - 1 {
+                let nextPt = pts[i + 1].point
+                lineNode = buildLineNode(from: v3(pt), to: v3(nextPt), color: col, radius: 0.9)
+                if let ln = lineNode { root.addChildNode(ln) }
+            }
+            entries.append(Coordinator.DotEntry(timestamp: entry.timestamp, dot: sn, line: lineNode))
+        }
+
+        let glowColor: UIColor = isRemote ? .magenta : .red
+        if let last = pts.last {
+            let glow = SCNSphere(radius: 3.5)
+            let gm = SCNMaterial()
+            gm.diffuse.contents  = glowColor
+            gm.emission.contents = glowColor
+            gm.transparency = 0.35
+            glow.materials = [gm]
+            let gn = SCNNode(geometry: glow)
+            gn.position = v3(last.point)
+            root.addChildNode(gn)
+            if isRemote { coordinator.remoteGlowNode = gn }
+            else        { coordinator.glowNode = gn }
+        }
+
+        if isRemote { coordinator.remoteBallDotNodes = entries }
+        else        { coordinator.ballDotNodes = entries }
+    }
+
+    // MARK: - Camera position estimation from calibration
+
+    private func estimateCameraPosition() -> EstimatedCameraPosition? {
+        guard settings.isCalibrated, settings.platePoints.count == 5 else { return nil }
+
+        let pts = settings.platePoints
+        let backLeft  = pts[0]
+        let backRight = pts[1]
+        let frontTip  = pts[3]
+
+        let zoom = Float(max(1.0, settings.selectedLens))
+        let focalNorm: Float = 1.35 * zoom
+        let plateWidthInches: Float = 17.0
+        let dxBack = Float(backRight.x - backLeft.x)
+        let dyBack = Float(backRight.y - backLeft.y)
+        let apparentBackWidth = sqrt(dxBack*dxBack + dyBack*dyBack)
+        guard apparentBackWidth > 0.001 else { return nil }
+        let distToBackEdge = focalNorm * plateWidthInches / apparentBackWidth
+        let distToPlate = distToBackEdge
+
+        let imgCX = pts.reduce(0.0) { $0 + $1.x } / Double(pts.count)
+        let imgCY = pts.reduce(0.0) { $0 + $1.y } / Double(pts.count)
+        let worldCentreX: Float = 0
+        let worldCentreY: Float = 10.2
+        let imgOffsetX = Float(imgCX) - 0.5
+        let imgOffsetY = Float(imgCY) - 0.5
+        let camX = worldCentreX - imgOffsetX * distToPlate / focalNorm
+
+        let frontTipImgY = Float(frontTip.y)
+        let backMidImgY  = Float((backLeft.y + backRight.y) / 2)
+        let isPitcherSide = frontTipImgY > backMidImgY
+
+        let horizontalAngle = asin(max(-0.9, min(0.9, camX / max(1, distToPlate))))
+        let depthFromCentre = distToPlate * cos(horizontalAngle)
+
+        let camY: Float
+        if isPitcherSide {
+            camY = worldCentreY + depthFromCentre
+        } else {
+            camY = worldCentreY - depthFromCentre
+        }
+
+        let hFovRad: Float = 2 * atan(0.5 / focalNorm)
+        let vFovRad: Float = hFovRad * (9.0 / 16.0)
+        let elevAngle: Float = imgOffsetY * vFovRad
+        let camZ = max(30, distToPlate * sin(elevAngle))
+
+        let relX = camX
+        let relY = camY - 17.0
+        let azimuth = atan2(relX, relY)
+        let fovDegrees = hFovRad * (180 / .pi)
+
+        return EstimatedCameraPosition(
+            worldX: camX,
+            worldY: camY,
+            worldZ: camZ,
+            azimuth: azimuth,
+            fieldOfView: fovDegrees
+        )
+    }
+
+    // MARK: - Lighting
+
+    private func addLighting(to root: SCNNode) {
+        let amb = SCNNode()
+        amb.light = { let l = SCNLight(); l.type = .ambient
+            l.color = UIColor(white: 0.4, alpha: 1); return l }()
+        root.addChildNode(amb)
+
+        let dir = SCNNode()
+        dir.light = { let l = SCNLight(); l.type = .directional
+            l.color = UIColor(white: 0.85, alpha: 1); return l }()
+        dir.eulerAngles = SCNVector3(-1.0, 0.5, 0)
+        root.addChildNode(dir)
+    }
+
+    // MARK: - Ground
+
+    private func addGround(to root: SCNNode) {
+        let plane = SCNPlane(width: 480, height: 680)
+        let mat = SCNMaterial()
+        mat.diffuse.contents = UIColor(white: 0.1, alpha: 1)
+        mat.isDoubleSided = true
+        plane.materials = [mat]
+        let node = SCNNode(geometry: plane)
+        node.eulerAngles = SCNVector3(-Float.pi / 2, 0, 0)
+        node.position = SCNVector3(0, 340, 0)
+        root.addChildNode(node)
+
+        let gridColor = UIColor(white: 0.22, alpha: 1)
+        for ix in stride(from: -240, through: 240, by: 24) {
+            addLine(from: SCNVector3(Float(ix), 0, 0),
+                    to:   SCNVector3(Float(ix), 680, 0),
+                    color: gridColor, radius: 0.25, to: root)
+        }
+        for iy in stride(from: 0, through: 680, by: 24) {
+            addLine(from: SCNVector3(-240, Float(iy), 0),
+                    to:   SCNVector3( 240, Float(iy), 0),
+                    color: gridColor, radius: 0.25, to: root)
+        }
+    }
+
+    // MARK: - Home plate
+
+    private func addHomePlate(to root: SCNNode) {
+        let corners: [SCNVector3] = [
+            SCNVector3(-8.5, 17.0, 0.1),
+            SCNVector3( 8.5, 17.0, 0.1),
+            SCNVector3( 8.5,  8.5, 0.1),
+            SCNVector3( 0.0,  0.0, 0.1),
+            SCNVector3(-8.5,  8.5, 0.1)
+        ]
+        let plateColor = UIColor(red: 0.92, green: 0.92, blue: 0.88, alpha: 1)
+        let looped = corners + [corners[0]]
+        for i in 0..<corners.count {
+            addLine(from: looped[i], to: looped[i+1],
+                    color: plateColor, radius: 0.7, to: root)
+        }
+        let cx = corners.reduce(Float(0)) { $0 + $1.x } / Float(corners.count)
+        let cy = corners.reduce(Float(0)) { $0 + $1.y } / Float(corners.count)
+        let cen = SCNVector3(cx, cy, 0.1)
+        let fillColor = UIColor(red: 0.82, green: 0.80, blue: 0.75, alpha: 0.9)
+        for i in 0..<corners.count {
+            addTriangle(a: cen, b: looped[i], c: looped[i+1], color: fillColor, to: root)
+        }
+    }
+
+    // MARK: - Strike zone
+
+    private func addStrikeZone(to root: SCNNode, height: Float, bottom: Float) {
+        let width: Float = 17.0
+        let midZ  = bottom + height / 2
+        let top   = bottom + height
+        let halfW = width / 2
+        let yFace: Float = 8.5
+
+        let plane = SCNPlane(width: CGFloat(width), height: CGFloat(height))
+        let fillMat = SCNMaterial()
+        fillMat.diffuse.contents  = UIColor.white.withAlphaComponent(0.10)
+        fillMat.emission.contents = UIColor.white.withAlphaComponent(0.06)
+        fillMat.isDoubleSided = true
+        plane.materials = [fillMat]
+        let planeNode = SCNNode(geometry: plane)
+        planeNode.eulerAngles = SCNVector3(-Float.pi / 2, 0, 0)
+        planeNode.position    = SCNVector3(0, yFace, midZ)
+        root.addChildNode(planeNode)
+
+        let edgeColor = UIColor(white: 1.0, alpha: 0.95)
+        let edges: [(SCNVector3, SCNVector3)] = [
+            (SCNVector3(-halfW, yFace, bottom), SCNVector3( halfW, yFace, bottom)),
+            (SCNVector3(-halfW, yFace, top),    SCNVector3( halfW, yFace, top)),
+            (SCNVector3(-halfW, yFace, bottom), SCNVector3(-halfW, yFace, top)),
+            (SCNVector3( halfW, yFace, bottom), SCNVector3( halfW, yFace, top))
+        ]
+        for (a, b) in edges {
+            addLine(from: a, to: b, color: edgeColor, radius: 0.6, to: root)
+        }
+    }
+
+    // MARK: - World-space coordinate conversion
+
+    private func convertToWorldSpace(_ markers: [TimestampedMarker]) -> [(point: Point3D, timestamp: Double)] {
+        guard !markers.isEmpty else { return [] }
+        let points = markers.map { $0.point }
+        let timestamps = markers.map { $0.timestamp }
+        if let h = HomographyHelper.make(from: settings) {
+            let pts3D = convertCalibrated(points, homography: h)
+            return zip(pts3D, timestamps).map { ($0, $1) }
+        }
+        let pts3D = convertUncalibrated(points)
+        return zip(pts3D, timestamps).map { ($0, $1) }
+    }
+
+    private func convertCalibrated(_ markers: [CGPoint],
+                                   homography: HomographyHelper) -> [Point3D] {
+        let pts = settings.platePoints
+        guard pts.count == 5, !markers.isEmpty else { return [] }
+
+        let zoom = Float(max(1.0, settings.selectedLens))
+        let focalNorm: Float = 1.35 * zoom
+
+        let backLeftX  = Float(pts[0].x)
+        let backRightX = Float(pts[1].x)
+        let apparentBackWidth = abs(backRightX - backLeftX)
+        guard apparentBackWidth > 0.001 else { return [] }
+
+        let distToBackEdge = focalNorm * 17.0 / apparentBackWidth
+        let cx = (backLeftX + backRightX) / 2
+        let zoneY: Float = 8.5
+
+        let leftMidPt  = pts[4]
+        let rightMidPt = pts[2]
+
+        let midVecX = Float(rightMidPt.x - leftMidPt.x)
+        let midVecY = Float(rightMidPt.y - leftMidPt.y)
+        let midEdgeWidth = sqrt(midVecX * midVecX + midVecY * midVecY)
+        guard midEdgeWidth > 0.001 else { return [] }
+
+        let plateInches: Float = {
+            let w = settings.useCentimeters ? settings.plateWidth / 2.54 : settings.plateWidth
+            return Float(w)
+        }()
+        let pixelsPerInchNorm = midEdgeWidth / plateInches
+        let anchorUIKitY = Float((leftMidPt.y + rightMidPt.y) / 2)
+
+        var pts3D: [Point3D] = markers.map { m in
+            let worldX = (Float(m.x) - cx) * distToBackEdge / focalNorm
+            let ballUIKitY = 1.0 - Float(m.y)
+            let worldZ = (anchorUIKitY - ballUIKitY) / pixelsPerInchNorm
+            return Point3D(x: worldX, y: zoneY, z: worldZ)
+        }
+
+        // 3-point moving average
+        var smoothed = pts3D
+        for i in 1..<(pts3D.count - 1) {
+            smoothed[i].x = (pts3D[i-1].x + pts3D[i].x + pts3D[i+1].x) / 3
+            smoothed[i].z = (pts3D[i-1].z + pts3D[i].z + pts3D[i+1].z) / 3
+        }
+        return smoothed
+    }
+
+    private var isPitcherSideCamera: Bool {
+        guard settings.isCalibrated, settings.platePoints.count == 5 else { return false }
+        let frontTipImgY = settings.platePoints[3].y
+        let backMidImgY  = (settings.platePoints[0].y + settings.platePoints[1].y) / 2
+        return frontTipImgY > backMidImgY
+    }
+
+    private func convertUncalibrated(_ markers: [CGPoint]) -> [Point3D] {
+        let n = markers.count
+        let xSign: Float = isPitcherSideCamera ? -1 : 1
+        return markers.enumerated().map { i, pt in
+            let t = n > 1 ? Float(i) / Float(n - 1) : 0.5
+            let lateral = xSign * (Float(pt.x) - 0.5) * 170
+            let depth   = (1.0 - t) * 612
+            let height  = 27.0 + Float(pt.y) * 33.0
+            return Point3D(x: lateral, y: depth, z: height)
+        }
+    }
+
+    // MARK: - Skeleton rig
+
+    /// Names of the 13 joints we track.
+    private let jointNames: [String] = [
+        "neck", "leftShoulder", "rightShoulder",
+        "leftElbow", "rightElbow", "leftWrist", "rightWrist",
+        "leftHip", "rightHip", "leftKnee", "rightKnee", "leftAnkle", "rightAnkle"
+    ]
+
+    /// Bone connections as pairs of joint names.
+    private let boneConnections: [(String, String)] = [
+        ("neck",          "leftShoulder"),
+        ("neck",          "rightShoulder"),
+        ("leftShoulder",  "leftElbow"),
+        ("leftElbow",     "leftWrist"),
+        ("rightShoulder", "rightElbow"),
+        ("rightElbow",    "rightWrist"),
+        ("leftShoulder",  "leftHip"),
+        ("rightShoulder", "rightHip"),
+        ("leftHip",       "rightHip"),
+        ("leftHip",       "leftKnee"),
+        ("leftKnee",      "leftAnkle"),
+        ("rightHip",      "rightKnee"),
+        ("rightKnee",     "rightAnkle"),
+    ]
+
+    /// Build one skeleton rig (26 nodes, all hidden) and store in Coordinator.
+    private func buildSkeletonRig(coordinator: Coordinator, to root: SCNNode, worldSpace: Bool) {
+        guard !skeletonFrames.isEmpty else { return }
+
+        let jointRadius: CGFloat = worldSpace ? 1.5 : 0.007
+        let boneRadius:  CGFloat = worldSpace ? 0.8 : 0.004
+
+        // Joint nodes
+        for name in jointNames {
+            let sphere = SCNSphere(radius: jointRadius)
+            let m = SCNMaterial()
+            m.diffuse.contents  = UIColor.yellow
+            m.emission.contents = UIColor.yellow.withAlphaComponent(0.5)
+            sphere.materials = [m]
+            let node = SCNNode(geometry: sphere)
+            node.isHidden = true
+            root.addChildNode(node)
+            coordinator.skeletonJointNodes[name] = node
+        }
+
+        // Bone nodes (cylinders; we'll resize + reposition them per frame)
+        for (startName, endName) in boneConnections {
+            let key = "\(startName)-\(endName)"
+            let cyl = SCNCylinder(radius: boneRadius, height: 1.0)  // height placeholder
+            let m = SCNMaterial()
+            m.diffuse.contents = UIColor.cyan.withAlphaComponent(0.85)
+            cyl.materials = [m]
+            let node = SCNNode(geometry: cyl)
+            node.isHidden = true
+            root.addChildNode(node)
+            coordinator.skeletonBoneNodes[key] = node
+        }
+
+        // Immediately position rig at mid-frame (so it shows correctly before any slider use)
+        updateSkeletonRig(coordinator: coordinator)
+    }
+
+    /// Reposition the skeleton rig to the nearest SkeletonFrame for `currentTime`.
+    private func updateSkeletonRig(coordinator: Coordinator) {
+        guard !skeletonFrames.isEmpty,
+              !coordinator.skeletonJointNodes.isEmpty else { return }
+
+        let frame: SkeletonFrame
+        if currentTime.isInfinite {
+            frame = skeletonFrames[skeletonFrames.count / 2]
+        } else {
+            // Binary search for nearest frame by timestamp
+            frame = nearestSkeletonFrame(to: currentTime)
+        }
+
+        let joints = frame.joints
+        let isWorldSpace = !lockedToCamera
+
+        // Build position lookup
+        var positions: [String: SCNVector3] = [:]
+        for name in jointNames {
+            if let p = jointPosition(name: name, joints: joints, worldSpace: isWorldSpace) {
+                positions[name] = p
+            }
+        }
+
+        // Update joint nodes
+        for name in jointNames {
+            let node = coordinator.skeletonJointNodes[name]
+            if let pos = positions[name] {
+                node?.position = pos
+                node?.isHidden = false
+            } else {
+                node?.isHidden = true
+            }
+        }
+
+        // Update bone nodes
+        for (startName, endName) in boneConnections {
+            let key = "\(startName)-\(endName)"
+            let node = coordinator.skeletonBoneNodes[key]
+            guard let a = positions[startName], let b = positions[endName] else {
+                node?.isHidden = true
+                continue
+            }
+            repositionCylinder(node: node!, from: a, to: b)
+            node?.isHidden = false
+        }
+    }
+
+    /// Binary search for the SkeletonFrame closest in timestamp to `time`.
+    private func nearestSkeletonFrame(to time: Double) -> SkeletonFrame {
+        let frames = skeletonFrames
+        var lo = 0
+        var hi = frames.count - 1
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if frames[mid].timestamp < time {
+                lo = mid + 1
+            } else {
+                hi = mid
+            }
+        }
+        // lo is now the first frame with timestamp >= time
+        if lo == 0 { return frames[0] }
+        if lo >= frames.count { return frames[frames.count - 1] }
+        let before = frames[lo - 1]
+        let after  = frames[lo]
+        return (time - before.timestamp) < (after.timestamp - time) ? before : after
+    }
+
+    /// Convert a single joint from a SkeletonJoints struct to an SCNVector3 in the appropriate space.
+    private func jointPosition(name: String, joints: SkeletonJoints, worldSpace: Bool) -> SCNVector3? {
+        let kp: KeyPath<SkeletonJoints, CGPoint?>
+        switch name {
+        case "neck":           kp = \.neck
+        case "leftShoulder":   kp = \.leftShoulder
+        case "rightShoulder":  kp = \.rightShoulder
+        case "leftElbow":      kp = \.leftElbow
+        case "rightElbow":     kp = \.rightElbow
+        case "leftWrist":      kp = \.leftWrist
+        case "rightWrist":     kp = \.rightWrist
+        case "leftHip":        kp = \.leftHip
+        case "rightHip":       kp = \.rightHip
+        case "leftKnee":       kp = \.leftKnee
+        case "rightKnee":      kp = \.rightKnee
+        case "leftAnkle":      kp = \.leftAnkle
+        case "rightAnkle":     kp = \.rightAnkle
+        default: return nil
+        }
+        guard let p = joints[keyPath: kp] else { return nil }
+
+        if worldSpace {
+            guard let pt3 = jointToWorld(p) else { return nil }
+            return v3(pt3)
+        } else {
+            // Vision Y=0=bottom, scene Z=up: high Y → high Z (no inversion needed)
+            return SCNVector3(Float(p.x), 0, Float(p.y) * videoAR)
+        }
+    }
+
+    /// Update a cylinder node's position, height, and rotation to span from `a` to `b`.
+    private func repositionCylinder(node: SCNNode, from a: SCNVector3, to b: SCNVector3) {
+        let dx = b.x - a.x
+        let dy = b.y - a.y
+        let dz = b.z - a.z
+        let len = sqrt(dx*dx + dy*dy + dz*dz)
+        guard len > 0.001 else { node.isHidden = true; return }
+
+        node.position = SCNVector3((a.x+b.x)/2, (a.y+b.y)/2, (a.z+b.z)/2)
+
+        if let cyl = node.geometry as? SCNCylinder {
+            cyl.height = CGFloat(len)
+        }
+
+        let dir = SCNVector3(dx/len, dy/len, dz/len)
+        let cross = SCNVector3(dir.z, 0, -dir.x)
+        let crossLen = sqrt(cross.x*cross.x + cross.z*cross.z)
+        if crossLen > 0.001 {
+            let angle = acos(max(-1, min(1, dir.y)))
+            node.rotation = SCNVector4(cross.x/crossLen, 0, cross.z/crossLen, angle)
+        } else {
+            node.rotation = SCNVector4(0, 0, 1, 0)
+        }
+    }
+
+    /// Convert a single joint image point to world-space Point3D.
+    private func jointToWorld(_ p: CGPoint) -> Point3D? {
+        if let h = HomographyHelper.make(from: settings) {
+            let w = h.imageToWorld(p)
+            let pts = settings.platePoints
+            guard pts.count == 5 else { return nil }
+            let leftMidPt  = pts[4]
+            let rightMidPt = pts[2]
+            let midVecX = Float(rightMidPt.x - leftMidPt.x)
+            let midVecY = Float(rightMidPt.y - leftMidPt.y)
+            let midEdgeWidth = sqrt(midVecX * midVecX + midVecY * midVecY)
+            guard midEdgeWidth > 0.001 else { return nil }
+            let plateInches: Float = {
+                let pw = settings.useCentimeters ? settings.plateWidth / 2.54 : settings.plateWidth
+                return Float(pw)
+            }()
+            let pixelsPerInchNorm = midEdgeWidth / plateInches
+            // Vision Y=0=bottom; anchorUIKitY is also in Vision space (normalised).
+            // Both are in the same coordinate space so no inversion needed.
+            let anchorUIKitY = Float((leftMidPt.y + rightMidPt.y) / 2)
+            let jointUIKitY  = Float(p.y)
+            let worldZ = (jointUIKitY - anchorUIKitY) / pixelsPerInchNorm
+            return Point3D(x: Float(w.x), y: Float(w.y), z: worldZ)
+        } else {
+            let xSign: Float = isPitcherSideCamera ? -1 : 1
+            let lateral = xSign * (Float(p.x) - 0.5) * 170
+            let worldZ  = (Float(p.y) - 0.3) * 80
+            return Point3D(x: lateral, y: -12, z: worldZ)
+        }
+    }
+
+    // MARK: - SceneKit geometry helpers
+
+    private func v3(_ p: Point3D) -> SCNVector3 { SCNVector3(p.x, p.y, p.z) }
+
+    /// Build a line node without adding it to a parent (caller handles that).
+    private func buildLineNode(from a: SCNVector3, to b: SCNVector3,
+                                color: UIColor, radius: CGFloat) -> SCNNode? {
+        let dx = b.x - a.x; let dy = b.y - a.y; let dz = b.z - a.z
+        let len = sqrt(dx*dx + dy*dy + dz*dz)
+        guard len > 0.001 else { return nil }
+
+        let cyl = SCNCylinder(radius: radius, height: CGFloat(len))
+        let m = SCNMaterial(); m.diffuse.contents = color
+        cyl.materials = [m]
+
+        let node = SCNNode(geometry: cyl)
+        node.position = SCNVector3((a.x+b.x)/2, (a.y+b.y)/2, (a.z+b.z)/2)
+
+        let dir = SCNVector3(dx/len, dy/len, dz/len)
+        let cross = SCNVector3(dir.z, 0, -dir.x)
+        let crossLen = sqrt(cross.x*cross.x + cross.z*cross.z)
+        if crossLen > 0.001 {
+            let angle = acos(max(-1, min(1, dir.y)))
+            node.rotation = SCNVector4(cross.x/crossLen, 0, cross.z/crossLen, angle)
+        }
+        return node
+    }
+
+    private func addLine(from a: SCNVector3, to b: SCNVector3,
+                         color: UIColor, radius: CGFloat, to parent: SCNNode) {
+        if let node = buildLineNode(from: a, to: b, color: color, radius: radius) {
+            parent.addChildNode(node)
+        }
+    }
+
+    private func addQuadFill(bl: SCNVector3, br: SCNVector3,
+                              tl: SCNVector3, tr: SCNVector3,
+                              color: UIColor, to parent: SCNNode) {
+        addTriangle(a: bl, b: br, c: tr, color: color, to: parent)
+        addTriangle(a: bl, b: tr, c: tl, color: color, to: parent)
+    }
+
+    private func addTriangle(a: SCNVector3, b: SCNVector3, c: SCNVector3,
+                              color: UIColor, to parent: SCNNode) {
+        let vertices: [SCNVector3] = [a, b, c]
+        let indices: [Int32] = [0, 1, 2]
+        let src = SCNGeometrySource(vertices: vertices)
+        let el  = SCNGeometryElement(indices: indices, primitiveType: .triangles)
+        let geo = SCNGeometry(sources: [src], elements: [el])
+        let m = SCNMaterial(); m.diffuse.contents = color; m.isDoubleSided = true
+        geo.materials = [m]
+        parent.addChildNode(SCNNode(geometry: geo))
+    }
+}
