@@ -3,6 +3,7 @@ import PhotosUI
 import AVFoundation
 import AVKit
 import Photos
+import MultipeerConnectivity
 
 struct ContentView: View {
     @State private var selectedItem: PhotosPickerItem?
@@ -15,7 +16,33 @@ struct ContentView: View {
     @State private var pickedVideo: PickedVideo?
     @State private var processingVideo: PickedVideo?
     @StateObject private var cameraSettings = CameraSettings()
+    @StateObject private var lineupStore = LineupStore()
     @State private var showingSettings = false
+    @State private var showingLineup = false
+    @State private var showingPitchOutcome = false
+    @State private var pendingPitchMarkers: [CGPoint] = []
+    @StateObject private var peerSession = MultipeerSession()
+    @State private var showingPeerPanel = false
+    /// Detection markers from the most-recently processed video (normalised image coords).
+    @State private var lastDetectionMarkers: [TimestampedMarker] = []
+    /// Skeleton frames from the most-recently processed video.
+    @State private var lastSkeletonFrames: [SkeletonFrame] = []
+    /// Remote trail received from the peer device. Set whenever a trailBroadcast arrives.
+    @State private var remoteDetectionMarkers: [TimestampedMarker] = []
+    /// Current scrub position for the 3D timeline. .infinity = show the full trail.
+    @State private var timelineValue: Double = .infinity
+    /// Whether the timeline is auto-playing.
+    @State private var isPlaying: Bool = false
+    /// Whether the main content area is showing the 3D view (true) or the video (false).
+    @State private var showing3DView = false
+    /// Toggled true whenever export processing completes, used to trigger the 3D view after dismissal.
+    @State private var processingDidComplete = false
+    /// URL of the most-recently processed video (set by the Select Video path).
+    /// Used to show the annotated video on the video side of the toggle.
+    @State private var lastProcessedVideoURL: URL? = nil
+    /// Calibration settings received from the peer (host). When non-nil, the 3D scene
+    /// is built using the host's calibration so both devices see the same world-space scene.
+    @StateObject private var remoteCameraSettings = CameraSettings()
 
     var body: some View {
         GeometryReader { geo in
@@ -24,9 +51,56 @@ struct ContentView: View {
                 Color.black.ignoresSafeArea()
                 
                 VStack(spacing: 0) {
-                    // Settings button in top right
+                    // MARK: - Top bar
                     HStack {
+                        // Toggle pill — shown whenever markers exist (calibration not required)
+                        if !lastDetectionMarkers.isEmpty {
+                            HStack(spacing: 0) {
+                                Button {
+                                    showing3DView = false
+                                } label: {
+                                    Image(systemName: "video.fill")
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundColor(showing3DView ? .white.opacity(0.5) : .black)
+                                    .padding(.vertical, 7)
+                                    .padding(.horizontal, 14)
+                                    .background(showing3DView ? Color.clear : Color.white)
+                                    .clipShape(Capsule())
+                                }
+                                Button {
+                                    showing3DView = true
+                                } label: {
+                                    Text("3D View")
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundColor(showing3DView ? .black : .white.opacity(0.5))
+                                    .padding(.vertical, 7)
+                                    .padding(.horizontal, 14)
+                                    .background(showing3DView ? Color.white : Color.clear)
+                                    .clipShape(Capsule())
+                                }
+                            }
+                            .padding(3)
+                            .background(Color.white.opacity(0.12))
+                            .clipShape(Capsule())
+                            .padding(.leading, 16)
+                        } else {
+                            Spacer()
+                        }
+
                         Spacer()
+
+                        Button(action: {
+                            showingLineup = true
+                        }) {
+                            Image(systemName: "person.3.fill")
+                                .font(.system(size: 20))
+                                .foregroundColor(.white)
+                                .padding(10)
+                                .background(Color.black.opacity(0.4))
+                                .clipShape(Circle())
+                        }
+                        .padding(.trailing, 8)
+
                         Button(action: {
                             showingSettings = true
                         }) {
@@ -38,14 +112,63 @@ struct ContentView: View {
                                 .clipShape(Circle())
                         }
                         .padding(.trailing, 16)
-                        .padding(.top, geo.safeAreaInsets.top > 0 ? 8 : 16)
                     }
+                    .padding(.top, geo.safeAreaInsets.top > 0 ? 8 : 16)
                     .zIndex(10)
                     
                     Spacer()
                         .frame(height: 8)
-                    
-                    if let identifier = lastVideoIdentifier, !identifier.isEmpty {
+
+                    // MARK: - Main content area
+                    // Single device: lockedToCamera=true (flat 2D overlay, no gestures).
+                    // Multi-device (remote trail present): lockedToCamera=false (free orbit + zoom).
+                    // Guest mode: use remoteCameraSettings (host's calibration) for world-space
+                    // reconstruction so both devices see the same scene geometry.
+                    let isMultiDevice = peerSession.isConnected
+                    let hasRemoteCalibration = peerSession.remoteCalibration != nil
+                    // Scene settings: prefer remote (host) calibration when guest; fall back to local.
+                    let sceneSettings = (isMultiDevice && hasRemoteCalibration) ? remoteCameraSettings : cameraSettings
+                    if showing3DView {
+                        VStack(spacing: 0) {
+                            ZStack(alignment: .bottomLeading) {
+                                PitchSceneView(detectionMarkers: lastDetectionMarkers,
+                                               settings: sceneSettings,
+                                               lockedToCamera: !isMultiDevice,
+                                               remoteDetectionMarkers: remoteDetectionMarkers,
+                                               skeletonFrames: lastSkeletonFrames,
+                                               currentTime: timelineValue)
+                                    .frame(maxWidth: .infinity)
+                                    .aspectRatio(9.0 / 16.0, contentMode: .fit)
+                                    .cornerRadius(16)
+                                    .padding(.horizontal, 16)
+                                // Legend when remote trail is present
+                                if isMultiDevice {
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Label("Local", systemImage: "circle.fill").foregroundColor(.yellow)
+                                        Label("Remote", systemImage: "circle.fill").foregroundColor(.cyan)
+                                    }
+                                    .font(.caption2)
+                                    .padding(8)
+                                    .background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 8))
+                                    .padding(.leading, 24)
+                                    .padding(.bottom, 8)
+                                }
+                            }
+                            // Timeline slider — shown when markers have timestamps
+                            if !lastDetectionMarkers.isEmpty,
+                               let firstT = lastDetectionMarkers.first?.timestamp,
+                               let lastT  = lastDetectionMarkers.last?.timestamp,
+                               lastT > firstT {
+                                TimelineSliderView(
+                                    value: $timelineValue,
+                                    range: firstT...lastT,
+                                    isPlaying: $isPlaying
+                                )
+                                .padding(.horizontal, 16)
+                                .padding(.top, 8)
+                            }
+                        }
+                    } else if let identifier = lastVideoIdentifier, !identifier.isEmpty {
                         PhotosVideoPlayer(localIdentifier: identifier, showControls: false, loop: true)
                             .frame(maxWidth: .infinity)
                             .frame(height: geo.size.height * 0.68)
@@ -53,6 +176,14 @@ struct ContentView: View {
                             .shadow(radius: 8)
                             .padding(.horizontal, 16)
                             .onTapGesture { showingLastVideo = true }
+                    } else if let videoURL = lastProcessedVideoURL {
+                        // Select Video path: show the processed video file directly
+                        URLVideoPlayer(url: videoURL)
+                            .frame(maxWidth: .infinity)
+                            .frame(height: geo.size.height * 0.68)
+                            .cornerRadius(16)
+                            .shadow(radius: 8)
+                            .padding(.horizontal, 16)
                     } else if let thumbnail = lastVideoThumbnail {
                         Image(uiImage: thumbnail)
                             .resizable()
@@ -81,9 +212,16 @@ struct ContentView: View {
 
                     Spacer()
 
+                    // MARK: - Peer Connection Banner
+                    PeerConnectionBanner(session: peerSession, showingPanel: $showingPeerPanel)
+                        .padding(.horizontal, 16)
+                        .padding(.bottom, 6)
+
                     VStack(spacing: 12) {
                         Button("Open Camera") {
                             currentVideoURL = nil
+                            lastProcessedVideoURL = nil
+                            processingDidComplete = false
                             showingCamera = true
                         }
                         .font(.headline)
@@ -113,15 +251,28 @@ struct ContentView: View {
         .fullScreenCover(isPresented: $showingCamera) {
             CameraView(
                 onVideoSaved: { identifier in
-                    Task { @MainActor in
-                        lastVideoIdentifier = identifier
-                        showingCamera = false
-                        print("✅ Video saved. Returning to home with identifier: \(identifier)")
-                    }
+                    lastVideoIdentifier = identifier
+                    showingCamera = false
+                    print("✅ Video saved. Returning to home with identifier: \(identifier)")
+                },
+                onProcessingComplete: { markers, skeletonFrames in
+                    lastDetectionMarkers = markers
+                    lastSkeletonFrames = skeletonFrames
+                    // Reset timeline to show the full trail on first display
+                    timelineValue = .infinity
+                    isPlaying = false
+                    processingDidComplete = true
+                },
+                onAnnotatedVideoURL: { url in
+                    // Show the annotated video in-app (same as the Select Video path)
+                    lastProcessedVideoURL = url
+                    lastVideoIdentifier = nil
                 },
                 videoURL: currentVideoURL,
                 isRecordingLive: $isRecordingLive,
-                settings: cameraSettings
+                settings: cameraSettings,
+                peerSession: peerSession,
+                activeBatter: lineupStore.activeBatter
             )
             .ignoresSafeArea()
         }
@@ -133,6 +284,7 @@ struct ContentView: View {
                 onProcess: {
                     let v = video
                     pickedVideo = nil
+                    processingDidComplete = false
                     // Small delay ensures the dismiss completes before presenting the next cover
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                         processingVideo = v
@@ -147,16 +299,30 @@ struct ContentView: View {
         .fullScreenCover(item: $processingVideo) { video in
             CameraView(
                 onVideoSaved: { identifier in
-                    Task { @MainActor in
-                        lastVideoIdentifier = identifier
-                        processingVideo = nil
-                        print("✅ Processed video saved. Returning to home with identifier: \(identifier)")
-                    }
+                    // Called from UIKit main thread — set state synchronously
+                    // so both updates land in the same SwiftUI render pass.
+                    lastVideoIdentifier = identifier
+                    processingVideo = nil
+                    print("✅ Processed video saved. Returning to home with identifier: \(identifier)")
+                },
+                onProcessingComplete: { markers, skeletonFrames in
+                    lastDetectionMarkers = markers
+                    lastSkeletonFrames = skeletonFrames
+                    timelineValue = .infinity
+                    isPlaying = false
+                    processingDidComplete = true
+                    print("✅ Detection markers received: \(markers.count) points, \(skeletonFrames.count) skeleton frames")
+                },
+                onAnnotatedVideoURL: { url in
+                    // Show the annotated output file rather than the original input
+                    lastProcessedVideoURL = url
+                    lastVideoIdentifier = nil
                 },
                 videoURL: video.url,
                 phAsset: video.phAsset,
                 isRecordingLive: .constant(false),
-                settings: cameraSettings
+                settings: cameraSettings,
+                activeBatter: lineupStore.activeBatter
             )
             .ignoresSafeArea()
         }
@@ -168,6 +334,98 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showingSettings) {
             CameraSettingsView(settings: cameraSettings)
+        }
+        .sheet(isPresented: $showingLineup) {
+            LineupView(store: lineupStore, settings: cameraSettings)
+        }
+        .sheet(isPresented: $showingPitchOutcome) {
+            PitchOutcomeSheet(markers: pendingPitchMarkers) { outcome in
+                lineupStore.recordPitch(markers: pendingPitchMarkers, outcome: outcome)
+                pendingPitchMarkers = []
+            }
+        }
+        .sheet(isPresented: $showingPeerPanel) {
+            SessionCodeView(session: peerSession, settings: cameraSettings)
+        }
+        .onReceive(peerSession.$negotiatedFrameRate) { rate in
+            if rate > 0 { cameraSettings.negotiatedFrameRate = rate }
+        }
+        .onChange(of: processingDidComplete) { _, completed in
+            guard completed else { return }
+            // Delay until after the fullScreenCover dismiss animation completes (~0.5 s).
+            // Without this, showing3DView=true fires in the same SwiftUI transaction as
+            // showingCamera/processingVideo=false, and the cover teardown wins.
+            // This fires even when no balls were detected (empty markers).
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                showing3DView = true
+                // If there's an active batter, prompt to log this pitch
+                if lineupStore.activeBatter != nil {
+                    pendingPitchMarkers = lastDetectionMarkers.map { $0.point }
+                    showingPitchOutcome = true
+                }
+            }
+        }
+        .onReceive(peerSession.$lastReceivedTrail) { trail in
+            guard let trail = trail else { return }
+            let markers = trail.positions.map { TimestampedMarker(timestamp: $0.deviceTimestamp, point: CGPoint(x: $0.x, y: $0.y)) }
+            remoteDetectionMarkers = markers
+            // If we don't have a local trail yet, use the remote one as the primary
+            // so the receiving device can also view the 3D pitch.
+            if lastDetectionMarkers.isEmpty && !markers.isEmpty {
+                lastDetectionMarkers = markers
+                timelineValue = .infinity
+                isPlaying = false
+            }
+        }
+        .onReceive(peerSession.$remoteCalibration) { cal in
+            guard let cal = cal else { return }
+            // Apply the host's calibration to remoteCameraSettings so the guest renders
+            // the 3D scene from the host's perspective (same world-space reconstruction).
+            remoteCameraSettings.isCalibrated = cal.isCalibrated
+            remoteCameraSettings.platePoints = zip(cal.platePointsX, cal.platePointsY)
+                .map { CGPoint(x: $0, y: $1) }
+            remoteCameraSettings.plateWidth = cal.plateWidth
+            remoteCameraSettings.useCentimeters = cal.useCentimeters
+            remoteCameraSettings.selectedLens = cal.selectedLens
+            remoteCameraSettings.strikeZoneHeight = cal.strikeZoneHeight
+            remoteCameraSettings.strikeZoneBottomOffset = cal.strikeZoneBottomOffset
+            // Derive legacy two-point edges from the 5-point calibration
+            if cal.platePointsX.count == 5 {
+                remoteCameraSettings.plateLeftEdge  = CGPoint(x: cal.platePointsX[4], y: cal.platePointsY[4])
+                remoteCameraSettings.plateRightEdge = CGPoint(x: cal.platePointsX[2], y: cal.platePointsY[2])
+            }
+        }
+        // HOST: push roster to guest whenever the player list changes
+        .onChange(of: lineupStore.players) { _, players in
+            guard peerSession.isConnected, peerSession.isCoordinator else { return }
+            if let data = try? JSONEncoder().encode(players) {
+                peerSession.broadcastRoster(players: data)
+            }
+        }
+        // HOST: push roster immediately on connect
+        .onReceive(peerSession.$isConnected) { connected in
+            guard connected, peerSession.isCoordinator else { return }
+            if let data = try? JSONEncoder().encode(lineupStore.players) {
+                peerSession.broadcastRoster(players: data)
+            }
+        }
+        // GUEST: apply incoming roster from host
+        .onReceive(peerSession.$receivedRoster) { roster in
+            guard let roster = roster else { return }
+            guard !peerSession.isCoordinator else { return }   // guests only
+            if let players = try? JSONDecoder().decode([Player].self, from: roster.playersJSON) {
+                lineupStore.applyRemotePlayers(players)
+            }
+        }
+        .onChange(of: lineupStore.activeBatterIndex) { _, _ in
+            // Apply the active batter's personalised strike zone, or restore defaults
+            if let batter = lineupStore.activeBatter {
+                cameraSettings.strikeZoneBottomOffset = batter.strikeZoneBottom
+                cameraSettings.strikeZoneHeight = batter.strikeZoneHeight
+            } else {
+                cameraSettings.strikeZoneBottomOffset = 18.0
+                cameraSettings.strikeZoneHeight = 22.0
+            }
         }
         .onChange(of: selectedItem) { oldItem, newItem in
             print("onChange(selectedItem): \(String(describing: newItem))")
@@ -248,6 +506,9 @@ struct ContentView: View {
                 pickedVideo = PickedVideo(url: resolvedURL, phAsset: asset)
                 selectedItem = nil
                 lastVideoIdentifier = nil
+                lastProcessedVideoURL = nil
+                // Uploaded videos are assumed to be filmed at 4× zoom.
+                cameraSettings.selectedLens = 4.0
                 print("loadSelectedVideo: presenting CameraView with file URL -> \(resolvedURL), PHAsset: \(asset != nil ? "✅" : "❌")")
             }
 
@@ -288,10 +549,390 @@ struct ContentView: View {
     }
 }
 
+// MARK: - TimelineSliderView
+
+struct TimelineSliderView: View {
+    @Binding var value: Double
+    let range: ClosedRange<Double>
+    @Binding var isPlaying: Bool
+
+    @State private var playTimer: Timer? = nil
+
+    var body: some View {
+        HStack(spacing: 12) {
+            // Play / Pause button
+            Button {
+                isPlaying.toggle()
+                if isPlaying {
+                    startPlayback()
+                } else {
+                    stopPlayback()
+                }
+            } label: {
+                Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundColor(.white)
+                    .frame(width: 32, height: 32)
+            }
+
+            // Elapsed time
+            Text(formatTime(value.isInfinite ? range.upperBound - range.lowerBound : value - range.lowerBound))
+                .font(.caption.monospacedDigit())
+                .foregroundColor(.white.opacity(0.8))
+                .frame(width: 44, alignment: .trailing)
+
+            Slider(value: Binding(
+                get: { value.isInfinite ? range.upperBound : value },
+                set: { newVal in
+                    value = newVal
+                    // Stop auto-play when the user manually scrubs
+                    stopPlayback()
+                }
+            ), in: range)
+            .accentColor(.yellow)
+
+            // Total duration
+            Text(formatTime(range.upperBound - range.lowerBound))
+                .font(.caption.monospacedDigit())
+                .foregroundColor(.white.opacity(0.5))
+                .frame(width: 44, alignment: .leading)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+        .onDisappear { stopPlayback() }
+        .onChange(of: isPlaying) { _, playing in
+            if playing { startPlayback() } else { stopPlayback() }
+        }
+    }
+
+    // MARK: - Playback
+
+    private func startPlayback() {
+        stopPlayback()
+        // If we're at or past the end, restart from the beginning
+        if value.isInfinite || value >= range.upperBound {
+            value = range.lowerBound
+        }
+        // Advance at real-time speed using a 60 fps timer
+        let tickInterval = 1.0 / 60.0
+        playTimer = Timer.scheduledTimer(withTimeInterval: tickInterval, repeats: true) { _ in
+            let next = (value.isInfinite ? range.lowerBound : value) + tickInterval
+            if next >= range.upperBound {
+                value = range.upperBound
+                stopPlayback()
+            } else {
+                value = next
+            }
+        }
+    }
+
+    private func stopPlayback() {
+        playTimer?.invalidate()
+        playTimer = nil
+        if isPlaying { isPlaying = false }
+    }
+
+    // MARK: - Helpers
+
+    private func formatTime(_ seconds: Double) -> String {
+        let s = max(0, seconds)
+        if s >= 10 {
+            return String(format: "%.1fs", s)
+        } else {
+            return String(format: "%.2fs", s)
+        }
+    }
+}
+
 struct PickedVideo: Identifiable {
     let id = UUID()
     let url: URL
     let phAsset: PHAsset?
+}
+
+// MARK: - URL Video Player
+/// Lightweight looping video player backed by a file URL (used for Select Video path).
+struct URLVideoPlayer: UIViewRepresentable {
+    let url: URL
+
+    func makeUIView(context: Context) -> UIView {
+        let view = UIView()
+        view.backgroundColor = .black
+
+        let player = AVPlayer(url: url)
+        player.actionAtItemEnd = .none
+
+        NotificationCenter.default.addObserver(
+            context.coordinator,
+            selector: #selector(Coordinator.playerDidFinish(_:)),
+            name: .AVPlayerItemDidPlayToEndTime,
+            object: player.currentItem
+        )
+        context.coordinator.player = player
+
+        let layer = AVPlayerLayer(player: player)
+        layer.videoGravity = .resizeAspect
+        context.coordinator.playerLayer = layer
+        view.layer.addSublayer(layer)
+
+        player.play()
+        return view
+    }
+
+    func updateUIView(_ uiView: UIView, context: Context) {
+        context.coordinator.playerLayer?.frame = uiView.bounds
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    class Coordinator: NSObject {
+        var player: AVPlayer?
+        var playerLayer: AVPlayerLayer?
+
+        @objc func playerDidFinish(_ notification: Notification) {
+            player?.seek(to: .zero)
+            player?.play()
+        }
+    }
+}
+
+// MARK: - Peer Connection Banner
+/// Compact status strip on the home screen — taps open the session code sheet.
+struct PeerConnectionBanner: View {
+    @ObservedObject var session: MultipeerSession
+    @Binding var showingPanel: Bool
+
+    var body: some View {
+        Button { showingPanel = true } label: {
+            HStack(spacing: 10) {
+                Circle()
+                    .fill(session.isConnected ? Color.green : Color.white.opacity(0.3))
+                    .frame(width: 9, height: 9)
+
+                VStack(alignment: .leading, spacing: 1) {
+                    if session.isConnected {
+                        Text("Multi-device connected")
+                            .font(.caption.weight(.semibold))
+                            .foregroundColor(.white)
+                        if session.negotiatedFrameRate > 0 {
+                            Text(String(format: "%.0f fps · %@",
+                                        session.negotiatedFrameRate,
+                                        session.isCoordinator ? "Host" : "Guest"))
+                                .font(.caption2)
+                                .foregroundColor(.white.opacity(0.7))
+                        }
+                    } else if session.role != nil {
+                        Text(session.status)
+                            .font(.caption.weight(.semibold))
+                            .foregroundColor(.white)
+                        Text("Code: \(session.sessionCode)")
+                            .font(.caption2)
+                            .foregroundColor(.white.opacity(0.7))
+                    } else {
+                        Text("Multi-device: not connected")
+                            .font(.caption.weight(.semibold))
+                            .foregroundColor(.white)
+                        Text("Tap to create or join a session")
+                            .font(.caption2)
+                            .foregroundColor(.white.opacity(0.7))
+                    }
+                }
+
+                Spacer()
+
+                Image(systemName: "chevron.right")
+                    .font(.caption)
+                    .foregroundColor(.white.opacity(0.4))
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(
+                RoundedRectangle(cornerRadius: 12)
+                    .fill(session.isConnected ? Color.green.opacity(0.2) : Color.white.opacity(0.07))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12)
+                            .stroke(session.isConnected ? Color.green.opacity(0.5) : Color.white.opacity(0.12),
+                                    lineWidth: 1)
+                    )
+            )
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+// MARK: - Session Code View
+/// Sheet for hosting or joining a multi-device session using a 4-digit code.
+struct SessionCodeView: View {
+    @ObservedObject var session: MultipeerSession
+    @ObservedObject var settings: CameraSettings
+    @Environment(\.dismiss) var dismiss
+
+    @State private var joinCode: String = ""
+    @State private var showJoinEntry = false
+    @FocusState private var joinFieldFocused: Bool
+
+    private var isActive: Bool { session.role != nil }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                // Connected state
+                if session.isConnected {
+                    Section {
+                        HStack(spacing: 12) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundColor(.green)
+                                .font(.title2)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Connected")
+                                    .font(.headline)
+                                Text(session.connectedPeerName)
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
+
+                    Section("Session") {
+                        LabeledContent("Code", value: session.sessionCode)
+                        LabeledContent("Role", value: session.isCoordinator ? "Host" : "Guest")
+                        if session.negotiatedFrameRate > 0 {
+                            LabeledContent("Frame Rate",
+                                           value: String(format: "%.0f fps", session.negotiatedFrameRate))
+                        }
+                        LabeledContent("Clock Offset",
+                                       value: String(format: "%.1f ms", session.clockOffsetSeconds * 1000))
+                    }
+
+                    Section {
+                        Button(role: .destructive) {
+                            session.disconnect()
+                            dismiss()
+                        } label: {
+                            Label("Disconnect", systemImage: "xmark.circle")
+                        }
+                    }
+
+                // Active but not yet connected (waiting / connecting)
+                } else if isActive {
+                    Section {
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack(spacing: 10) {
+                                ProgressView()
+                                Text(session.status)
+                                    .font(.subheadline)
+                            }
+                            if !session.sessionCode.isEmpty {
+                                HStack {
+                                    Text("Session code:")
+                                        .foregroundColor(.secondary)
+                                    Text(session.sessionCode)
+                                        .font(.system(.title, design: .monospaced).weight(.bold))
+                                        .foregroundColor(.primary)
+                                }
+                                .padding(.top, 4)
+                            }
+                        }
+                        .padding(.vertical, 6)
+                    }
+
+                    Section {
+                        Button(role: .destructive) {
+                            session.disconnect()
+                        } label: {
+                            Label("Cancel", systemImage: "xmark.circle")
+                        }
+                    }
+
+                // Idle state — choose host or join
+                } else {
+                    Section {
+                        Button {
+                            session.hostSession()
+                        } label: {
+                            HStack {
+                                Image(systemName: "wifi.router")
+                                    .font(.title3)
+                                    .foregroundColor(.blue)
+                                    .frame(width: 36)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Create Session")
+                                        .font(.headline)
+                                    Text("Generate a code for the other device to join")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                            .padding(.vertical, 4)
+                        }
+
+                        Button {
+                            showJoinEntry = true
+                            joinFieldFocused = true
+                        } label: {
+                            HStack {
+                                Image(systemName: "iphone.and.arrow.right.inward")
+                                    .font(.title3)
+                                    .foregroundColor(.blue)
+                                    .frame(width: 36)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Join Session")
+                                        .font(.headline)
+                                    Text("Enter the 4-digit code shown on the host device")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                            .padding(.vertical, 4)
+                        }
+                    }
+
+                    if showJoinEntry {
+                        Section("Enter Host Code") {
+                            HStack {
+                                TextField("0000", text: $joinCode)
+                                    .keyboardType(.numberPad)
+                                    .font(.system(.title, design: .monospaced))
+                                    .focused($joinFieldFocused)
+                                    .onChange(of: joinCode) { _, v in
+                                        joinCode = String(v.filter(\.isNumber).prefix(4))
+                                    }
+                                Spacer()
+                                Button("Join") {
+                                    guard joinCode.count == 4 else { return }
+                                    session.joinSession(code: joinCode)
+                                    showJoinEntry = false
+                                }
+                                .disabled(joinCode.count != 4)
+                                .buttonStyle(.borderedProminent)
+                            }
+                        }
+                    }
+
+                    Section("How it works") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Label("One device creates a session and shares the 4-digit code.", systemImage: "1.circle")
+                            Label("The other device taps Join and enters the code.", systemImage: "2.circle")
+                            Label("Both devices calibrate against the same home plate.", systemImage: "3.circle")
+                            Label("Ball trails are synchronised and triangulated after each pitch.", systemImage: "4.circle")
+                        }
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .padding(.vertical, 4)
+                    }
+                }
+            }
+            .navigationTitle("Multi-Device")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+    }
 }
 
 struct PhotosVideoPlayer: View {
