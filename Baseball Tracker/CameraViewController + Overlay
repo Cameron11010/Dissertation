@@ -28,6 +28,9 @@ extension CameraViewController {
     }
 
     func convertPoint(_ point: CGPoint, bufferSize: CGSize, mirrored: Bool, contentFlippedVertically: Bool) -> CGPoint {
+        // Vision returns coordinates in the orientation-corrected image space because
+        // we pass orientation to VNImageRequestHandler. Only a Y-flip is needed to
+        // convert from Vision (Y=0=bottom) to UIKit (Y=0=top).
         var x = point.x * bufferSize.width
         var y = point.y * bufferSize.height
 
@@ -96,7 +99,7 @@ extension CameraViewController {
         ]
         
         guard let recognizedPoints = try? observation.recognizedPoints(.all) else { return }
-        
+
         let skeletonUIColor = settings.skeletonColor.toUIColor()
         let jointUIColor = settings.jointColor.toUIColor()
         
@@ -167,6 +170,10 @@ extension CameraViewController {
         let elbowColor = settings.elbowAngleColor.toUIColor()
         let kneeColor = settings.kneeAngleColor.toUIColor()
         let shoulderColor = settings.shoulderAngleColor.toUIColor()
+        func cvPt(_ p: CGPoint) -> CGPoint {
+            convertPoint(p, bufferSize: bufferSize, mirrored: mirrored,
+                         contentFlippedVertically: contentFlippedVertically)
+        }
         
         // Right Elbow Angle
         if let rightShoulder = recognizedPoints[.rightShoulder],
@@ -175,9 +182,9 @@ extension CameraViewController {
            rightShoulder.confidence > angleConfidenceThreshold,
            rightElbow.confidence > angleConfidenceThreshold,
            rightWrist.confidence > angleConfidenceThreshold {
-            let s = convertPoint(rightShoulder.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
-            let e = convertPoint(rightElbow.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
-            let w = convertPoint(rightWrist.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let s = cvPt(rightShoulder.location)
+            let e = cvPt(rightElbow.location)
+            let w = cvPt(rightWrist.location)
             let angle = calculateJointAngle(proximal: s, joint: e, distal: w)
             drawAngleArc(at: e, from: s, to: w, angle: angle, label: "R Elbow", color: elbowColor)
         }
@@ -189,9 +196,9 @@ extension CameraViewController {
            leftShoulder.confidence > angleConfidenceThreshold,
            leftElbow.confidence > angleConfidenceThreshold,
            leftWrist.confidence > angleConfidenceThreshold {
-            let s = convertPoint(leftShoulder.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
-            let e = convertPoint(leftElbow.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
-            let w = convertPoint(leftWrist.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let s = cvPt(leftShoulder.location)
+            let e = cvPt(leftElbow.location)
+            let w = cvPt(leftWrist.location)
             let angle = calculateJointAngle(proximal: s, joint: e, distal: w)
             drawAngleArc(at: e, from: s, to: w, angle: angle, label: "L Elbow", color: elbowColor)
         }
@@ -203,9 +210,9 @@ extension CameraViewController {
            rightHip.confidence > angleConfidenceThreshold,
            rightKnee.confidence > angleConfidenceThreshold,
            rightAnkle.confidence > angleConfidenceThreshold {
-            let h = convertPoint(rightHip.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
-            let k = convertPoint(rightKnee.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
-            let a = convertPoint(rightAnkle.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let h = cvPt(rightHip.location)
+            let k = cvPt(rightKnee.location)
+            let a = cvPt(rightAnkle.location)
             let angle = calculateJointAngle(proximal: h, joint: k, distal: a)
             drawAngleArc(at: k, from: h, to: a, angle: angle, label: "R Knee", color: kneeColor)
         }
@@ -217,9 +224,9 @@ extension CameraViewController {
            leftHip.confidence > angleConfidenceThreshold,
            leftKnee.confidence > angleConfidenceThreshold,
            leftAnkle.confidence > angleConfidenceThreshold {
-            let h = convertPoint(leftHip.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
-            let k = convertPoint(leftKnee.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
-            let a = convertPoint(leftAnkle.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let h = cvPt(leftHip.location)
+            let k = cvPt(leftKnee.location)
+            let a = cvPt(leftAnkle.location)
             let angle = calculateJointAngle(proximal: h, joint: k, distal: a)
             drawAngleArc(at: k, from: h, to: a, angle: angle, label: "L Knee", color: kneeColor)
         }
@@ -231,9 +238,9 @@ extension CameraViewController {
            rightHip.confidence > angleConfidenceThreshold,
            rightShoulder.confidence > angleConfidenceThreshold,
            rightElbow.confidence > angleConfidenceThreshold {
-            let h = convertPoint(rightHip.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
-            let s = convertPoint(rightShoulder.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
-            let e = convertPoint(rightElbow.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let h = cvPt(rightHip.location)
+            let s = cvPt(rightShoulder.location)
+            let e = cvPt(rightElbow.location)
             let angle = calculateJointAngle(proximal: h, joint: s, distal: e)
             drawAngleArc(at: s, from: h, to: e, angle: angle, label: "R Shoulder", color: shoulderColor)
         }
@@ -245,9 +252,9 @@ extension CameraViewController {
            leftHip.confidence > angleConfidenceThreshold,
            leftShoulder.confidence > angleConfidenceThreshold,
            leftElbow.confidence > angleConfidenceThreshold {
-            let h = convertPoint(leftHip.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
-            let s = convertPoint(leftShoulder.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
-            let e = convertPoint(leftElbow.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let h = cvPt(leftHip.location)
+            let s = cvPt(leftShoulder.location)
+            let e = cvPt(leftElbow.location)
             let angle = calculateJointAngle(proximal: h, joint: s, distal: e)
             drawAngleArc(at: s, from: h, to: e, angle: angle, label: "L Shoulder", color: shoulderColor)
         }
@@ -261,10 +268,10 @@ extension CameraViewController {
            rightShoulder.confidence > angleConfidenceThreshold,
            leftHip.confidence > angleConfidenceThreshold,
            rightHip.confidence > angleConfidenceThreshold {
-            let lShoulder = convertPoint(leftShoulder.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
-            let rShoulder = convertPoint(rightShoulder.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
-            let lHip = convertPoint(leftHip.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
-            let rHip = convertPoint(rightHip.location, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
+            let lShoulder = cvPt(leftShoulder.location)
+            let rShoulder = cvPt(rightShoulder.location)
+            let lHip = cvPt(leftHip.location)
+            let rHip = cvPt(rightHip.location)
             
             let shoulderAngle = atan2(rShoulder.y - lShoulder.y, rShoulder.x - lShoulder.x)
             let hipAngle = atan2(rHip.y - lHip.y, rHip.x - lHip.x)
@@ -362,49 +369,73 @@ extension CameraViewController {
     
     // MARK: - Draw Calibration Overlay
     func drawCalibrationOverlay(bufferSize: CGSize) {
-        let leftPos = CGPoint(
-            x: settings.plateLeftEdge.x * bufferSize.width,
-            y: settings.plateLeftEdge.y * bufferSize.height
-        )
-        let rightPos = CGPoint(
-            x: settings.plateRightEdge.x * bufferSize.width,
-            y: settings.plateRightEdge.y * bufferSize.height
-        )
-        
-        let linePath = UIBezierPath()
-        linePath.move(to: leftPos)
-        linePath.addLine(to: rightPos)
-        
-        let lineLayer = CAShapeLayer()
-        lineLayer.path = linePath.cgPath
-        lineLayer.strokeColor = UIColor.yellow.cgColor
-        lineLayer.lineWidth = 3
-        lineLayer.lineCap = .round
-        overlayLayer.addSublayer(lineLayer)
-        
-        let leftMarkerSize: CGFloat = 12
-        let leftMarkerRect = CGRect(x: leftPos.x - leftMarkerSize / 2, y: leftPos.y - leftMarkerSize / 2,
-                                    width: leftMarkerSize, height: leftMarkerSize)
-        let leftMarkerLayer = CAShapeLayer()
-        leftMarkerLayer.path = UIBezierPath(ovalIn: leftMarkerRect).cgPath
-        leftMarkerLayer.fillColor = UIColor.green.cgColor
-        leftMarkerLayer.strokeColor = UIColor.white.cgColor
-        leftMarkerLayer.lineWidth = 2
-        overlayLayer.addSublayer(leftMarkerLayer)
-        
-        let rightMarkerSize: CGFloat = 12
-        let rightMarkerRect = CGRect(x: rightPos.x - rightMarkerSize / 2, y: rightPos.y - rightMarkerSize / 2,
-                                     width: rightMarkerSize, height: rightMarkerSize)
-        let rightMarkerLayer = CAShapeLayer()
-        rightMarkerLayer.path = UIBezierPath(ovalIn: rightMarkerRect).cgPath
-        rightMarkerLayer.fillColor = UIColor.blue.cgColor
-        rightMarkerLayer.strokeColor = UIColor.white.cgColor
-        rightMarkerLayer.lineWidth = 2
-        overlayLayer.addSublayer(rightMarkerLayer)
-        
-        let midpoint = CGPoint(x: (leftPos.x + rightPos.x) / 2, y: (leftPos.y + rightPos.y) / 2)
+        // Build screen-space positions for each of the 5 plate points.
+        let screenPoints: [CGPoint] = settings.platePoints.map { normalised in
+            CGPoint(x: normalised.x * bufferSize.width,
+                    y: normalised.y * bufferSize.height)
+        }
+
+        let allValid = screenPoints.allSatisfy { $0 != .zero }
+
+        if allValid && screenPoints.count == 5 {
+            // Draw the pentagon outline
+            let platePath = UIBezierPath()
+            platePath.move(to: screenPoints[0])
+            for i in 1..<5 { platePath.addLine(to: screenPoints[i]) }
+            platePath.close()
+
+            let plateLayer = CAShapeLayer()
+            plateLayer.path = platePath.cgPath
+            plateLayer.strokeColor = UIColor.yellow.cgColor
+            plateLayer.fillColor = UIColor.yellow.withAlphaComponent(0.06).cgColor
+            plateLayer.lineWidth = 3
+            plateLayer.lineCap = .round
+            plateLayer.lineJoin = .round
+            overlayLayer.addSublayer(plateLayer)
+
+            // Draw a dot for each corner with its colour
+            let markerColors: [UIColor] = [.systemGreen, .systemBlue, .systemOrange, .systemRed, .systemPurple]
+            for (i, pt) in screenPoints.enumerated() {
+                let size: CGFloat = 10
+                let rect = CGRect(x: pt.x - size / 2, y: pt.y - size / 2, width: size, height: size)
+                let dot = CAShapeLayer()
+                dot.path = UIBezierPath(ovalIn: rect).cgPath
+                dot.fillColor = markerColors[i].cgColor
+                dot.strokeColor = UIColor.white.cgColor
+                dot.lineWidth = 2
+                overlayLayer.addSublayer(dot)
+            }
+        } else {
+            // Fallback: draw the legacy two-point line (back edge only)
+            let leftPos  = CGPoint(x: settings.plateLeftEdge.x  * bufferSize.width,
+                                   y: settings.plateLeftEdge.y  * bufferSize.height)
+            let rightPos = CGPoint(x: settings.plateRightEdge.x * bufferSize.width,
+                                   y: settings.plateRightEdge.y * bufferSize.height)
+
+            let linePath = UIBezierPath()
+            linePath.move(to: leftPos)
+            linePath.addLine(to: rightPos)
+
+            let lineLayer = CAShapeLayer()
+            lineLayer.path = linePath.cgPath
+            lineLayer.strokeColor = UIColor.yellow.cgColor
+            lineLayer.lineWidth = 3
+            lineLayer.lineCap = .round
+            overlayLayer.addSublayer(lineLayer)
+        }
+
+        // Width label at the midpoint of the back edge
+        let leftPos  = allValid ? screenPoints[HomePlatePoint.backLeft.rawValue]
+                                : CGPoint(x: settings.plateLeftEdge.x  * bufferSize.width,
+                                          y: settings.plateLeftEdge.y  * bufferSize.height)
+        let rightPos = allValid ? screenPoints[HomePlatePoint.backRight.rawValue]
+                                : CGPoint(x: settings.plateRightEdge.x * bufferSize.width,
+                                          y: settings.plateRightEdge.y * bufferSize.height)
+
+        let midpoint = CGPoint(x: (leftPos.x + rightPos.x) / 2,
+                               y: (leftPos.y + rightPos.y) / 2)
         let widthText = String(format: "%.1f%@", settings.plateWidth, settings.useCentimeters ? "cm" : "\"")
-        
+
         let textLayer = CATextLayer()
         textLayer.string = widthText
         textLayer.foregroundColor = UIColor.white.cgColor
@@ -412,21 +443,37 @@ extension CameraViewController {
         textLayer.fontSize = 16
         textLayer.alignmentMode = .center
         textLayer.contentsScale = view.traitCollection.displayScale
-        
+
         let textWidth: CGFloat = 80
         let textHeight: CGFloat = 28
-        textLayer.frame = CGRect(x: midpoint.x - textWidth / 2, y: midpoint.y - textHeight / 2,
-                                width: textWidth, height: textHeight)
+        textLayer.frame = CGRect(x: midpoint.x - textWidth / 2,
+                                 y: midpoint.y - textHeight / 2,
+                                 width: textWidth,
+                                 height: textHeight)
         textLayer.cornerRadius = 6
         overlayLayer.addSublayer(textLayer)
     }
     
     // MARK: - Strike Zone Overlay
+    // The ABS strike zone width is defined by the right corner (pt 2) and left corner (pt 4)
+    // of home plate — the 17" dimension across the widest part, not the back edge.
     func drawStrikeZone(bufferSize: CGSize) {
-        let left = CGPoint(x: settings.plateLeftEdge.x * bufferSize.width,
-                          y: settings.plateLeftEdge.y * bufferSize.height)
-        let right = CGPoint(x: settings.plateRightEdge.x * bufferSize.width,
-                           y: settings.plateRightEdge.y * bufferSize.height)
+        // Prefer the dedicated corner points when a full 5-point calibration is available.
+        let rightNorm: CGPoint
+        let leftNorm: CGPoint
+
+        if settings.platePoints.count == 5 &&
+           settings.platePoints[HomePlatePoint.right.rawValue] != .zero &&
+           settings.platePoints[HomePlatePoint.left.rawValue]  != .zero {
+            rightNorm = settings.platePoints[HomePlatePoint.right.rawValue]
+            leftNorm  = settings.platePoints[HomePlatePoint.left.rawValue]
+        } else {
+            rightNorm = settings.plateRightEdge
+            leftNorm  = settings.plateLeftEdge
+        }
+
+        let left  = CGPoint(x: leftNorm.x  * bufferSize.width,  y: leftNorm.y  * bufferSize.height)
+        let right = CGPoint(x: rightNorm.x * bufferSize.width,  y: rightNorm.y * bufferSize.height)
 
         let plateVec = CGPoint(x: right.x - left.x, y: right.y - left.y)
         let platePixels = sqrt(plateVec.x * plateVec.x + plateVec.y * plateVec.y)
@@ -478,6 +525,36 @@ extension CameraViewController {
         overlayLayer.addSublayer(midLayer)
     }
     
+    // MARK: - Check Swing Indicator
+
+    /// Draws a prominent "CHECK SWING" banner at the top of the frame when a check swing is detected.
+    func drawCheckSwingIndicator(bufferSize: CGSize) {
+        let bannerHeight: CGFloat = 48
+        let bannerWidth: CGFloat = 240
+        let bannerX = (bufferSize.width - bannerWidth) / 2
+        let bannerY: CGFloat = 60
+
+        let bgLayer = CAShapeLayer()
+        bgLayer.path = UIBezierPath(roundedRect: CGRect(x: bannerX, y: bannerY,
+                                                         width: bannerWidth, height: bannerHeight),
+                                    cornerRadius: 10).cgPath
+        bgLayer.fillColor = UIColor.systemOrange.withAlphaComponent(0.9).cgColor
+        bgLayer.strokeColor = UIColor.white.withAlphaComponent(0.8).cgColor
+        bgLayer.lineWidth = 2
+        overlayLayer.addSublayer(bgLayer)
+
+        let textLayer = CATextLayer()
+        textLayer.string = "⚡ CHECK SWING"
+        textLayer.foregroundColor = UIColor.white.cgColor
+        textLayer.backgroundColor = UIColor.clear.cgColor
+        textLayer.fontSize = 18
+        textLayer.alignmentMode = .center
+        textLayer.contentsScale = view.traitCollection.displayScale
+        textLayer.frame = CGRect(x: bannerX, y: bannerY + (bannerHeight - 24) / 2,
+                                 width: bannerWidth, height: 24)
+        overlayLayer.addSublayer(textLayer)
+    }
+
     // MARK: - Draw ROI Debug Box
     func drawROI(_ roi: CGRect, bufferSize: CGSize) {
         let roiRect = convertBoundingBox(roi, bufferSize: bufferSize, mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
