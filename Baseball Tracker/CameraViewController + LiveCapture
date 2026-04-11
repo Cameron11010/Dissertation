@@ -1,1 +1,204 @@
+//
+//  CameraViewController+LiveCapture.swift
+//  Baseball Tracker
+//
+//  AVCaptureVideoDataOutputSampleBufferDelegate — handles every camera frame.
+//
+//  Threading:
+//    • captureOutput fires on videoQueue (serial).
+//    • isProcessingVision is only read/written on videoQueue.
+//    • Vision inference runs on visionQueue (serial, concurrent with videoQueue).
+//    • All UI/overlay updates dispatch to DispatchQueue.main.
+//
 
+import AVFoundation
+import Vision
+import CoreVideo
+
+extension CameraViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
+
+    func captureOutput(_ output: AVCaptureOutput,
+                       didOutput sampleBuffer: CMSampleBuffer,
+                       from connection: AVCaptureConnection) {
+
+        // Only used for live camera.
+        guard videoURL == nil else { return }
+
+        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        frameCount += 1
+
+        // Heartbeat — log every 60 frames (~0.25s at 240fps).
+        if frameCount % 60 == 0 {
+            print("[Capture] frame=\(frameCount) recording=\(isRecording) writer=\(assetWriter != nil)")
+        }
+
+        // ── RECORDING ─────────────────────────────────────────────────────
+        if isRecording {
+            guard let writer  = assetWriter,
+                  let input   = assetWriterInput,
+                  let adaptor = pixelBufferAdaptor,
+                  let pixBuf  = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+                print("[Recording] guard failed: writer=\(assetWriter != nil) input=\(assetWriterInput != nil) adaptor=\(pixelBufferAdaptor != nil)")
+                return
+            }
+
+            if recordingStartTime == nil {
+                guard writer.startWriting() else {
+                    print("[Recording] startWriting failed: \(writer.error?.localizedDescription ?? "?")")
+                    return
+                }
+                writer.startSession(atSourceTime: pts)
+                recordingStartTime = pts
+                print("[Recording] Session started at \(CMTimeGetSeconds(pts))s")
+            }
+
+            guard writer.status == .writing else {
+                print("[Recording] bad status=\(writer.status.rawValue) \(writer.error?.localizedDescription ?? "")")
+                return
+            }
+
+            lastFrameTime = pts
+
+            // Copy the pixel buffer for vision BEFORE appending to the adaptor.
+            // The adaptor may lock/retain the buffer during H.264 encoding, which
+            // would prevent copyPixelBuffer from reading it cleanly in scheduleVision.
+            let visionBuf: CVPixelBuffer? = (frameCount % 4 == 0) ? copyPixelBuffer(pixBuf) : nil
+
+            if input.isReadyForMoreMediaData {
+                adaptor.append(pixBuf, withPresentationTime: pts)
+            }
+
+            if let vb = visionBuf {
+                scheduleVision(pixBuf: vb, pts: pts, isRecording: true, alreadyCopied: true)
+            }
+            return
+        }
+
+        // ── LIVE PREVIEW ──────────────────────────────────────────────────
+        // Do NOT store sampleBuffer — holding CMSampleBuffer references exhausts
+        // the camera's internal buffer pool (typically 10-15 buffers), causing
+        // frame delivery to stop entirely after the pool fills up.
+        lastFrameTime = pts
+
+        guard frameCount % 4 == 0,
+              let pixBuf = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+
+        scheduleVision(pixBuf: pixBuf, pts: pts, isRecording: false)
+    }
+
+    // MARK: - Vision scheduling
+
+    /// Schedules a Vision pass only when the previous one has completed.
+    /// Must be called on videoQueue. `isProcessingVision` is only touched here
+    /// and in the visionQueue async block below — never from main thread.
+    /// Pass `alreadyCopied: true` when the caller has already made a safe copy of the buffer.
+    private func scheduleVision(pixBuf src: CVPixelBuffer, pts: CMTime, isRecording: Bool, alreadyCopied: Bool = false) {
+        guard !isProcessingVision else { return }
+        isProcessingVision = true
+
+        let copy: CVPixelBuffer
+        if alreadyCopied {
+            copy = src
+        } else {
+            guard let c = copyPixelBuffer(src) else {
+                isProcessingVision = false
+                return
+            }
+            copy = c
+        }
+
+        visionQueue.async { [weak self, copy, pts, isRecording] in
+            guard let self = self else { return }
+
+            var requests: [VNRequest] = []
+            if self.settings.ballDetectionEnabled  { requests.append(contentsOf: self.requests) }
+            if self.settings.poseEstimationEnabled, let pr = self.poseRequest { requests.append(pr) }
+
+            if !requests.isEmpty {
+                let handler = VNImageRequestHandler(cvPixelBuffer: copy, options: [:])
+                try? handler.perform(requests)
+            }
+
+            // Recording bookkeeping.
+            if isRecording {
+                if let pose = self.lastPoseObservation, self.settings.poseEstimationEnabled {
+                    let frame = self.makeSkeletonFrame(from: pose, timestamp: CMTimeGetSeconds(pts))
+                    self.skeletonFrames.append(frame)
+                }
+
+                let ballObs = self.lastObservations.first {
+                    guard let l = $0.labels.first else { return false }
+                    return l.identifier == "baseball" && $0.confidence >= self.settings.ballConfidenceThreshold
+                }
+                if let ball = ballObs {
+                    self.ballEverDetectedThisRecording = true
+                    self.consecutiveFramesWithoutBall = 0
+                    if let pose = self.lastPoseObservation, let ts = self.lastFrameTime {
+                        let pos = CGPoint(x: ball.boundingBox.midX, y: ball.boundingBox.midY)
+                        _ = self.analyzeBiomechanics(ballPosition: pos, poseObservation: pose)
+                        self.fusedFrameData.append((timestamp: ts, ballPosition: pos, poseObservation: pose))
+                        let cutoff = CMTimeSubtract(ts, CMTime(seconds: 5, preferredTimescale: 600))
+                        self.fusedFrameData.removeAll { CMTimeCompare($0.timestamp, cutoff) < 0 }
+                    }
+                } else if self.ballEverDetectedThisRecording {
+                    self.consecutiveFramesWithoutBall += 1
+                }
+
+                if self.isRecording, self.peerSession?.isConnected == true, self.ballEverDetectedThisRecording {
+                    let gone  = self.consecutiveFramesWithoutBall >= self.autoStopGraceFrames
+                    let swing = self.checkSwingDetected || self.lastPoseObservation == nil
+                    if gone && swing {
+                        DispatchQueue.main.async { self.stopCustomRecording() }
+                    }
+                }
+            }
+
+            // Grab best ball result for overlay.
+            let bestBall = self.settings.ballDetectionEnabled ? self.lastObservations.first(where: {
+                guard let l = $0.labels.first else { return false }
+                return l.identifier == "baseball" && $0.confidence >= self.settings.ballConfidenceThreshold
+            }) : nil
+
+            // Update overlay and release the vision gate — both on videoQueue so
+            // isProcessingVision is always written from the same queue it's read on.
+            DispatchQueue.main.async { [bestBall] in
+                self.updateLiveOverlay(ballDetection: bestBall)
+            }
+            self.videoQueue.async {
+                self.isProcessingVision = false
+            }
+        }
+    }
+
+    // MARK: - Pixel buffer copy
+
+    private func copyPixelBuffer(_ src: CVPixelBuffer) -> CVPixelBuffer? {
+        let w   = CVPixelBufferGetWidth(src)
+        let h   = CVPixelBufferGetHeight(src)
+        let fmt = CVPixelBufferGetPixelFormatType(src)
+        let attrs = [kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary] as CFDictionary
+
+        var dst: CVPixelBuffer?
+        guard CVPixelBufferCreate(kCFAllocatorDefault, w, h, fmt, attrs, &dst) == kCVReturnSuccess,
+              let dst else { return nil }
+
+        CVPixelBufferLockBaseAddress(src, .readOnly)
+        CVPixelBufferLockBaseAddress(dst, [])
+        let planes = CVPixelBufferGetPlaneCount(src)
+        if planes == 0 {
+            if let s = CVPixelBufferGetBaseAddress(src),
+               let d = CVPixelBufferGetBaseAddress(dst) {
+                memcpy(d, s, CVPixelBufferGetBytesPerRow(src) * h)
+            }
+        } else {
+            for p in 0..<planes {
+                guard let s = CVPixelBufferGetBaseAddressOfPlane(src, p),
+                      let d = CVPixelBufferGetBaseAddressOfPlane(dst, p) else { continue }
+                memcpy(d, s, CVPixelBufferGetBytesPerRowOfPlane(src, p) * CVPixelBufferGetHeightOfPlane(src, p))
+            }
+        }
+        CVPixelBufferUnlockBaseAddress(dst, [])
+        CVPixelBufferUnlockBaseAddress(src, .readOnly)
+        return dst
+    }
+}
