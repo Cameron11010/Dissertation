@@ -1,0 +1,229 @@
+//
+//  CameraViewController+MultiDevice.swift
+//  Baseball Tracker
+//
+//  Multi-device integration: broadcast local trails, receive remote trails,
+//  and show the 3D view button when calibrated and markers are available.
+//
+
+import UIKit
+import SwiftUI
+import CoreMedia
+
+extension CameraViewController: MultipeerSessionDelegate {
+
+    // MARK: - Setup
+
+    /// Call after setting peerSession to register as its delegate.
+    func setupMultiDeviceIfNeeded() {
+        guard let session = peerSession else { return }
+        session.delegate = self
+        print("[MultiDevice] Registered as peer session delegate")
+    }
+
+    // MARK: - Broadcast local trail
+
+    /// Converts detectionMarkers to a TrailBroadcastPayload and sends it to the peer.
+    /// Each CGPoint (normalised Vision coords) is wrapped in a TimedPosition using
+    /// a monotonically increasing synthetic timestamp (frame index / frameRate).
+    func broadcastLocalTrail() {
+        guard let session = peerSession, session.isConnected else { return }
+        guard !detectionMarkers.isEmpty else { return }
+
+        let fps = activeFrameRate > 0 ? activeFrameRate : 30.0
+        let positions = detectionMarkers.map { marker in
+            TimedPosition(deviceTimestamp: marker.timestamp,
+                          x: Double(marker.point.x),
+                          y: Double(marker.point.y),
+                          isInterpolated: false)
+        }
+
+        let uuid = UIDevice.current.identifierForVendor?.uuidString ?? UUID().uuidString
+        let payload = TrailBroadcastPayload(deviceID: uuid,
+                                           positions: positions,
+                                           frameRate: fps)
+        session.broadcastTrail(payload)
+        // Always send calibration alongside trail so the guest always has current settings.
+        session.broadcastCalibration(makeCalibrationPayload())
+        print("[MultiDevice] Broadcast trail with \(positions.count) points at \(fps) fps")
+    }
+
+    // MARK: - Broadcast calibration
+
+    /// Builds a CalibrationPayload from the current CameraSettings and sends it to the peer.
+    func broadcastCalibrationToPeer() {
+        guard let session = peerSession, session.isConnected else { return }
+        session.broadcastCalibration(makeCalibrationPayload())
+        print("[MultiDevice] Broadcast calibration (calibrated=\(settings.isCalibrated))")
+    }
+
+    private func makeCalibrationPayload() -> CalibrationPayload {
+        let pts = settings.platePoints
+        return CalibrationPayload(
+            isCalibrated: settings.isCalibrated,
+            platePointsX: pts.map { $0.x },
+            platePointsY: pts.map { $0.y },
+            plateWidth: settings.plateWidth,
+            useCentimeters: settings.useCentimeters,
+            selectedLens: settings.selectedLens,
+            strikeZoneHeight: settings.strikeZoneHeight,
+            strikeZoneBottomOffset: settings.strikeZoneBottomOffset
+        )
+    }
+
+    // MARK: - MultipeerSessionDelegate
+
+    func session(_ session: MultipeerSession, peerDidConnect peerName: String) {
+        print("[MultiDevice] Peer connected: \(peerName)")
+        DispatchQueue.main.async {
+            // Show a brief HUD so the user knows the devices are linked
+            self.showTemporaryBanner("Connected to \(peerName)")
+            // Send our calibration immediately so the guest has it as soon as possible.
+            self.broadcastCalibrationToPeer()
+        }
+    }
+
+    func session(_ session: MultipeerSession, peerDidDisconnect peerName: String) {
+        print("[MultiDevice] Peer disconnected: \(peerName)")
+    }
+
+    func session(_ session: MultipeerSession, didReceiveTrail trail: TrailBroadcastPayload) {
+        // Preserve timestamps from the peer device for timeline synchronisation
+        let markers = trail.positions.map { TimestampedMarker(timestamp: $0.deviceTimestamp, point: CGPoint(x: $0.x, y: $0.y)) }
+        DispatchQueue.main.async {
+            self.remoteDetectionMarkers = markers
+            print("[MultiDevice] Received \(markers.count) remote trail points")
+            self.updateView3DButtonVisibility()
+        }
+    }
+
+    func session(_ session: MultipeerSession, didReceiveTriangulated payload: TriangulatedPayload) {
+        // Not used in camera view — triangulation is displayed in ContentView
+    }
+
+    func session(_ session: MultipeerSession, negotiatedFrameRate: Double) {
+        // Already handled by CameraSettings observer in ContentView
+    }
+
+    func session(_ session: MultipeerSession, didReceiveRecordingCommand start: Bool) {
+        // Mirror the peer's recording state — only act if we're not already in that state
+        if start && !isRecording {
+            print("[MultiDevice] Peer started recording — starting local recording")
+            DispatchQueue.main.async { self.startCustomRecording() }
+        } else if !start && isRecording {
+            print("[MultiDevice] Peer stopped recording — stopping local recording")
+            DispatchQueue.main.async { self.stopCustomRecording() }
+        }
+    }
+
+    // MARK: - 3D View Button
+
+    func setupView3DButton() {
+
+        let button = UIButton(type: .system)
+        let config = UIImage.SymbolConfiguration(pointSize: 20, weight: .semibold)
+        let image = UIImage(systemName: "view.3d", withConfiguration: config)
+        button.setImage(image, for: .normal)
+        button.tintColor = .white
+        button.backgroundColor = UIColor.systemBlue.withAlphaComponent(0.85)
+        button.layer.cornerRadius = 22
+        button.addTarget(self, action: #selector(view3DButtonTapped), for: .touchUpInside)
+        button.accessibilityLabel = "3D View"
+        button.accessibilityHint = "Show 3D pitch trajectory"
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.isHidden = true   // shown only when markers + calibration are ready
+
+        view.addSubview(button)
+        self.view3DButton = button
+
+        // Position: to the left of the calibrate button
+        NSLayoutConstraint.activate([
+            button.widthAnchor.constraint(equalToConstant: 44),
+            button.heightAnchor.constraint(equalToConstant: 44)
+        ])
+    }
+
+    /// Shows/hides the 3D View button based on whether we have local markers and calibration.
+    func updateView3DButtonVisibility() {
+        let hasLocal = !detectionMarkers.isEmpty
+        let calibrated = settings.isCalibrated
+        view3DButton?.isHidden = !(hasLocal && calibrated)
+    }
+
+    @objc func view3DButtonTapped() {
+        let markers = detectionMarkers
+        guard !markers.isEmpty, settings.isCalibrated else { return }
+
+        let remote = remoteDetectionMarkers
+        var sceneView = PitchSceneView(detectionMarkers: markers,
+                                       settings: settings,
+                                       lockedToCamera: false)
+        sceneView.remoteDetectionMarkers = remote
+
+        let hostingVC = UIHostingController(rootView:
+            ZStack(alignment: .topLeading) {
+                Color.black.ignoresSafeArea()
+                sceneView
+                    .ignoresSafeArea()
+                Button(action: { [weak self] in
+                    self?.dismiss(animated: true)
+                }) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 28))
+                        .foregroundColor(.white)
+                        .padding(20)
+                }
+                .padding(.top, 44)
+                // Gesture hint
+                if !remote.isEmpty {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Label("Local trail", systemImage: "circle.fill")
+                            .foregroundColor(.yellow)
+                        Label("Remote trail", systemImage: "circle.fill")
+                            .foregroundColor(.cyan)
+                    }
+                    .font(.caption2)
+                    .padding(10)
+                    .background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 8))
+                    .padding(.leading, 16)
+                    .frame(maxHeight: .infinity, alignment: .bottom)
+                    .padding(.bottom, 40)
+                }
+            }
+        )
+        hostingVC.modalPresentationStyle = .fullScreen
+        present(hostingVC, animated: true)
+    }
+
+    // MARK: - Temporary banner
+
+    private func showTemporaryBanner(_ message: String) {
+        let label = UILabel()
+        label.text = message
+        label.textColor = .white
+        label.font = UIFont.systemFont(ofSize: 14, weight: .semibold)
+        label.textAlignment = .center
+        label.backgroundColor = UIColor.black.withAlphaComponent(0.7)
+        label.layer.cornerRadius = 10
+        label.clipsToBounds = true
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.alpha = 0
+
+        view.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            label.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 60),
+            label.widthAnchor.constraint(lessThanOrEqualTo: view.widthAnchor, multiplier: 0.8),
+            label.heightAnchor.constraint(equalToConstant: 36)
+        ])
+        // Add horizontal padding via insets by using a container
+        label.layoutMargins = UIEdgeInsets(top: 0, left: 16, bottom: 0, right: 16)
+
+        UIView.animate(withDuration: 0.3) { label.alpha = 1 }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+            UIView.animate(withDuration: 0.4, animations: { label.alpha = 0 }) { _ in
+                label.removeFromSuperview()
+            }
+        }
+    }
+}
