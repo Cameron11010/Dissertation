@@ -179,6 +179,15 @@ extension CameraViewController {
             let sequenceHandler = VNSequenceRequestHandler()
             var lastTrackedObservation: VNDetectedObjectObservation? = nil
             let trackerConfidenceFloor: Float = 0.3  // Below this, stop trusting the tracker
+
+            // Dedicated pose request for the export loop — no completion handler, results read
+            // directly from .results after perform(). Using self.poseRequest is unsafe here
+            // because its completion handler fires back into the VC on the same thread and races
+            // with the export loop reading results (causing crashes on recording end).
+            let exportPoseRequest: VNDetectHumanBodyPoseRequest? = self.settings.poseEstimationEnabled
+                ? VNDetectHumanBodyPoseRequest()
+                : nil
+            exportPoseRequest?.regionOfInterest = CGRect(x: 0, y: 0, width: 1, height: 1)
             // Scale max tracker frames with FPS: ~1 second of real time.
             // At 30fps = 30 frames, at 240fps = 240 frames.
             let maxTrackerFrames: Int = max(30, Int(actualFPS))
@@ -192,7 +201,11 @@ extension CameraViewController {
             var pitchEnded = false
             var recentPositions: [CGPoint] = []    // Sliding window of last N accepted positions
             let directionWindowSize = 5            // Points needed to establish direction
-            let reversalAngleThreshold: CGFloat = 90.0  // Degrees — direction change > this = pitch over
+            let reversalAngleThreshold: CGFloat = 120.0 // Degrees — direction change > this = pitch over
+            // Minimum total distance the ball must travel (in normalised coords) before
+            // pitch-end detection activates.  Prevents false triggers when the ball is
+            // nearly stationary in the windup / first few frames.
+            let minTravelBeforeReversalCheck: CGFloat = 0.05  // 5% of frame width/height
             var pitchEndFrame: Int = 0
             
             print("========================================")
@@ -238,7 +251,7 @@ extension CameraViewController {
                     if self.settings.ballDetectionEnabled {
                         allRequests.append(req)
                     }
-                    if self.settings.poseEstimationEnabled, let poseReq = self.poseRequest {
+                    if let poseReq = exportPoseRequest {
                         allRequests.append(poseReq)
                     }
                     
@@ -247,6 +260,14 @@ extension CameraViewController {
                     if !allRequests.isEmpty {
                         try? handler.perform(allRequests)
                         results = (req.results as? [VNRecognizedObjectObservation]) ?? []
+                    }
+
+                    // Collect skeleton frame from pose results for this video frame
+                    if let poseReq = exportPoseRequest,
+                       let poseObs = (poseReq.results as? [VNHumanBodyPoseObservation])?.first {
+                        let timestamp = CMTimeGetSeconds(pts)
+                        let frame = self.makeSkeletonFrame(from: poseObs, timestamp: timestamp)
+                        self.skeletonFrames.append(frame)
                     }
                     
                     // Track source of accepted detection for this frame
@@ -322,23 +343,31 @@ extension CameraViewController {
                             let pitchTag = pitchEnded ? " [PITCH ENDED]" : ""
                             print("[Export Frame \(exportFrameCount) @ \(String(format: "%.3f", timestamp))s\(frameDeltaInfo)] ✅ COREML: conf=\(String(format: "%.3f", detection.confidence)) bbox=(\(String(format: "%.3f,%.3f %.3fx%.3f", bbox.origin.x, bbox.origin.y, bbox.width, bbox.height))) \(filterInfo) missedStreak=\(missedStreak)\(pitchTag)")
                             
-                            // Check for direction reversal before adding to trail
+                            // Check for direction reversal before adding to trail.
+                            // Guard: only activate once the ball has travelled a meaningful
+                            // distance so stationary / windup frames don't fire a false reversal.
                             if !pitchEnded {
-                                if recentPositions.count >= directionWindowSize {
-                                    let oldDir = self.directionVector(from: recentPositions, endIndex: recentPositions.count - 1, window: directionWindowSize)
-                                    let newDir = CGPoint(x: detCenter.x - recentPositions.last!.x,
-                                                         y: detCenter.y - recentPositions.last!.y)
-                                    let angle = self.angleBetween(oldDir, newDir)
-                                    if angle > reversalAngleThreshold {
-                                        pitchEnded = true
-                                        pitchEndFrame = exportFrameCount
-                                        print("⚡️ PITCH END DETECTED at frame \(exportFrameCount) — direction reversal \(String(format: "%.1f", angle))° > \(String(format: "%.0f", reversalAngleThreshold))° threshold")
+                                if recentPositions.count >= directionWindowSize,
+                                   let first = recentPositions.first {
+                                    let totalDx = recentPositions.last!.x - first.x
+                                    let totalDy = recentPositions.last!.y - first.y
+                                    let totalTravel = sqrt(totalDx * totalDx + totalDy * totalDy)
+                                    if totalTravel >= minTravelBeforeReversalCheck {
+                                        let oldDir = self.directionVector(from: recentPositions, endIndex: recentPositions.count - 1, window: directionWindowSize)
+                                        let newDir = CGPoint(x: detCenter.x - recentPositions.last!.x,
+                                                             y: detCenter.y - recentPositions.last!.y)
+                                        let angle = self.angleBetween(oldDir, newDir)
+                                        if angle > reversalAngleThreshold {
+                                            pitchEnded = true
+                                            pitchEndFrame = exportFrameCount
+                                            print("⚡️ PITCH END DETECTED at frame \(exportFrameCount) — direction reversal \(String(format: "%.1f", angle))° > \(String(format: "%.0f", reversalAngleThreshold))° threshold (travel=\(String(format: "%.3f", totalTravel)))")
+                                        }
                                     }
                                 }
                             }
                             
                             if !pitchEnded {
-                                self.detectionMarkers.append(detCenter)
+                                self.detectionMarkers.append(TimestampedMarker(timestamp: CMTimeGetSeconds(pts), point: detCenter))
                                 recentPositions.append(detCenter)
                                 if recentPositions.count > directionWindowSize * 3 {
                                     recentPositions.removeFirst(recentPositions.count - directionWindowSize * 3)
@@ -392,23 +421,29 @@ extension CameraViewController {
                                             let pitchTag = pitchEnded ? " [PITCH ENDED]" : ""
                                             print("[Export Frame \(exportFrameCount) @ \(String(format: "%.3f", timestamp))s\(frameDeltaInfo)] 🔍 TRACKER: conf=\(String(format: "%.3f", trackerResult.confidence)) bbox=(\(String(format: "%.3f,%.3f %.3fx%.3f", tBBox.origin.x, tBBox.origin.y, tBBox.width, tBBox.height))) consecutive=\(trackerConsecutiveFrames)/\(maxTrackerFrames) missedStreak=\(missedStreak)\(pitchTag)")
                                             
-                                            // Check for direction reversal
+                                            // Check for direction reversal (same minimum-travel guard as CoreML branch)
                                             if !pitchEnded {
-                                                if recentPositions.count >= directionWindowSize {
-                                                    let oldDir = self.directionVector(from: recentPositions, endIndex: recentPositions.count - 1, window: directionWindowSize)
-                                                    let newDir = CGPoint(x: tCenter.x - recentPositions.last!.x,
-                                                                         y: tCenter.y - recentPositions.last!.y)
-                                                    let angle = self.angleBetween(oldDir, newDir)
-                                                    if angle > reversalAngleThreshold {
-                                                        pitchEnded = true
-                                                        pitchEndFrame = exportFrameCount
-                                                        print("⚡️ PITCH END DETECTED at frame \(exportFrameCount) — direction reversal \(String(format: "%.1f", angle))° > \(String(format: "%.0f", reversalAngleThreshold))° threshold")
+                                                if recentPositions.count >= directionWindowSize,
+                                                   let first = recentPositions.first {
+                                                    let totalDx = recentPositions.last!.x - first.x
+                                                    let totalDy = recentPositions.last!.y - first.y
+                                                    let totalTravel = sqrt(totalDx * totalDx + totalDy * totalDy)
+                                                    if totalTravel >= minTravelBeforeReversalCheck {
+                                                        let oldDir = self.directionVector(from: recentPositions, endIndex: recentPositions.count - 1, window: directionWindowSize)
+                                                        let newDir = CGPoint(x: tCenter.x - recentPositions.last!.x,
+                                                                             y: tCenter.y - recentPositions.last!.y)
+                                                        let angle = self.angleBetween(oldDir, newDir)
+                                                        if angle > reversalAngleThreshold {
+                                                            pitchEnded = true
+                                                            pitchEndFrame = exportFrameCount
+                                                            print("⚡️ PITCH END DETECTED at frame \(exportFrameCount) — direction reversal \(String(format: "%.1f", angle))° > \(String(format: "%.0f", reversalAngleThreshold))° threshold (travel=\(String(format: "%.3f", totalTravel)))")
+                                                        }
                                                     }
                                                 }
                                             }
                                             
                                             if !pitchEnded {
-                                                self.detectionMarkers.append(tCenter)
+                                                self.detectionMarkers.append(TimestampedMarker(timestamp: CMTimeGetSeconds(pts), point: tCenter))
                                                 recentPositions.append(tCenter)
                                                 if recentPositions.count > directionWindowSize * 3 {
                                                     recentPositions.removeFirst(recentPositions.count - directionWindowSize * 3)
@@ -581,7 +616,9 @@ extension CameraViewController {
                 
                 Task { @MainActor in
                     guard granted else {
+                        self.onAnnotatedVideoURL?(outputURL)
                         self.onVideoSaved?("")
+                        self.onProcessingComplete?(self.detectionMarkers, self.skeletonFrames)
                         let alert = UIAlertController(title: "Photos Access Denied",
                                                       message: "Annotated video exported to a temporary file, but app does not have permission to save to Photos. Please enable Photos access in Settings.",
                                                       preferredStyle: .alert)
@@ -623,7 +660,9 @@ extension CameraViewController {
                     self.currentRawVideoURL = nil
                     
                     if let id = annotatedId {
+                        self.onAnnotatedVideoURL?(outputURL)
                         self.onVideoSaved?(id)
+                        self.onProcessingComplete?(self.detectionMarkers, self.skeletonFrames)
                         let message = self.settings.exportCleanVideo
                             ? "Both the annotated and clean videos have been saved to Photos."
                             : "Annotated video saved to Photos."
@@ -636,7 +675,9 @@ extension CameraViewController {
                         })
                         self.topMostViewController().present(alert, animated: true)
                     } else {
+                        self.onAnnotatedVideoURL?(outputURL)
                         self.onVideoSaved?("")
+                        self.onProcessingComplete?(self.detectionMarkers, self.skeletonFrames)
                         let alert = UIAlertController(title: "Save Failed",
                                                       message: "Could not save video to Photos. Please check permissions or available space.",
                                                       preferredStyle: .alert)
@@ -805,8 +846,8 @@ extension CameraViewController {
                 var sx: CGFloat = 0
                 var sy: CGFloat = 0
                 for j in lo...hi {
-                    sx += raw[j].x
-                    sy += raw[j].y
+                    sx += raw[j].point.x
+                    sy += raw[j].point.y
                 }
                 smoothed.append(CGPoint(x: sx / count, y: sy / count))
             }
@@ -840,8 +881,8 @@ extension CameraViewController {
         // Detection marker dots (optional — off by default)
         if self.settings.showDetectionMarkers && !self.detectionMarkers.isEmpty {
             for normCenter in self.detectionMarkers {
-                var cx = normCenter.x * rect.width
-                var cy = normCenter.y * rect.height
+                var cx = normCenter.point.x * rect.width
+                var cy = normCenter.point.y * rect.height
                 if !contentFlippedVertically { cy = rect.height - cy }
                 if mirrored { cx = rect.width - cx }
                 let markerSize: CGFloat = 12
