@@ -6,6 +6,64 @@
 import SwiftUI
 import Combine
 
+// MARK: - Home Plate Point Labels
+// Points are collected in this order, matching the physical shape:
+//   0 - Back-left  (pitcher's side, left)
+//   1 - Back-right (pitcher's side, right)
+//   2 - Right      (batter's right, the pointy corner)
+//   3 - Front tip  (the sharp point closest to the catcher)
+//   4 - Left       (batter's left, the other pointy corner)
+//
+// MLB home plate dimensions (inches):
+//   Width (back edge, top)         : 17"
+//   Side length (angled edges)     : 8.5" each
+//   Point-to-point depth           : 17" (same as width, symmetric)
+//
+// World coordinate origin = front tip of home plate (point 3)
+// +X runs from left to right (toward first base from batter's POV)
+// +Y runs away from catcher (toward pitcher)
+// All Z = 0 (plate is flat on the ground)
+
+enum HomePlatePoint: Int, CaseIterable {
+    case backLeft   = 0
+    case backRight  = 1
+    case right      = 2
+    case frontTip   = 3
+    case left       = 4
+
+    var label: String {
+        switch self {
+        case .backLeft:  return "Back-Left"
+        case .backRight: return "Back-Right"
+        case .right:     return "Right Corner"
+        case .frontTip:  return "Front Tip"
+        case .left:      return "Left Corner"
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .backLeft:  return .green
+        case .backRight: return .blue
+        case .right:     return .orange
+        case .frontTip:  return .red
+        case .left:      return .purple
+        }
+    }
+
+    /// Known world coordinates (inches) relative to the front tip as origin.
+    /// Positive Y = toward pitcher, Positive X = toward first base (batter's left when facing pitcher).
+    var worldPosition: CGPoint {
+        switch self {
+        case .backLeft:  return CGPoint(x: -8.5, y: 17.0)
+        case .backRight: return CGPoint(x:  8.5, y: 17.0)
+        case .right:     return CGPoint(x:  8.5, y:  8.5)
+        case .frontTip:  return CGPoint(x:  0.0, y:  0.0)
+        case .left:      return CGPoint(x: -8.5, y:  8.5)
+        }
+    }
+}
+
 // MARK: - Settings Model
 class CameraSettings: ObservableObject {
     @Published var ballDetectionEnabled: Bool = true
@@ -13,16 +71,37 @@ class CameraSettings: ObservableObject {
     @Published var showLabels: Bool = true
     @Published var ballConfidenceThreshold: Float = 0.35
     @Published var poseConfidenceThreshold: Float = 0.3
-    
-    // Calibration (using home plate width)
-    @Published var isCalibrated: Bool = false
-    @Published var plateLeftEdge: CGPoint = .zero // Normalized coordinates (0-1)
-    @Published var plateRightEdge: CGPoint = .zero // Normalized coordinates (0-1)
-    @Published var plateWidth: Double = 17.0 // inches (regulation baseball home plate)
-    @Published var useCentimeters: Bool = false // false = inches, true = centimeters
-    @Published var selectedLens: Double = 1.0 // Lens choice (1x, 2x, 4x, 8x)
-    
-    // Colors
+
+    // MARK: - Calibration (5-point home plate)
+    // Normalised image coordinates (0-1) for each of the 5 plate corners.
+    // Persisted to UserDefaults so calibration survives app restarts.
+    @Published var isCalibrated: Bool = false {
+        didSet { saveCalibration() }
+    }
+    @Published var platePoints: [CGPoint] = Array(repeating: .zero, count: 5) {
+        didSet { saveCalibration() }
+    }
+    @Published var plateWidth: Double = 17.0 {
+        didSet { saveCalibration() }
+    }
+    @Published var useCentimeters: Bool = false {
+        didSet { saveCalibration() }
+    }
+
+    // Legacy two-point calibration kept for backward compatibility with overlay/strike-zone drawing.
+    // These are derived automatically from platePoints when a 5-point calibration is saved.
+    @Published var plateLeftEdge: CGPoint = .zero   // normalised
+    @Published var plateRightEdge: CGPoint = .zero  // normalised
+
+    // MARK: - Multi-device / Frame Rate
+    // The negotiated common frame rate used by all connected devices.
+    // A value of 0 means no negotiation has happened yet; each device runs at its own max rate.
+    @Published var negotiatedFrameRate: Double = 0
+
+    // MARK: - Lens / Zoom
+    @Published var selectedLens: Double = 1.0   // 1x, 2x, 4x, 8x
+
+    // MARK: - Colors
     @Published var ballColor: Color = .red
     @Published var trajectoryColor: Color = .red
     @Published var skeletonColor: Color = .cyan
@@ -31,21 +110,59 @@ class CameraSettings: ObservableObject {
     @Published var kneeAngleColor: Color = .orange
     @Published var shoulderAngleColor: Color = .purple
     @Published var separationColor: Color = .cyan
-    
-    // Strike zone
+
+    // MARK: - Strike Zone
     @Published var showStrikeZone: Bool = true
     @Published var strikeZoneColor: Color = .white
-    // Generic strike zone height in inches (MLB regulation ~22", adjustable for age groups)
+    /// Strike zone height in inches. Overridden by active batter's personalised height when set.
     @Published var strikeZoneHeight: Double = 22.0
-    // Distance in inches from home plate up to the bottom of the strike zone
-    // (~knee height; MLB regulation is roughly 18–20 inches above the plate)
+    /// Distance in inches from home plate up to the bottom of the strike zone.
+    /// Overridden by active batter's personalised offset when set.
     @Published var strikeZoneBottomOffset: Double = 18.0
-    
-    // Export options
+
+    // MARK: - Export
     @Published var exportCleanVideo: Bool = false
-    
-    // Debug options
+
+    // MARK: - Debug
     @Published var showROI: Bool = false
-    @Published var enableROI: Bool = true // Toggle to enable/disable ROI tracking
-    @Published var showDetectionMarkers: Bool = false // Show individual detection dots on export
+    @Published var enableROI: Bool = true
+    @Published var showDetectionMarkers: Bool = false
+
+    // MARK: - Persistence keys
+    private enum Key {
+        static let isCalibrated   = "cal.isCalibrated"
+        static let platePointsX   = "cal.platePointsX"
+        static let platePointsY   = "cal.platePointsY"
+        static let plateWidth     = "cal.plateWidth"
+        static let useCentimeters = "cal.useCentimeters"
+    }
+
+    init() { loadCalibration() }
+
+    // MARK: - Calibration persistence
+
+    private func saveCalibration() {
+        let ud = UserDefaults.standard
+        ud.set(isCalibrated, forKey: Key.isCalibrated)
+        ud.set(platePoints.map { $0.x }, forKey: Key.platePointsX)
+        ud.set(platePoints.map { $0.y }, forKey: Key.platePointsY)
+        ud.set(plateWidth,     forKey: Key.plateWidth)
+        ud.set(useCentimeters, forKey: Key.useCentimeters)
+    }
+
+    private func loadCalibration() {
+        let ud = UserDefaults.standard
+        guard ud.bool(forKey: Key.isCalibrated) else { return }
+        let xs = ud.array(forKey: Key.platePointsX) as? [Double] ?? []
+        let ys = ud.array(forKey: Key.platePointsY) as? [Double] ?? []
+        guard xs.count == 5, ys.count == 5 else { return }
+        platePoints    = zip(xs, ys).map { CGPoint(x: $0, y: $1) }
+        let w          = ud.double(forKey: Key.plateWidth)
+        plateWidth     = w == 0 ? 17.0 : w
+        useCentimeters = ud.bool(forKey: Key.useCentimeters)
+        isCalibrated   = true
+        // Derive legacy edges
+        plateLeftEdge  = platePoints[HomePlatePoint.left.rawValue]
+        plateRightEdge = platePoints[HomePlatePoint.right.rawValue]
+    }
 }
