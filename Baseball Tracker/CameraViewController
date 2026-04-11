@@ -21,6 +21,34 @@ import CoreML
 import Photos
 import Combine
 
+// MARK: - Shared types
+
+struct TimestampedMarker {
+    let timestamp: Double
+    let point: CGPoint
+}
+
+struct SkeletonJoints {
+    var neck:          CGPoint? = nil
+    var leftShoulder:  CGPoint? = nil
+    var rightShoulder: CGPoint? = nil
+    var leftElbow:     CGPoint? = nil
+    var rightElbow:    CGPoint? = nil
+    var leftWrist:     CGPoint? = nil
+    var rightWrist:    CGPoint? = nil
+    var leftHip:       CGPoint? = nil
+    var rightHip:      CGPoint? = nil
+    var leftKnee:      CGPoint? = nil
+    var rightKnee:     CGPoint? = nil
+    var leftAnkle:     CGPoint? = nil
+    var rightAnkle:    CGPoint? = nil
+}
+
+struct SkeletonFrame {
+    let timestamp: Double
+    let joints: SkeletonJoints
+}
+
 class CameraViewController: UIViewController {
     
     // MARK: - Settings
@@ -31,7 +59,8 @@ class CameraViewController: UIViewController {
     let captureSession = AVCaptureSession()
     let sessionQueue = DispatchQueue(label: "camera.session.queue")
     let visionQueue = DispatchQueue(label: "camera.vision.queue", qos: .userInteractive)
-    
+    let videoQueue = DispatchQueue(label: "camera.video.queue", qos: .userInteractive, attributes: [], autoreleaseFrequency: .workItem)
+
     var videoDeviceInput: AVCaptureDeviceInput!
     var videoOutput: AVCaptureVideoDataOutput!
     var previewLayer: CALayer!
@@ -84,6 +113,11 @@ class CameraViewController: UIViewController {
     let maxROISize: CGFloat = 0.7 // Maximum ROI size before resetting to full frame
     let roiExpansionRate: CGFloat = 1.08 // Expand by 8% per frame without detection (gentle for 240fps)
     
+    // MARK: - Vision processing gate
+    // Prevents new inference dispatches while a previous one is still running.
+    // Only read/written on videoQueue — never touch from main thread.
+    var isProcessingVision: Bool = false
+
     // MARK: - Pose Estimation
     var poseRequest: VNDetectHumanBodyPoseRequest!
     var lastPoseObservation: VNHumanBodyPoseObservation?
@@ -94,9 +128,30 @@ class CameraViewController: UIViewController {
     
     // MARK: - Overlay
     var overlayLayer = CALayer()
-    
-    var detectionMarkers: [CGPoint] = []
-    
+
+    var detectionMarkers: [TimestampedMarker] = []
+    var remoteDetectionMarkers: [TimestampedMarker] = []
+
+    // MARK: - Multi-device
+    var peerSession: MultipeerSession? = nil
+    var view3DButton: UIButton?
+
+    // MARK: - Auto-stop / swing detection
+    var checkSwingDetected: Bool = false
+    var wristXHistory: [(leadWrist: CGFloat, trailWrist: CGFloat)] = []
+    var ballEverDetectedThisRecording: Bool = false
+    var consecutiveFramesWithoutBall: Int = 0
+    let autoStopGraceFrames: Int = 30
+
+    // MARK: - Skeleton data
+    var skeletonFrames: [SkeletonFrame] = []
+
+    // MARK: - Batter
+    var activeBatter: Player? = nil
+
+    // MARK: - Callbacks
+    var onProcessingComplete: (([TimestampedMarker], [SkeletonFrame]) -> Void)? = nil
+
     // MARK: - UI
     var processingOverlay: UIView?
     var processingLabel: UILabel?
@@ -116,6 +171,9 @@ class CameraViewController: UIViewController {
     /// recovery of original 240fps frames from composed slow-motion videos.
     var phAsset: PHAsset? = nil
     var onVideoSaved: ((String) -> Void)?
+    /// Called with the local file URL of the annotated video immediately after export.
+    /// Use this to display the video in-app without waiting for Photos library indexing.
+    var onAnnotatedVideoURL: ((URL) -> Void)?
     var onRecordingStateChanged: ((Bool) -> Void)?
     
     // URL of the most-recent raw (unannotated) recording, kept alive until
@@ -135,12 +193,14 @@ class CameraViewController: UIViewController {
     /// makeAnnotatedPixelBuffer for proper overlay positioning after the writer
     /// applies the transform.
     var videoRotationDegrees: Int = 0
+    var poseVideoRotation: Int = 0
     
     // MARK: - Lifecycle
     override func viewDidLoad() {
         super.viewDidLoad()
         print("🎥 CameraViewController viewDidLoad started")
         view.backgroundColor = .black
+        isRecording = false   // ensure clean state on each presentation
         onRecordingStateChanged?(false)
         
         setupOverlay()
@@ -150,7 +210,9 @@ class CameraViewController: UIViewController {
         setupCalibrateButton()
         setupZoomControls()
         setupRecordButton()
+        setupView3DButton()
         setupSettingsObservers()
+        setupMultiDeviceIfNeeded()
         
         self.detectionMarkers.removeAll()
         
@@ -232,6 +294,16 @@ class CameraViewController: UIViewController {
             view.bringSubviewToFront(calibrateButton)
         }
         
+        if let view3DButton = view3DButton {
+            let safeArea = view.safeAreaInsets
+            let buttonSize: CGFloat = 44
+            view3DButton.frame = CGRect(x: view.bounds.width - (buttonSize + 16) * 3,
+                                        y: safeArea.top + 8,
+                                        width: buttonSize,
+                                        height: buttonSize)
+            view.bringSubviewToFront(view3DButton)
+        }
+        
         if let recordButton = recordButton {
             let safeArea = view.safeAreaInsets
             let buttonSize: CGFloat = 70
@@ -278,8 +350,10 @@ class CameraViewController: UIViewController {
         }
         sessionQueue.async { [weak self] in
             self?.captureSession.stopRunning()
+            DispatchQueue.main.async {
+                self?.dismiss(animated: true)
+            }
         }
-        self.dismiss(animated: true)
     }
     
     // MARK: - Settings Button Setup
@@ -456,17 +530,15 @@ class CameraViewController: UIViewController {
     }
     
     func updateRecordButton(isRecording: Bool) {
-        DispatchQueue.main.async {
-            if isRecording {
-                self.recordButton.backgroundColor = UIColor.red.withAlphaComponent(1.0)
-                self.recordButton.layer.borderWidth = 0
-            } else {
-                self.recordButton.backgroundColor = UIColor.red.withAlphaComponent(0.7)
-                self.recordButton.layer.borderWidth = 2
-            }
+        if isRecording {
+            self.recordButton.backgroundColor = UIColor.red.withAlphaComponent(1.0)
+            self.recordButton.layer.borderWidth = 0
+        } else {
+            self.recordButton.backgroundColor = UIColor.red.withAlphaComponent(0.7)
+            self.recordButton.layer.borderWidth = 2
         }
     }
-    
+
     @objc func recordButtonTapped() {
         if isRecording {
             stopCustomRecording()
@@ -523,153 +595,120 @@ class CameraViewController: UIViewController {
     // MARK: - Camera Setup
     func setupCamera() {
         print("🎥 setupCamera() called on thread: \(Thread.current)")
-        captureSession.beginConfiguration()
 
-        captureSession.sessionPreset = .inputPriority
-        
         guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else {
             print("❌ ERROR: Could not get camera device")
             return
         }
-        
         print("✅ Got camera device: \(device.localizedName)")
-        
-        let preferredDims: [(width: Int32, height: Int32)] = [
-            (1920, 1080), (1080, 1920),
-            (1280, 720), (720, 1280)
-        ]
-        
+
+        // ── 1. Configure device format BEFORE touching the session ──────────
+        // lockForConfiguration must NOT be called inside beginConfiguration/commitConfiguration.
         func maxFPS(for format: AVCaptureDevice.Format) -> Double {
-            return format.videoSupportedFrameRateRanges.map { $0.maxFrameRate }.max() ?? 0
+            format.videoSupportedFrameRateRanges.map { $0.maxFrameRate }.max() ?? 0
         }
-        
+
         let globalMaxFPS = device.formats.map { maxFPS(for: $0) }.max() ?? 0
-        print("[Camera] Found \(device.formats.count) formats, max fps available: \(globalMaxFPS)")
-        
-        let highestFPSFormats = device.formats.filter { maxFPS(for: $0) == globalMaxFPS }
-        print("[Camera] \(highestFPSFormats.count) formats support \(globalMaxFPS) fps")
-        
-        let preferredHighSpeedFormat: AVCaptureDevice.Format? = {
-            for dim in preferredDims {
-                if let match = highestFPSFormats.first(where: { fmt in
-                    let d = CMVideoFormatDescriptionGetDimensions(fmt.formatDescription)
-                    return (d.width == dim.width && d.height == dim.height)
-                }) {
-                    return match
-                }
+        print("[Camera] \(device.formats.count) formats, max fps: \(globalMaxFPS)")
+
+        let preferredDims: [(Int32, Int32)] = [(1920, 1080), (1080, 1920), (1280, 720), (720, 1280)]
+        let highFPSFormats = device.formats.filter { maxFPS(for: $0) == globalMaxFPS }
+
+        let chosenFormat: AVCaptureDevice.Format? = {
+            for (w, h) in preferredDims {
+                if let f = highFPSFormats.first(where: {
+                    let d = CMVideoFormatDescriptionGetDimensions($0.formatDescription)
+                    return d.width == w && d.height == h
+                }) { return f }
             }
-            return nil
+            return highFPSFormats.first
         }()
-        
-        let chosenFormat: AVCaptureDevice.Format? = preferredHighSpeedFormat ?? device.formats.max(by: { f1, f2 in
-            let fps1 = maxFPS(for: f1)
-            let fps2 = maxFPS(for: f2)
-            if fps1 == fps2 {
-                let d1 = CMVideoFormatDescriptionGetDimensions(f1.formatDescription)
-                let d2 = CMVideoFormatDescriptionGetDimensions(f2.formatDescription)
-                let area1 = Int(d1.width) * Int(d1.height)
-                let area2 = Int(d2.width) * Int(d2.height)
-                return area1 < area2
-            }
-            return fps1 < fps2
-        })
-        
-        if let bestFormat = chosenFormat {
-            let maxFrameRate = maxFPS(for: bestFormat)
-            let dims = CMVideoFormatDescriptionGetDimensions(bestFormat.formatDescription)
-            print("[Camera] Chose format: \(dims.width)x\(dims.height) supporting max \(maxFrameRate) fps")
-            
+
+        if let fmt = chosenFormat {
+            let fps = maxFPS(for: fmt)
+            let dims = CMVideoFormatDescriptionGetDimensions(fmt.formatDescription)
+            print("[Camera] Chose \(dims.width)×\(dims.height) @ \(fps) fps")
             do {
                 try device.lockForConfiguration()
-                device.activeFormat = bestFormat
-                let desc = CMVideoFormatDescriptionGetDimensions(bestFormat.formatDescription)
-                self.activeDimensions = desc
-                if let frameRateRange = bestFormat.videoSupportedFrameRateRanges.first(where: { $0.maxFrameRate == maxFrameRate }) {
-                    let duration = CMTimeMake(value: 1, timescale: Int32(frameRateRange.maxFrameRate.rounded()))
-                    device.activeVideoMinFrameDuration = duration
-                    device.activeVideoMaxFrameDuration = duration
-                    print("[Camera] Set frame duration to \(duration.value)/\(duration.timescale)")
+                device.activeFormat = fmt
+                self.activeDimensions = dims
+                if let range = fmt.videoSupportedFrameRateRanges.first(where: { $0.maxFrameRate == fps }) {
+                    let dur = CMTimeMake(value: 1, timescale: Int32(fps.rounded()))
+                    device.activeVideoMinFrameDuration = dur
+                    device.activeVideoMaxFrameDuration = dur
                 }
                 device.unlockForConfiguration()
-                
-                let actualDuration = device.activeVideoMaxFrameDuration
-                if actualDuration.seconds > 0 {
-                    self.activeFrameRate = 1.0 / actualDuration.seconds
-                } else {
-                    self.activeFrameRate = Double(maxFrameRate)
-                }
-                
-                print("[Camera] Active configuration: \(self.activeDimensions.width)x\(self.activeDimensions.height) @ \(self.activeFrameRate) fps")
-                
-                if self.activeFrameRate >= 240 {
-                    print("[Camera] ✅ SUCCESS: Running at 240fps or higher!")
-                } else if self.activeFrameRate >= 120 {
-                    print("[Camera] ⚠️ WARNING: Running at 120fps (not 240fps)")
-                } else {
-                    print("[Camera] ⚠️ WARNING: Running at \(self.activeFrameRate)fps (expected 240fps)")
-                }
+                let dur = device.activeVideoMaxFrameDuration
+                self.activeFrameRate = dur.seconds > 0 ? 1.0 / dur.seconds : fps
+                print("[Camera] Active: \(self.activeDimensions.width)×\(self.activeDimensions.height) @ \(self.activeFrameRate) fps")
             } catch {
-                print("Failed to configure device for highest frame rate: \(error)")
+                print("[Camera] lockForConfiguration failed: \(error)")
             }
-        } else {
-            print("[Camera] ERROR: No suitable format found!")
         }
-        
+
+        // ── 2. Build capture session ──────────────────────────────────────
         do {
             videoDeviceInput = try AVCaptureDeviceInput(device: device)
         } catch {
-            print("Error creating device input: \(error)")
+            print("[Camera] AVCaptureDeviceInput error: \(error)")
             return
         }
-        
-        guard videoDeviceInput != nil else { return }
+
+        captureSession.beginConfiguration()
+        captureSession.sessionPreset = .inputPriority
+
+        guard captureSession.canAddInput(videoDeviceInput) else {
+            print("[Camera] Cannot add video input")
+            captureSession.commitConfiguration()
+            return
+        }
         captureSession.addInput(videoDeviceInput)
-        
+
         videoOutput = AVCaptureVideoDataOutput()
         videoOutput.videoSettings = [
             kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
         ]
-        
-        let videoQueue = DispatchQueue(label: "videoQueue", qos: .userInteractive, attributes: [], autoreleaseFrequency: .workItem)
+        videoOutput.alwaysDiscardsLateVideoFrames = true   // prevent queue build-up at 240fps
         videoOutput.setSampleBufferDelegate(self, queue: videoQueue)
-        
-        if captureSession.canAddOutput(videoOutput) {
-            captureSession.addOutput(videoOutput)
+
+        guard captureSession.canAddOutput(videoOutput) else {
+            print("[Camera] Cannot add video output")
+            captureSession.commitConfiguration()
+            return
         }
-        
-        videoOutput.alwaysDiscardsLateVideoFrames = false
-        
+        captureSession.addOutput(videoOutput)
+
+        // Set portrait orientation on the connection.
         if let connection = videoOutput.connection(with: .video) {
             if #available(iOS 17.0, *) {
-                let desiredAngle: CGFloat = 90
-                if connection.isVideoRotationAngleSupported(desiredAngle) {
-                    connection.videoRotationAngle = desiredAngle
+                if connection.isVideoRotationAngleSupported(90) {
+                    connection.videoRotationAngle = 90
                 }
             } else {
                 if connection.isVideoOrientationSupported {
                     connection.videoOrientation = .portrait
                 }
             }
-            
-            self.mirrored = (videoDeviceInput.device.position == .front)
-            self.contentFlippedVertically = false
         }
-        
+        self.mirrored = (device.position == .front)
+        self.contentFlippedVertically = false
+
+        captureSession.commitConfiguration()
+
+        // ── 3. Start running & add preview layer ──────────────────────────
+        captureSession.startRunning()
+        print("[Camera] Session running: \(captureSession.isRunning)")
+
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
-            let bounds = self.view.bounds
             let preview = AVCaptureVideoPreviewLayer(session: self.captureSession)
             preview.videoGravity = .resizeAspectFill
-            preview.frame = bounds
+            preview.frame = self.view.bounds
             self.previewLayer = preview
             self.view.layer.insertSublayer(preview, at: 0)
+            self.view.layer.insertSublayer(self.overlayLayer, above: preview)
+            print("[Camera] Preview layer added, overlay above preview")
         }
-        
-        self.sessionQueue.async { [weak self] in
-            self?.captureSession.startRunning()
-        }
-        
-        captureSession.commitConfiguration()
     }
     
     // MARK: - Navigation Helpers
