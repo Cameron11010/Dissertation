@@ -18,6 +18,7 @@
 import UIKit
 import AVFoundation
 import Photos
+import Vision
 
 extension CameraViewController {
     
@@ -27,11 +28,16 @@ extension CameraViewController {
         
         // Reset tracking data
         self.detectionMarkers.removeAll()
+        self.skeletonFrames.removeAll()
         self.poseHistory.removeAll()
         self.fusedFrameData.removeAll()
         self.lastPoseObservation = nil
         self.currentROI = nil
         self.framesWithoutDetection = 0
+
+        // For video processing, search the full frame for the batter skeleton
+        // (the live-camera ROI may have been suppressed when no batter is selected)
+        self.poseRequest?.regionOfInterest = CGRect(x: 0, y: 0, width: 1, height: 1)
 
         // Show video preview immediately
         DispatchQueue.main.async { [weak self] in
@@ -167,6 +173,10 @@ extension CameraViewController {
             self.contentUpsideDown = (snapped == 180)
             self.videoRotationDegrees = snapped
             self.contentFlippedVertically = false
+            // VNDetectHumanBodyPoseRequest returns coordinates in the raw
+            // landscape buffer space regardless of the orientation hint.
+            // Store the rotation so the drawing code can remap them correctly.
+            self.poseVideoRotation = snapped
 
             await self.exportAnnotatedVideo(asset: asset, track: track)
         } catch {
