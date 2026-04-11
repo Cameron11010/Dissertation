@@ -52,7 +52,7 @@ struct CameraSettingsView: View {
                                 .foregroundColor(.orange)
                             Text("Camera not calibrated")
                         }
-                        Text("Tap the ruler button and mark the two front edges of home plate for accurate measurements")
+                        Text("Tap the ruler button and mark all 5 corners of home plate in order: Back-Left, Back-Right, Right Corner, Front Tip, Left Corner.")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
